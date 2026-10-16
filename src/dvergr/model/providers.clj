@@ -172,7 +172,7 @@
   "Best default model per provider for auto-config. Fireworks ids must exist in
    resources/models.edn; the others are passed through to the provider."
   {:anthropic   "claude-sonnet-4-6"
-   :fireworks   "accounts/fireworks/models/minimax-m2p7"
+   :fireworks   "accounts/fireworks/models/minimax-m3"
    ;; GPT-5.5 is documented independently with medium reasoning by default and
    ;; supports function calling on Chat Completions. Unlike GPT-5.6, it does not
    ;; carry :chat-tools-need-effort-none?; that absence is not itself evidence

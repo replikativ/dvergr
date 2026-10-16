@@ -269,3 +269,28 @@
           (is (= :error (:tool-call/status row)) "not left :running")
           (is (str/includes? (:tool-call/result row) "tool exploded"))))
       (finally (chat-ctx/close-chat! ctx)))))
+
+(deftest retired-model-charges-successor-price-and-persists-execution-id
+  (let [ctx (chat-ctx/create-chat-context {:title "successor usage" :with-sci? false})
+        old "accounts/fireworks/models/kimi-k2p5"
+        successor "accounts/fireworks/models/kimi-k3"
+        formatted (atom nil)
+        executed (atom nil)]
+    (try
+      (with-redefs [agent/messages->api-format (fn [messages _ model] (reset! formatted model) messages)
+                    model-chat/chat (fn [_ opts]
+                                      (reset! executed (:model opts))
+                                      (assoc (response "done") :usage {:input-tokens 1000}))]
+        (is (= :complete (agent/run-agent-turn! ctx {:provider :fireworks :model old :tools {}
+                                                     :auto-compact? false :turn-number 0})))
+        (is (= successor @formatted @executed))
+        (is (= 3000 (:used (chat-ctx/get-budget ctx))
+               (accounting/get-total-cost (:db-conn ctx) (:chat-id ctx))))
+        (is (= #{successor}
+               (set (dh/q '[:find [?model ...] :in $ ?chat-id
+                            :where [?c :chat/id ?chat-id] [?l :ledger/context ?c]
+                            [?l :ledger/model ?model]]
+                          @(:db-conn ctx) (:chat-id ctx)))))
+        ;; Reading an old identity still uses its stored rate, never a successor's.
+        (is (= 600 (accounting/calculate-cost :input-tokens 1000 {:model old}))))
+      (finally (chat-ctx/close-chat! ctx)))))

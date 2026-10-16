@@ -130,7 +130,7 @@
   "Make HTTP request with error handling. Returns response or throws. The
    usage a subscription provider reports in the headers is recorded, also
    on a refusal."
-  [provider-id url headers body credentials]
+  [provider-id url headers body credentials opts]
   (let [response (gateway/request! {:method :post
                                     :url url
                                     :headers headers
@@ -142,7 +142,16 @@
     (try (subscription/observe-headers! provider-id (:headers response))
          (catch Exception _ nil))
     (if (>= (:status response) 400)
-      (throw (wrap-api-error response))
+      (let [error (wrap-api-error response)
+            config-key (or (:model-config-key opts) :model)]
+        (if (and (= 404 (:status response))
+                 (str/includes? (str/lower-case (:message (ex-data error))) "model not found"))
+          (throw (ex-info (str "Model " (:model opts) " from " config-key
+                               " is unavailable: " (.getMessage error))
+                          (assoc (ex-data error) :type ::model-not-found
+                                 :model (:model opts) :config-key config-key)
+                          error))
+          (throw error)))
       response)))
 
 ;; ============================================================================
@@ -186,7 +195,7 @@
                               body
                               (alength (.getBytes ^String (json/write-value-as-string body) "UTF-8"))
                               (some body [:max_tokens :max_completion_tokens :max_output_tokens])))]
-                   (make-request (p/provider-id provider) url headers body credentials))
+                   (make-request (p/provider-id provider) url headers body credentials opts))
         last-read (java.util.concurrent.atomic.AtomicLong. (System/currentTimeMillis))
         stalled (atom false)
         ^java.io.InputStream raw (:body response)
@@ -280,6 +289,7 @@
 
    Options:
      :model     - Model ID (required)
+     :model-config-key - Source config key for model error diagnostics (default :model)
      :provider  - Provider keyword (optional, inferred from model)
      :max-tokens - Max output tokens
      :system    - System prompt (overrides system message in messages)
@@ -336,6 +346,7 @@
 
         ;; Ensure model is in opts
         opts (assoc opts :model model-id)]
+    ;; Response identity is the execution id used for pricing and attribution.
 
     ;; DirectChat providers bypass the HTTP+SSE path entirely
     (if (p/implements-direct-chat? provider)
@@ -343,7 +354,7 @@
         (throw (ex-info "Dispatch-governed Runs require a native HTTP provider"
                         {:type ::unsupported-dispatch-accounting
                          :provider provider-key}))
-        (p/direct-chat provider messages opts))
+        (assoc (p/direct-chat provider messages opts) :model model-id))
 
       ;; Standard HTTP+SSE streaming path. A model call has no side effect,
       ;; so a stream that stalls or breaks while it is read is asked again,
@@ -365,7 +376,7 @@
                                     "The response stream stalled or broke; asking again")
                           (Thread/sleep (long (calculate-backoff attempt nil)))
                           (recur (inc attempt)))
-                      (:response r))))
+                      (assoc (:response r) :model model-id))))
                 (catch Throwable e
                   (resource/settle-dispatches! nil)
                   (throw e)))

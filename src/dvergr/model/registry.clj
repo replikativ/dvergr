@@ -757,7 +757,7 @@
            (swap! registry update (:id entry)
                   (fn [existing]
                     (merge (select-keys existing
-                                        [:quirks :reasoning-efforts
+                                        [:retired :successor :quirks :reasoning-efforts
                                          :default-reasoning-effort :instruction-role])
                            entry)))
            (swap! n inc)))
@@ -798,9 +798,25 @@
   (swap! aliases assoc alias-name model-id))
 
 (defn resolve-alias
-  "Resolve a model alias to its full ID. Returns input if not an alias."
+  "Resolve aliases and retired ids to a current model, warning once per resolution."
   [model-id-or-alias]
-  (get @aliases model-id-or-alias model-id-or-alias))
+  (ensure-models-loaded!)
+  (let [id (get @aliases model-id-or-alias model-id-or-alias)
+        resolved (loop [id id seen #{}]
+                   (when (contains? seen id)
+                     (throw (ex-info "Cyclic model successors" {:model-id id})))
+                   (let [model (get-model id)]
+                     (if (:retired model)
+                       (if-let [successor (:successor model)]
+                         (do (get-model! successor)
+                             (recur successor (conj seen id)))
+                         (throw (ex-info "Retired model has no successor" {:model-id id})))
+                       id)))]
+    (when (not= id resolved)
+      (tel/log! {:level :warn :id ::retired-model
+                 :data {:model id :successor resolved}}
+                (str "Retired model " id " resolves to " resolved)))
+    resolved))
 
 (defn get-model-by-alias
   "Get model definition, resolving aliases first."

@@ -17,20 +17,40 @@
    Also the primitive the jitsi frame pipeline uses (screen-content
    descriptions → knowledge bases)."
   (:require [dvergr.model.chat :as chat]
+            [dvergr.model.registry :as registry]
+            [dvergr.model.providers :as providers]
             [clojure.string :as str]
             [jsonista.core :as json]
             [taoensso.telemere :as tel]))
 
-(def ^:private default-model
-  "Vision model (registered in models.edn; OpenAI-compatible chat endpoint
-   takes image_url content parts). Kimi K2.6 is the only image-capable model
-   deployed on the current Fireworks account (probed 2026-07-05) and it reads
-   business documents accurately. Override with DVERGR_VISION_MODEL — e.g. a
-   dedicated Qwen-VL once it's deployed (cheaper per token)."
-  "accounts/fireworks/models/kimi-k2p6")
+(defn- system-env [key] (System/getenv key))
 
 (defn- model-id [model]
-  (or model (System/getenv "DVERGR_VISION_MODEL") default-model))
+  (registry/ensure-models-loaded!)
+  (let [configured (or model (not-empty (system-env "DVERGR_VISION_MODEL"))
+                       (registry/get-default :vision-model))
+        fail! (fn [reason]
+                (throw (ex-info
+                        (str "Configure :defaults :vision-model in models.edn or DVERGR_VISION_MODEL "
+                             "(or pass :model): " reason)
+                        {:type ::configuration :config-key :vision-model :model configured})))
+        _ (when (str/blank? configured) (fail! "an explicit image-capable model is required"))
+        mid (registry/resolve-alias configured)
+        _ (registry/assert-capability! mid :vision)
+        _ (providers/ensure-initialized!)
+        provider-key (registry/provider-of mid)
+        provider (or (providers/get-provider provider-key)
+                     (fail! (str "provider " provider-key " is not registered; configure its credentials")))
+        base-url (get-in provider [:config :base-url])
+        host (some-> base-url java.net.URI. .getHost str/lower-case)
+        route-provider (cond
+                         (= host "api.fireworks.ai") :fireworks
+                         (= host "api.openai.com") :openai
+                         (= host "api.anthropic.com") :anthropic)]
+    (when (and route-provider (not= provider-key route-provider))
+      (fail! (str mid " belongs to " provider-key " but its provider routes to " base-url
+                  "; correct the provider :base-url / OPENAI_BASE_URL or choose a model served there")))
+    mid))
 
 (defn- image-message [data-url text]
   {:role "user"
@@ -50,24 +70,26 @@
   nil)
 
 (defn- call-model [messages opts]
-  (let [r (chat/chat messages opts)]
+  (let [mid (registry/resolve-alias (:model opts))
+        _ (registry/assert-capability! mid :vision)
+        r (chat/chat messages (assoc opts :model mid))]
     (when *on-response* (*on-response* r))
     r))
 
 (defn describe
-  "Describe image bytes → text, or nil on failure. Routes through
-   dvergr.model.chat/chat (provider/key resolution + 429/5xx retry), sending
-   the image as a base64 data-url content part.
-   opts: :prompt (default: detailed description + OCR), :model, :max-tokens."
+  "Describe image bytes → text. Throws on failure so frame intake can report it.
+   Routes through dvergr.model.chat/chat with a base64 image_url content part.
+   opts: :prompt (default: detailed description + OCR), :model, :max-tokens.
+   Model must be explicit: :model, DVERGR_VISION_MODEL, or :defaults :vision-model."
   [^bytes bytes mime & [{:keys [prompt model max-tokens]}]]
-  (let [messages [(image-message (->data-url bytes mime) (or prompt default-prompt))]]
-    (try
-      (:content (call-model messages
-                            {:model (model-id model)
-                             :max-tokens (or max-tokens 1024)}))
-      (catch Throwable t
-        (tel/log! {:level :warn :id ::vision-failed :data {:error (.getMessage t)}})
-        nil))))
+  (let [messages [(image-message (->data-url bytes mime) (or prompt default-prompt))]
+        content (:content (call-model messages
+                                      {:model (model-id model)
+                                       :model-config-key (if model :model "DVERGR_VISION_MODEL")
+                                       :max-tokens (or max-tokens 1024)}))]
+    (when (str/blank? content)
+      (throw (ex-info "Vision describe returned no text" {:model (model-id model)})))
+    content))
 
 ;; ── Structured extraction ────────────────────────────────────────────────
 
@@ -118,7 +140,7 @@
    confirms the extracted one. Defends against plausible-value hallucination
    that schema-validation can't catch. Returns a bool, or nil when the re-read
    itself failed (treated as unverified, not as mismatch)."
-  [data-url model field claimed]
+  [data-url model config-key field claimed]
   (let [reread (try
                  (:content (call-model
                             [(image-message
@@ -130,7 +152,7 @@
                             ;; Generous budget: reasoning models (e.g. Kimi)
                             ;; spend tokens thinking before the short answer —
                             ;; too small a cap yields empty content.
-                            {:model model :max-tokens 512}))
+                            {:model model :model-config-key config-key :max-tokens 512}))
                  (catch Throwable _ nil))]
     (when reread
       (boolean (values-agree? claimed reread)))))
@@ -145,7 +167,7 @@
 
    opts:
      :schema        (required) field description, as above
-     :model         vision model id (default: the registered Qwen3-VL-32B)
+     :model         explicit vision model id; otherwise DVERGR_VISION_MODEL or :defaults :vision-model
      :verify-fields collection of field keywords to re-verify with a second
                     targeted pass — use for the load-bearing numbers
                     (:total, :amount_due …). Each gets one extra LLM call.
@@ -167,6 +189,7 @@
     (throw (ex-info "vision/extract requires :schema" {})))
   (let [mid      (model-id model)
         data-url (->data-url bytes mime)
+        config-key (if model :model "DVERGR_VISION_MODEL")
         schema-s (if (string? schema) schema (pr-str schema))
         prompt   (str "Extract the following fields from this document and return "
                       "them as a SINGLE JSON object. Output ONLY the JSON — no prose, "
@@ -176,8 +199,10 @@
                       (when instructions (str "\n\n" instructions)))
         reply    (try
                    (:content (call-model [(image-message data-url prompt)]
-                                         {:model mid :max-tokens (or max-tokens 4096)}))
+                                         {:model mid :model-config-key config-key :max-tokens (or max-tokens 4096)}))
                    (catch Throwable t
+                     (when (= :dvergr.model.chat/model-not-found (:type (ex-data t)))
+                       (throw t))
                      (tel/log! {:level :warn :id ::extract-failed
                                 :data {:error (.getMessage t)}})
                      nil))
@@ -188,7 +213,7 @@
       :else
       (let [verified (when (seq verify-fields)
                        (into {} (for [f verify-fields]
-                                  [f (verify-field data-url mid f (get parsed f))])))
+                                  [f (verify-field data-url mid config-key f (get parsed f))])))
             issues   (for [[f ok?] verified :when (not ok?)]
                        (str "field " f " not verified against a second read"))]
         (cond-> {:data parsed}

@@ -69,9 +69,12 @@ quirks; `resources/models.edn` adds Fireworks models, and `(registry/refresh-fro
 - Fireworks: `accounts/fireworks/models/minimax-m3`, `glm-5p3-flash`,
   `deepseek-v4p1-flash`, `glm-5p3`, `kimi-k3`. Key: `OPENAI_API_KEY` +
   `OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1`, or `FIREWORKS_API_KEY`. An agent
-  that pins no model and gets Fireworks as its provider runs `minimax-m2p7`
+  that pins no model and gets Fireworks as its provider runs `minimax-m3`
   (`providers/default-spec`); the registry's `:compaction-model` default and the `minimax`
   alias are `minimax-m3`.
+- Vision requires explicit `:defaults :vision-model` in models.edn or
+  `DVERGR_VISION_MODEL` (per-call `:model` overrides both), with a provider URL
+  that serves the selected image-capable model.
 - API: `claude-sonnet-4-6`, `claude-opus-4-7`, `claude-haiku-4-5`, `gpt-5.6-*`.
 
 Claude Code CLI candidates call tools natively over MCP when they work in a room (room workflows;

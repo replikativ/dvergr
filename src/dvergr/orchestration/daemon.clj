@@ -15,7 +15,7 @@
    Usage:
      (def d (start! {:telegram {:token (System/getenv \"TELEGRAM_BOT_TOKEN\")}
                      :agents {:var {:provider :fireworks
-                                    :model \"accounts/fireworks/models/minimax-m2p7\"
+                                    :model \"accounts/fireworks/models/minimax-m3\"
                                     :system-prompt \"You are a helpful assistant.\"}}}))
 
      (list-agents d)
@@ -361,7 +361,7 @@
        {:id      (:id safe-config)
         :spec    {:provider      (or (:provider safe-config) (:provider ds) :fireworks)
                   :model         (or (:model safe-config) (:model ds)
-                                     "accounts/fireworks/models/minimax-m2p7")
+                                     "accounts/fireworks/models/minimax-m3")
                   :system-prompt system-prompt
                   :isolation     (or (:isolation safe-config) :sci)}
         :tools   tools-map
@@ -1284,7 +1284,7 @@
   ;; Start daemon with Telegram bot
   (def d (start! {:telegram {:token (System/getenv "TELEGRAM_BOT_TOKEN")}
                   :agents {:var {:provider :fireworks
-                                 :model "accounts/fireworks/models/minimax-m2p7"
+                                 :model "accounts/fireworks/models/minimax-m3"
                                  :system-prompt "You are a helpful assistant. Answer questions clearly and concisely."
                                  :tags #{:secretary}
                                  :description "Default agent for new conversations"}}}))

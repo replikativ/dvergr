@@ -657,7 +657,7 @@
     (when auto-compact?
       {:model (registry/resolve-alias (or compaction-model
                                           (registry/get-default :compaction-model)
-                                          "accounts/fireworks/models/minimax-m2p7"))
+                                          "accounts/fireworks/models/minimax-m3"))
        :provider (or (:provider model-spec) :fireworks)})))
 
 (defn- llm-inputs

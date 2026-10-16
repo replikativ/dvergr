@@ -12,36 +12,38 @@
    Budget: tokens are accounted to the calling agent's chat-ctx when
    :chat-ctx is present in the tool execution context."
   (:require [dvergr.model.chat :as model-chat]
+            [dvergr.model.registry :as registry]
             [dvergr.chat.context :as chat-ctx]
             [dvergr.tools :as tools]))
 
 (def ^:private default-model
   "Default cheap model for llm_call. Override with LLM_CALL_MODEL env var."
   (or (System/getenv "LLM_CALL_MODEL")
-      "accounts/fireworks/models/minimax-m2p7"))
+      "accounts/fireworks/models/minimax-m3"))
 
 (defn cheap-llm-call
   "Make a cheap one-shot LLM call synchronously.
    Returns {:text :usage :model} on success, {:error} on failure.
 
    opts:
-   - :model      — model ID override (default: minimax-m2p7)
+   - :model      — model ID override (default: minimax-m3)
    - :max-tokens — max output tokens (default: 500)
    - :system     — optional system prompt string"
   [prompt content opts]
   (try
-    (let [model      (or (:model opts) default-model)
+    (let [model      (registry/resolve-alias (or (:model opts) default-model))
           max-tokens (or (:max-tokens opts) 500)
           system     (:system opts)
           full-prompt (if (seq content)
                         (str prompt "\n\n" content)
                         prompt)
           result     (model-chat/chat [{:role "user" :content full-prompt}]
-                                      (cond-> {:model model :max-tokens max-tokens}
+                                      (cond-> {:model model :max-tokens max-tokens
+                                               :model-config-key (if (:model opts) :model "LLM_CALL_MODEL")}
                                         system (assoc :system system)))]
       {:text  (or (:content result) "")
        :usage (:usage result)
-       :model model})
+       :model (or (:model result) model)})
     (catch Exception e
       {:error (.getMessage e)})))
 

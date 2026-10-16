@@ -67,9 +67,10 @@ backends:
 
 `dvergr.media.vision` describes and extracts from images via a vision LLM,
 routed through `dvergr.model.chat/chat` (so it gets provider/key resolution and
-429/5xx retry). The default model is set in `resources/models.edn` and
-overridable with `DVERGR_VISION_MODEL` — see
-[provider-setup.md](provider-setup.md).
+429/5xx retry). Configure per-call `:model`, `DVERGR_VISION_MODEL`, or
+`:defaults :vision-model` in models.edn, in that precedence order; there is no
+implicit default. The registered provider must serve the chosen image-capable
+model. See [provider-setup.md](provider-setup.md).
 
 ### `vision/describe` — OCR + scene description
 
