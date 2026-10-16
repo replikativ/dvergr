@@ -563,7 +563,7 @@
    New durable extensions must add typed storage in persistent implementations
    before being added here."
   #{:role :source-user :source-username :source-user-id
-    :audience :mentions :attachment :provenance
+    :audience :mentions :dvergr/recipients :attachment :provenance
     :object
     :tool-uses :activities :reasoning :kind :from :source :schedule-id :plain?
     :notification/type :notification/agent :notification/task
@@ -625,6 +625,11 @@
                       {:type :room-store/invalid-message-metadata
                        :value metadata})))
     (reject-unknown-metadata! :metadata durable-message-metadata-keys metadata)
+    (when (contains? metadata :dvergr/recipients)
+      (let [targets (:dvergr/recipients metadata)]
+        (when-not (and (set? targets) (seq targets) (every? keyword? targets))
+          (throw (ex-info "Message multicast recipients must be a non-empty keyword set"
+                          {:type :room-store/invalid-message-metadata})))))
     (when-let [attachment (:attachment metadata)]
       (when-not (map? attachment)
         (throw (ex-info "Message attachment metadata must be a map"

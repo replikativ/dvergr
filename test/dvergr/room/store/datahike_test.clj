@@ -361,6 +361,24 @@
   (let [[_conn st] (mem-store)]
     (contract/assert-message-envelope! st :envelope-datahike)))
 
+(deftest multicast-address-is-typed-and-replayed
+  (let [[conn st] (mem-store)
+        id (random-uuid)
+        targets #{:agent/a :agent/b}
+        message {:id id :from :human :to nil :content "review"
+                 :metadata {:dvergr/recipients targets}}]
+    (try
+      (store/-store-room! st :multicast {:slug "multicast" :title "Multicast"})
+      (is (= :inserted (store/-store-message! st :multicast message)))
+      (is (= targets (get-in (first (store/-list-messages st :multicast {}))
+                             [:metadata :dvergr/recipients])))
+      (is (= targets (set (dh/q '[:find [?recipient ...] :in $ ?id
+                                  :where [?m :message/id ?id]
+                                  [?m :message/recipients ?recipient]] @conn id))))
+      (is (= :db.type/keyword (get-in @conn [:schema :message/recipients :db/valueType])))
+      (is (= :db.cardinality/many (get-in @conn [:schema :message/recipients :db/cardinality])))
+      (finally (dh/release conn)))))
+
 (deftest cross-room-scorecard-identity-contract
   (let [[_conn st] (mem-store)]
     (contract/assert-cross-room-scorecard-identity! st)))

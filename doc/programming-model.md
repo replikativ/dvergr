@@ -36,7 +36,26 @@ a message has exactly one `:to`, nobody is delivered the same message twice, and
 the chat-room semantic falls out naturally: a broadcast reaches everyone; a
 targeted post reaches only the addressee.
 
-The one rule frontends use to decide *who to address* is `discourse/room-target`:
+For an explicitly selected group, `discourse/with-recipients` addresses ONE
+message to several participant keywords:
+
+```clojure
+(d/post! room (d/with-recipients (d/message :you nil "Compare these options")
+                                [:researcher :reviewer]))
+```
+
+The envelope retains `:to nil` and records `:metadata {:dvergr/recipients
+#{:researcher :reviewer}}`. Its explicit recipients replace broadcast routing:
+only those direct inboxes receive it; a type subscriber and the room history
+see it once. Every observer receives the same immutable envelope, not an
+address-rewritten copy. Do not post separate same-UUID copies to different
+targets: durable message deduplication correctly suppresses the later copies.
+Retry the one multicast envelope with its original id instead. Recipients are
+typed `:message/recipients` cardinality-many keywords in Datahike, not EDN text;
+they are independent of `:audience` (mentioned actors, not a delivery address).
+
+Without an explicit recipient selection, frontends decide *who to address*
+with `discourse/room-target`:
 
 > A room with exactly **one** agent participant (reserved `:_…` ids ignored)
 > addresses that agent — it's a **DM**. A room with **zero or several** agents

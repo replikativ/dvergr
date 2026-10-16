@@ -45,6 +45,7 @@
 
 (def participant             @#'dvergr.discourse/participant)
 (def message                 @#'dvergr.discourse/message)
+(def with-recipients         @#'dvergr.discourse/with-recipients)
 (def reply                   @#'dvergr.discourse/reply)
 (def thread-root-id          @#'dvergr.discourse/thread-root-id)
 (def same-thread?            @#'dvergr.discourse/same-thread?)

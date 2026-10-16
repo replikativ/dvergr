@@ -51,6 +51,7 @@
    threads outside a spin."
   (:refer-clojure :exclude [await])
   (:require [is.simm.partial-cps.sequence :as aseq]
+            [is.simm.partial-cps.async :as async]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ectx]
             [org.replikativ.spindel.spin.cps :refer [spin]]
@@ -107,6 +108,43 @@
 ;; Bus
 ;; ============================================================================
 
+(defn recipients
+  "The routing keys of one immutable envelope. Explicit multicast uses
+   :metadata {:dvergr/recipients #{actor ...}} with :to nil; it is NOT broadcast.
+   Validate before durability, so a bad address cannot poison the fan-out pump."
+  [msg]
+  (if (and (map? (:metadata msg)) (contains? (:metadata msg) :dvergr/recipients))
+    (let [targets (get-in msg [:metadata :dvergr/recipients])]
+      (when-not (and (nil? (:to msg)) (set? targets) (seq targets)
+                     (every? keyword? targets))
+        (throw (ex-info "Multicast requires :to nil and distinct keyword recipients"
+                        {:type ::invalid-recipients})))
+      (sort-by str targets))
+    [(:to msg)]))
+
+;; These async-sequence views are immutable. In particular do not use a
+;; transducer sequence with mutable cursor/pending state: that would entangle
+;; execution-context forks. Routing wrappers never leave the :to topology;
+;; every subscriber receives the exact envelope that was made durable.
+(defrecord RecipientRoutes [source pending]
+  aseq/PAsyncSeq
+  (anext [_]
+    (async/async
+     (if-let [route (first pending)]
+       [route (->RecipientRoutes source (next pending))]
+       (when-let [[msg more] (async/await (aseq/anext source))]
+         (async/await
+          (aseq/anext
+           (->RecipientRoutes more (map (fn [target] {::target target ::message msg})
+                                        (recipients msg))))))))))
+
+(defrecord Envelopes [source]
+  aseq/PAsyncSeq
+  (anext [_]
+    (async/async
+     (when-let [[route more] (async/await (aseq/anext source))]
+       [(::message route) (->Envelopes more)]))))
+
 (defrecord Bus
            [;; spindel execution context
             ctx
@@ -114,7 +152,7 @@
             source-mbox
    ;; mult fanning out to the routing pubs + relay
             source-mult
-   ;; pub keyed by :to (direct-to-participant routing)
+   ;; recipient-keyed pub of private routing wrappers (direct/multicast)
             to-pub
    ;; pub keyed by :type (capability routing)
             type-pub
@@ -262,7 +300,7 @@
              m          (mult/mult source)
              to-tap     (mult/tap m (buf/fixed-buffer 256))
              type-tap   (mult/tap m (buf/fixed-buffer 256))
-             to-pub-v   (pub/pub to-tap :to)
+             to-pub-v   (pub/pub (->RecipientRoutes to-tap nil) ::target)
              type-pub-v (pub/pub type-tap :type)
              log-state  (atom {:entries [] :cursor 0})]
          (when relay-to
@@ -279,6 +317,7 @@
 ;; ============================================================================
 
 (defn- stamp [msg]
+  (recipients msg)
   (cond-> msg
     (and (map? msg) (nil? (:id msg))) (assoc :id (random-uuid))))
 
@@ -476,7 +515,7 @@
    (subscribe! bus topic (buf-for-topic topic)))
   ([bus topic buffer]
    (let [[dim value] topic
-         aseq        (binding [ec/*execution-context* (:ctx bus)]
+         raw         (binding [ec/*execution-context* (:ctx bus)]
                        (case dim
                          :to   (pub/sub (:to-pub bus)   value buffer)
                          :type (pub/sub (:type-pub bus) value buffer)
@@ -484,16 +523,17 @@
                                          {:topic topic :supported #{:to :type}}))))]
      (tel/log! {:level :debug :id ::subscribe
                 :data {:topic topic}})
-     (->Subscription bus topic aseq buffer))))
+     (assoc (->Subscription bus topic (if (= :to dim) (->Envelopes raw) raw) buffer)
+            :raw-aseq raw))))
 
 (defn unsubscribe!
   "Remove `sub`'s subscription from its bus."
-  [{:keys [bus topic aseq] :as _sub}]
+  [{:keys [bus topic aseq raw-aseq]}]
   (let [[dim value] topic]
     (binding [ec/*execution-context* (:ctx bus)]
       (case dim
-        :to   (pub/unsub (:to-pub bus)   value aseq)
-        :type (pub/unsub (:type-pub bus) value aseq))))
+        :to   (pub/unsub (:to-pub bus)   value (or raw-aseq aseq))
+        :type (pub/unsub (:type-pub bus) value (or raw-aseq aseq)))))
   nil)
 
 ;; ============================================================================

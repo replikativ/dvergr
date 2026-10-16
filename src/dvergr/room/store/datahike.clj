@@ -128,6 +128,7 @@
       (:source-username metadata) (assoc :message/source-username (:source-username metadata))
       (:source-user-id  metadata) (assoc :message/source-user-id  (long (:source-user-id metadata)))
       (seq (:audience metadata)) (assoc :message/audience (set (:audience metadata)))
+      (seq (:dvergr/recipients metadata)) (assoc :message/recipients (:dvergr/recipients metadata))
       (seq (:mentions metadata)) (assoc :message/mention-handles
                                         (set (map str (:mentions metadata))))
       (:kind metadata) (assoc :message/metadata-kind (:kind metadata))
@@ -382,7 +383,7 @@
     :message/from :message/to :message/in-reply-to
     :message/thread-root-id :message/run-id
     :message/reasoning
-    :message/audience :message/mention-handles
+    :message/audience :message/recipients :message/mention-handles
     :message/metadata-kind :message/context-from
     :message/source :message/schedule-id :message/plain?
     :message/attachment-store-ref
@@ -1031,6 +1032,8 @@
                                    (assoc :source-user-id (:message/source-user-id m))
                                    (seq (:message/audience m))
                                    (assoc :audience (set (:message/audience m)))
+                                   (seq (:message/recipients m))
+                                   (assoc :dvergr/recipients (set (:message/recipients m)))
                                    (seq (:message/mention-handles m))
                                    (assoc :mentions (set (:message/mention-handles m)))
                                    (seq attachment) (assoc :attachment attachment)
