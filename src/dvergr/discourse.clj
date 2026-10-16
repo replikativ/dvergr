@@ -2294,6 +2294,11 @@
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
    (assert-settlement-released! fork :merge)
+   ;; a merge writes the parent's systems: only those the parent room's grants
+   ;; permit it to write, checked now (a grant may have been downgraded or
+   ;; detached since the fork wrote), before the fork is claimed
+   (when (fork-handle fork)
+     (srooms/assert-merge-permitted! (:slug parent) (:ctx fork)))
    (let [claim (claim-settlement! fork {:op :merged :parent (:id parent)})]
      (when (map? claim)
        (let [{:keys [settlement in-progress?]} (lost-to fork claim)]

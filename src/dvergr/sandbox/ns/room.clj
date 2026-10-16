@@ -24,7 +24,6 @@
             [dvergr.runtime.ctx :as runtime-ctx]
             [clojure.string :as str]
             [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.yggdrasil :as ygg]
             [dvergr.sandbox.ns.doc :as doc]
             [dvergr.effects :as effects]
             [sci.core :as sci]))
@@ -297,16 +296,19 @@
         gc!            (fn gc!
                          ([] (gc! {}))
                          ([opts]
-                          (effects/perform! effects {:effect :room/gc
-                                                     :resource {:room (str (current-room-id))
-                                                                :remove-before (some? (:remove-before opts))}}
-                                            ;; only the systems the room may
-                                            ;; write: a KB attached :read is
-                                            ;; its owner's storage
-                                            (fn [] (safe #(binding [ec/*execution-context* (selected-ctx)]
-                                                            (if-let [room-id (current-room-id)]
-                                                              (srooms/gc-room! room-id opts)
-                                                              (ygg/gc! opts))))))))
+                          ;; the collections are started here and finish in the
+                          ;; background: the result is data, no computation the
+                          ;; sandbox could run later, after a grant changed
+                          (let [opts (select-keys opts [:remove-before :grace-period-ms :dry-run?])]
+                            (effects/perform! effects {:effect :room/gc
+                                                       :resource {:room (str (current-room-id))
+                                                                  :remove-before (some? (:remove-before opts))}}
+                                              ;; only the systems the room may
+                                              ;; write: a KB attached :read is
+                                              ;; its owner's storage
+                                              (fn [] (safe #(binding [ec/*execution-context* (selected-ctx)]
+                                                              (ns-datahike/seal
+                                                               (srooms/gc-room! (current-room-id) opts)))))))))
         ;; Which KBs this room may WRITE, and which one `*kb*` is. A room's own
         ;; KB is the default, but a room whose knowledge lives in an ATTACHED KB
         ;; would otherwise write into its own empty one with nothing saying so —
@@ -358,5 +360,5 @@
                             recent-messages [([] [n]) "The n most recent messages in THIS room (default 20), newest first."]
                             search-messages [([term]) "Messages in THIS room whose content contains `term` (max 50)."]
                             schedules       [([]) "The schedules registered on THIS room — what runs, and when."]
-                            gc!             [([] [opts]) "Reclaim unreachable storage for this room/fork — datahike index blobs and git objects. Default collects orphan garbage only and KEEPS all history; pass {:remove-before <Date>} to collapse history older than that."]}))]
+                            gc!             [([] [opts]) "Reclaim unreachable storage for this room/fork — datahike index blobs and git objects — of the databases and repositories the room may write. Default collects orphan garbage only and KEEPS all history; pass {:remove-before <Date>} to collapse history older than that. Starts the collections and returns {system-id :started}; they finish in the background."]}))]
     (sci/add-namespace! sci-ctx 'dvergr.room (with-schemas room-map))))

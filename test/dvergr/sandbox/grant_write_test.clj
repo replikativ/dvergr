@@ -13,6 +13,10 @@
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as dh]
+            [dvergr.discourse :as discourse]
+            [dvergr.room.registry :as registry]
+            [dvergr.rooms :as droom]
+            [dvergr.orchestration.daemon :as daemon]
             [dvergr.sandbox :as sandbox]
             [dvergr.substrate.paths :as paths]
             [dvergr.system.db :as sdb]
@@ -32,7 +36,7 @@
   (let [original-home (paths/home)
         home (str (io/file (System/getProperty "java.io.tmpdir")
                            (str "dvergr-grant-write-" (random-uuid))))
-        root (context/create-execution-context)]
+        root (daemon/create-shared-context :with-git? false)]
     (try
       (paths/set-home! home)
       (sdb/reset-conn!)
@@ -59,7 +63,7 @@
         (let [ec (:room-ctx a)
               sci-ctx (sandbox/fork-for-session ec)]
           (sandbox/setup-agent-namespaces! sci-ctx ec :room-id (:room-id a))
-          (reset! world {:a a :b b :c c :ec ec :sci-ctx sci-ctx})
+          (reset! world {:a a :b b :c c :ec ec :sci-ctx sci-ctx :root root})
           (f)))
       (finally
         (srooms/set-grant-permits! nil)
@@ -181,15 +185,69 @@
     (is (= {:ok true} (ev "(d/database-exists? {:store {:id \"c-ledger\"}})")) "and A still sees it")))
 
 (deftest gc-leaves-the-storage-of-read-grants-alone
-  (let [{:keys [a b]} @world
+  (let [{:keys [a b c]} @world
         sid (fn [k path] (str "room-" k "-" (.getName (io/file path))))
         b-kb (sid "kb" (:kb-path b))
+        c-kb (sid "kb" (:kb-path c))
         a-kb (sid "kb" (:kb-path a))
-        r (ev "(set (keys (room/gc! {:dry-run? true})))")]
+        r (ev "(room/gc! {:dry-run? true})")]
     (is (contains? (in-room :a #(set (keys (ygg/registered-systems)))) b-kb)
         "B's KB is registered in A's composite")
     (is (not (contains? (:ok r) b-kb)) (pr-str r))
-    (is (contains? (:ok r) a-kb) "A's own systems are collected")))
+    (is (= :started (get (:ok r) a-kb)) "A's own systems are collected")
+    (testing "the result is data: no computation to run later, after a grant changed"
+      (is (every? #{:started} (vals (:ok r))) (pr-str r)))
+    (testing "a detached system is not the room's either, though still registered"
+      (is (contains? (:ok r) c-kb))
+      (try
+        (sdb/detach! (:room-id a) (:kb-id c))
+        (is (contains? (in-room :a #(set (keys (ygg/registered-systems)))) c-kb))
+        (is (not (contains? (:ok (ev "(room/gc! {:dry-run? true})")) c-kb)))
+        (is (read-only? (ev "(d/transact (room/db \"room-c-kb\") [{:entity/title \"c-detached\"}])")))
+        (finally (sdb/attach! (:room-id a) (:kb-id c) :read-write))))))
+
+(deftest a-fork-does-not-merge-into-a-database-the-room-may-no-longer-write
+  ;; The fork writes C's KB while A's grant is :read-write, the grant is then
+  ;; downgraded, and A's sandbox merges the fork: the merge would land the
+  ;; fork's write in C's KB (confirmed with the check stubbed out).
+  (let [{:keys [a c]} @world
+        room (binding [rtc/*execution-context* (:root @world)]
+               (registry/lookup (droom/create-room! {:slug "merger" :title "merger" :parent-id false})))
+        room-uuid (:room/id (sdb/room-by-slug "merger"))
+        sandbox-in (fn [ctx]
+                     (let [sci-ctx (sandbox/fork-for-session ctx)]
+                       (sandbox/setup-agent-namespaces! sci-ctx ctx :room-id room-uuid)
+                       (fn [code]
+                         (binding [rtc/*execution-context* ctx]
+                           (let [r (sandbox/eval-code sci-ctx (str "(require '[datahike.api :as d] '[dvergr.room :as room]) " code))]
+                             (if (:success r) {:ok (:value r)} {:err (get-in r [:error :message])}))))))
+        fork-of (fn [] (binding [rtc/*execution-context* (:ctx room)]
+                         (discourse/fork-room room {:isolation :ctx})))]
+    (sdb/attach! room-uuid (:kb-id c) :read-write)
+    (binding [rtc/*execution-context* (:ctx room)]
+      (#'srooms/register-system-into-current! {:system/type :kb :system/scope (:kb-path c)}))
+    (try
+      (let [fork (fork-of)
+            in-fork (sandbox-in (:ctx fork))
+            in-room (sandbox-in (:ctx room))]
+        (is (= {:ok 2} (in-fork "(count (:tx-data (d/transact (room/db \"room-c-kb\") [{:entity/title \"c-from-fork\"}])))")))
+        (sdb/attach! room-uuid (:kb-id c) :read)
+        (let [r (in-room (str "(room/merge! \"merger\" " (pr-str (:slug fork)) ")"))]
+          (is (re-find #"may not write" (str (:err r))) (pr-str r)))
+        (is (not (contains? (titles :c) "c-from-fork")) "C's KB is unchanged")
+        (testing "the refused fork can still be discarded"
+          (is (= {:ok (:slug fork)} (in-room (str "(:slug (room/discard! " (pr-str (:slug fork)) "))")))))
+        (testing "a fork that writes only what the room may write merges"
+          (let [fork (fork-of)
+                in-fork (sandbox-in (:ctx fork))]
+            (is (= {:ok 2} (in-fork "(count (:tx-data (d/transact room/*kb* [{:entity/title \"own-from-fork\"}])))")))
+            (is (= {:ok :merger} (in-room (str "(:id (room/merge! \"merger\" " (pr-str (:slug fork)) "))"))))
+            (is (= {:ok #{"own-from-fork"}}
+                   (in-room "(set (d/q '[:find [?t ...] :where [_ :entity/title ?t]] @room/*kb*))"))))))
+      (finally
+        (binding [rtc/*execution-context* (:ctx room)]
+          (try (governance/ungovern! (:conn (:store room))) (catch Throwable _))
+          (discourse/close-room! room))))))
 
 (deftest the-host-answers-for-its-own-permissions
   ;; a host whose vocabulary has more words (simmis: :merge implies :write)

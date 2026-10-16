@@ -142,8 +142,12 @@ cancellable.
   store is never written through a handle, whatever its grant: messages go through
   `dvergr.room/post!`, which records the author. `(dvergr.room/databases)` says which is
   which (`:writable?`). `d/delete-database` deletes only a data DB the room holds as
-  `:owner`, and `dvergr.room/gc!` collects only the systems the room may write; a store
-  attached `:read` is its owner's to delete and collect. The handle offers nothing else:
+  `:owner`, and `dvergr.room/gc!` collects only the systems the room may write (it starts
+  the collections and returns `{system-id :started}`); a store attached `:read`, or one
+  detached since, is its owner's to delete and collect. A fork does not carry a write
+  past a grant either: merging a fork that changed a database the room may no longer
+  write (`dvergr.system.rooms/assert-merge-permitted!`, in `dvergr.discourse/merge-room`)
+  is refused, and the fork can be discarded. The handle offers nothing else:
   no `swap!`/`reset!`, no `:store`, no field access, no `load-entities` (not mirrored).
   `dvergr.sandbox.grant-write-test` runs each of these attacks against a provisioned room.
 - **Gated deps**: `clojure.repl.deps/add-libs` is available (`dvergr.sandbox.deps`) but

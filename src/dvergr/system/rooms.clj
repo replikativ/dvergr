@@ -37,6 +37,7 @@
             [dvergr.substrate.kontor-book :as kontor-book]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.engine.core :as ec]
+            [taoensso.telemere :as tel]
             [yggdrasil.gc :as ygg-gc]
             [yggdrasil.protocols :as ygg-protocols]))
 
@@ -737,26 +738,81 @@
     :book (book-system-name scope)
     nil))
 
+(defn system-write-check
+  "A predicate over Yggdrasil system ids: whether the room `room-id` may
+   write the system (transact it, collect its storage, merge a fork's changes
+   into it). A system the registry knows (KB, messages store, repo, data DB,
+   book) only on a grant of this room that permits `:write`; a detached one,
+   still registered in the room's composite, not at all. A system the
+   registry does not know (a mailbox) is the room's own. Read once: call it
+   again after the grants change."
+  [room-id]
+  (let [registry (into #{} (keep #(system-name (:system/type %) (:system/scope %)))
+                       (sdb/all-systems))
+        writable (into #{}
+                       (keep (fn [{:keys [system permission]}]
+                               (when (grant-permits? permission :write)
+                                 (system-name (:system/type system) (:system/scope system)))))
+                       (when room-id (sdb/systems-for-room room-id)))]
+    (fn [sid] (or (contains? writable sid) (not (contains? registry sid))))))
+
+(defn assert-merge-permitted!
+  "Throws when merging the `:ctx` fork whose context is `fork-ctx` into the
+   room `room-id` would change a system the room may not write
+   (`system-write-check`): a fork may have written a KB while the room's grant
+   permitted it, and the grant was downgraded or detached since. Only a
+   system the fork changed counts (its fork-vs-parent delta is not trivial,
+   `dvergr.rooms.forks/classify`); a delta that cannot be computed counts as
+   a change. Nothing is diffed when every system in the fork may be written.
+   The room is named by its `slug`, as the live Room carries it."
+  [slug fork-ctx]
+  (let [room-id (some-> slug sdb/room-by-slug :room/id)
+        may-write? (system-write-check room-id)
+        blocked (binding [ec/*execution-context* fork-ctx]
+                  (into #{} (remove may-write?) (keys (ygg/registered-systems))))]
+    (when (seq blocked)
+      (let [diff (ygg/context-diff fork-ctx)
+            classify (requiring-resolve 'dvergr.rooms.forks/classify)
+            changed (filterv #(not= :trivial (classify {% (get diff %)} nil)) (sort blocked))]
+        (when (seq changed)
+          (throw (ex-info (str "The fork changed databases this room may not write (its grant does "
+                               "not permit writes, or they were detached): " (pr-str changed)
+                               "; discard the fork")
+                          {:type ::merge-not-permitted :room/id room-id :systems changed})))))))
+
+(defn- start-gc!
+  "Start one system's GC: `gc-system!` answers a partial-cps computation,
+   which runs only when it is called, and completes later (datahike's and the
+   repository's sweeps are async-only). It is called here, with callbacks
+   that log the outcome, so no caller is left holding a computation it could
+   run later, after the room's grant changed."
+  [sid cps]
+  (cps (fn [report]
+         (tel/log! {:level :info :id :rooms/gc-done :data {:system sid :report (pr-str report)}}
+                   "Room storage GC finished"))
+       (fn [error]
+         (tel/log! {:level :warn :id :rooms/gc-failed :data {:system sid :error (str error)}}
+                   "Room storage GC failed")))
+  :started)
+
 (defn gc-room!
   "Reclaim unreachable storage of the room's systems in the bound ctx (the
    room's, or a fork of it), as `ygg/gc!` does, but only of the systems the
-   room may write: one attached on a grant that does not permit `:write` (a
-   KB attached `:read` from another room) is that room's storage, and its GC
-   (`:remove-before` collapses history) is the owner's to run. Systems the
-   room holds on no grant (a mailbox) are the room's own. Returns {system-id
-   -> report}, or nil if nothing was collected."
+   room may write (`system-write-check`): one attached on a grant that does
+   not permit `:write` (a KB attached `:read` from another room), or no
+   longer attached, is its owner's storage, and its GC (`:remove-before`
+   collapses history) is the owner's to run. Each collection is started here
+   and completes in the background (logged as `:rooms/gc-done` or
+   `:rooms/gc-failed`). Returns {system-id -> :started}, or nil if no system
+   may be collected."
   ([room-id] (gc-room! room-id {}))
   ([room-id opts]
-   (let [foreign (into #{}
-                       (keep (fn [{:keys [system permission]}]
-                               (when-not (grant-permits? permission :write)
-                                 (system-name (:system/type system) (:system/scope system)))))
-                       (when room-id (sdb/systems-for-room room-id)))
+   (let [may-write? (system-write-check room-id)
          reports (into {}
                        (keep (fn [[sid sys]]
-                               (when (and (not (contains? foreign sid))
+                               (when (and (may-write? sid)
                                           (satisfies? ygg-protocols/GarbageCollectable sys))
-                                 [sid (ygg-gc/gc-system! sys opts)])))
+                                 [sid (start-gc! sid (ygg-gc/gc-system! sys opts))])))
                        (ygg/registered-systems))]
      (when (seq reports) reports))))
 
