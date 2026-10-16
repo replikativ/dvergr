@@ -16,6 +16,7 @@
             [datahike.api :as d]
             [datahike.blob :as blob]
             [dvergr.effects :as effects]
+            [dvergr.system.rooms :as srooms]
             [dvergr.rooms.forks :as forks]
             [dvergr.sandbox.ns.io :as sio]
             [dvergr.substrate.geschichte :as gs]
@@ -367,6 +368,9 @@
    :message :written [{:path :size :content-id}] :removed [path]}`;
    `:commit` is nil when the files already were as given."
   [room files {:keys [message boundary]}]
+  (binding [ec/*execution-context* (:ctx room)]
+    (when-let [reason (srooms/room-effect-write-refusal room {:effect :room/write})]
+      (effects/deny! {:effect :room/write} :trunk-write-policy reason)))
   (let [entries (plan files)
         {:keys [conn] :as ws} (workspace! room)
         fs (gs/filesystem ws)

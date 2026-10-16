@@ -14,6 +14,10 @@
             [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as dh]
             [dvergr.discourse :as discourse]
+            [dvergr.effects :as effects]
+            [dvergr.rooms.files :as files]
+            [dvergr.rooms.forks :as forks]
+            [dvergr.tools :as tools]
             [dvergr.room.registry :as registry]
             [dvergr.rooms :as droom]
             [dvergr.orchestration.daemon :as daemon]
@@ -67,6 +71,7 @@
           (f)))
       (finally
         (srooms/set-grant-permits! nil)
+        (srooms/set-trunk-write-policy! nil)
         (when-let [{:keys [a b c]} @world]
           (doseq [{:keys [room-ctx room-id]} [a b c]]
             (binding [rtc/*execution-context* room-ctx]
@@ -349,3 +354,113 @@
       (finally
         (srooms/set-grant-permits! nil)
         (sdb/attach! (:room-id a) (:kb-id b) :read)))))
+
+(deftest trunk-policy-makes-held-handles-read-only
+  (let [{:keys [a c ec]} @world
+        before (titles :a)
+        calls (atom [])]
+    (is (= {:ok true} (ev "(def trunk-held (room/db \"room-a-kb\")) true")))
+    (try
+      (srooms/set-trunk-write-policy!
+       (fn [rid sid]
+         (swap! calls conj [rid sid])
+         (when (and (= rid (:room-id a)) (= sid (:kb-id a))) :fork-only)))
+      (doseq [target ["room/*kb*" "trunk-held" "(room/db \"room-a-kb\")"
+                      "(room/kb \"room-a-kb\")" "(d/connect {:store {:id \"room-a-kb\"}})"]
+              tx ["d/transact" "d/transact!"]]
+        (let [r (ev (str "(" tx " " target " [{:entity/title \"trunk-refused\"}])"))]
+          (is (re-find #"this room's workflow writes through forks" (str (:err r))) (pr-str r))))
+      (is (= before (titles :a)))
+      (is (= {:ok false} (ev "(:writable? (first (filter #(= \"room-a-kb\" (:name %)) (room/databases))))")))
+      (is (= {:ok true} (ev "(set? (set (d/q '[:find [?t ...] :where [_ :entity/title ?t]] @trunk-held)))")))
+      (is (contains? (set @calls) [(:room-id a) (:kb-id a)]))
+      (testing "another attached system is unaffected"
+        (is (:ok (ev "(d/transact (room/db \"room-c-kb\") [{:entity/title \"unrestricted-attached\"}])")))
+        (is (contains? (titles :c) "unrestricted-attached"))
+        (binding [rtc/*execution-context* ec]
+          (is (= :success
+                 (:type ((:execute (get @tools/registry "knowledge_add"))
+                         {:title "unrestricted-tool"}
+                         {:kb-conn (srooms/room-kb-conn (:room-id a) "room-c-kb")
+                          :room-id (:room-id a) :execution-ctx ec})))))
+        (is (contains? (titles :c) "unrestricted-tool")))
+      (testing "the system predicate includes the trunk policy"
+        (binding [rtc/*execution-context* ec]
+          (is (false? ((srooms/system-write-check (:room-id a))
+                       (str "room-kb-" (.getName (io/file (:kb-path a)))))))))
+      (finally (srooms/set-trunk-write-policy! nil)))
+    (testing "removing the policy restores held handles"
+      (is (:ok (ev "(d/transact trunk-held [{:entity/title \"trunk-restored\"}])")))
+      (is (contains? (titles :a) "trunk-restored")))
+    (testing "an installed hook returning nil keeps normal writes"
+      (try
+        (srooms/set-trunk-write-policy! (fn [_ _] nil))
+        (is (:ok (ev "(d/transact trunk-held [{:entity/title \"nil-policy\"}])")))
+        (finally (srooms/set-trunk-write-policy! nil))))))
+
+(deftest fork-only-world-writes-and-merges
+  (let [room (binding [rtc/*execution-context* (:root @world)]
+               (registry/lookup (droom/create-room! {:slug "fork-policy" :title "policy" :parent-id false})))
+        rid (:room/id (sdb/room-by-slug "fork-policy"))
+        evaluate (fn [ctx code]
+                   (let [sci-ctx (sandbox/fork-for-session ctx)]
+                     (sandbox/setup-agent-namespaces! sci-ctx ctx :room-id rid)
+                     (binding [rtc/*execution-context* ctx]
+                       (sandbox/eval-code sci-ctx (str "(require '[datahike.api :as d] '[dvergr.room :as room]) " code)))))]
+    (try
+      (srooms/set-trunk-write-policy! (fn [room-id _] (when (= rid room-id) :fork-only)))
+      (is (false? (:success (evaluate (:ctx room) "(d/transact room/*kb* [{:entity/title \"refused\"}])"))))
+      (testing "a fork sharing the trunk context does not unlock its handles"
+        (let [fork (binding [rtc/*execution-context* (:ctx room)]
+                     (discourse/fork-room room {:isolation :none}))]
+          (try
+            (is (re-find #"this room's workflow writes through forks"
+                         (get-in (evaluate (:ctx room) "(d/transact room/*kb* [{:entity/title \"shared-refused\"}])")
+                                 [:error :message])))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                  #"this room's workflow writes through forks"
+                                  (files/write! fork {"policy.txt" {:text "shared-refused"}} {})))
+            (finally (discourse/close-room! fork)))))
+      (testing "file batches and tool gates refuse before their executors"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                              #"this room's workflow writes through forks"
+                              (files/write! room {"policy.txt" {:text "refused"}}
+                                            {:boundary (constantly nil)})))
+        (binding [rtc/*execution-context* (:ctx room)]
+          (is (= :error
+                 (:type ((:execute (get @tools/registry "knowledge_add"))
+                         {:title "tool-refused"}
+                         {:room room :kb-conn (srooms/room-kb-conn rid)})))))
+        (doseq [effect [{:effect :fs/write :resource {:path "/policy.txt"}}
+                        {:effect :git/commit :resource {:message "refused"}}
+                        {:effect :db/transact :resource {:datoms 1}}
+                        {:effect :tool/call :resource {:tool "opaque"}}
+                        {:effect :eval/native :resource {:code "opaque"}}
+                        {:effect :process/run :resource {:cmd "opaque"}}]]
+          (let [ran (atom false)]
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                  #"this room's workflow writes through forks"
+                                  (effects/perform! (tools/effect-boundary {:room room})
+                                                    effect #(reset! ran true))))
+            (is (false? @ran))))
+        (is (re-find #"this room's workflow writes through forks"
+                     (get-in (evaluate (:ctx room) "(spit \"/policy.txt\" \"refused\")") [:error :message]))))
+      (let [fork (binding [rtc/*execution-context* (:ctx room)]
+                   (discourse/fork-room room {:isolation :ctx}))]
+        (is (string? (:commit (files/write! fork {"policy.txt" {:text "accepted"}} {}))))
+        (is (true? (effects/perform! (tools/effect-boundary {:room fork})
+                                     {:effect :tool/call :resource {:tool "opaque"}}
+                                     (constantly true))))
+        (is (:success (evaluate (:ctx fork) "(d/transact room/*kb* [{:entity/title \"fork-accepted\"}])")))
+        (is (= true (:value (evaluate (:ctx fork) "(:writable? (first (filter #(= \"fork-policy-kb\" (:name %)) (room/databases))))"))))
+        (binding [rtc/*execution-context* (:ctx room)]
+          (is (:ok? (forks/merge! fork :expect-state (forks/state-token fork))))))
+      (is (= "accepted" (:text (files/read-file room "policy.txt" {}))))
+      (binding [rtc/*execution-context* (:ctx room)]
+        (is (= #{"fork-accepted"}
+               (set (dh/q '[:find [?t ...] :where [_ :entity/title ?t]] @(srooms/room-kb-conn rid))))))
+      (finally
+        (srooms/set-trunk-write-policy! nil)
+        (binding [rtc/*execution-context* (:ctx room)]
+          (try (governance/ungovern! (:conn (:store room))) (catch Throwable _)))
+        (discourse/close-room! room)))))

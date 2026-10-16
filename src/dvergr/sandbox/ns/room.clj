@@ -211,7 +211,11 @@
                           #(if-let [room-id (current-room-id)]
                              (binding [ec/*execution-context* (selected-ctx)]
                                (srooms/room-kb-conn room-id))
-                             kb-conn)))
+                             kb-conn)
+                          #(when-let [rid (current-room-id)]
+                             (binding [ec/*execution-context* (selected-ctx)]
+                               (let [kb (first (srooms/writable-kbs rid))]
+                                 (srooms/trunk-write-refusal rid (:system-id kb)))))))
         ;; EVERY readable KB, not just `*kb*`. A room's knowledge is spread over
         ;; its own KB plus whatever is granted to it, and the two are written
         ;; through different bindings of the same katzen schema — dvergr's
@@ -325,7 +329,10 @@
               (safe #(ns-datahike/world-connection
                       (fn []
                         (binding [ec/*execution-context* (selected-ctx)]
-                          (srooms/room-kb-conn (current-room-id) slug))))))
+                          (srooms/room-kb-conn (current-room-id) slug)))
+                      (fn []
+                        (binding [ec/*execution-context* (selected-ctx)]
+                          (:write-refusal (srooms/room-database-by-name (current-room-id) slug)))))))
         room-map (merge (ns-kb/room-ops-map ctx agent-program-ceiling
                                             current-source-room
                                             {:acting-agent acting-agent :effects effects}) ; create!/fork!/merge!/post!/messages/…

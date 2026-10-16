@@ -240,10 +240,11 @@
      #(or (:conn (lookup))
           (throw (ex-info (str "No database named " (pr-str (name nm)) " in this room")
                           {:name nm})))
-     #(let [{:keys [type permission writable?] :as found} (lookup)]
+     #(let [{:keys [type permission writable? write-refusal] :as found} (lookup)]
         (cond
           (nil? found) (str "no database named " (pr-str (name nm)) " is attached to this room")
           writable? nil
+          write-refusal write-refusal
           (= :msgs type) (str (pr-str (name nm)) " is a messages store; post messages with "
                               "dvergr.room/post!")
           :else (str (pr-str (name nm)) " is attached to this room with a "

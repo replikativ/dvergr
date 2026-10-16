@@ -1183,6 +1183,12 @@
         boundary   (effects/boundary-resolver
                     binding-resolver audit-log
                     {:relations relations
+                     :write-refusal (fn [effect]
+                                      ;; Database handles check their exact target themselves.
+                                      (when-not (= :db/transact (:effect effect))
+                                        (binding [rtc/*execution-context* (runtime-ctx/selected-context spindel-ctx)]
+                                          ((requiring-resolve 'dvergr.system.rooms/effect-write-refusal)
+                                           (or (some-> binding-resolver (apply []) :room-id) room-id) effect))))
                      :world #(effects/world-handlers (runtime-ctx/selected-context spindel-ctx))
                      :world-sink #(effects/world-sink (runtime-ctx/selected-context spindel-ctx))})
         binding-swap! (when capability-id

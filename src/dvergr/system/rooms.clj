@@ -412,6 +412,61 @@
   [f]
   (reset! grant-permits-hook f))
 
+(defonce ^:private trunk-write-policy-hook (atom nil))
+
+(defn set-trunk-write-policy!
+  "Host hook: `f` is `(fn [room-id system-id] -> :fork-only | nil)`.
+   Both ids are registry ids. :fork-only makes trunk handles read-only;
+   forks still write and merge, subject to grants. nil removes the policy."
+  [f]
+  (reset! trunk-write-policy-hook f))
+
+(defn trunk-write-refusal
+  "The refusal for writing registry system `system-id` in the current world,
+   or nil. An isolated Room marked by `forks/fork?` is unaffected."
+  [room-id system-id]
+  (when-let [policy @trunk-write-policy-hook]
+    (when (and (= :fork-only (policy room-id system-id))
+               (not (and (ec/execution-context-bound?)
+                         (some (fn [room]
+                                 (and ((requiring-resolve 'dvergr.rooms.forks/fork?) room)
+                                      (not (identical? (:ctx room)
+                                                       (:ctx ((requiring-resolve 'dvergr.room.registry/lookup)
+                                                              (:parent-id room)))))
+                                      (rctx/descendant-context?
+                                       (ec/current-execution-context) (:ctx room))))
+                               ((requiring-resolve 'dvergr.room.registry/list-rooms))))))
+      "this room's workflow writes through forks")))
+
+(defn effect-write-refusal
+  "The trunk policy refusal at an effect gate. File effects target repos;
+   database effects target databases. Opaque tools and native/process code
+   may write any attached system. Merge and conversation posting stay available."
+  [room-id {:keys [effect resource]}]
+  (when (and room-id @trunk-write-policy-hook)
+    (let [types (cond
+                  (contains? #{:fs/write :fs/delete :fs/mkdir :fs/move :fs/copy
+                               :git/add :git/commit :room/write} effect) #{:repo}
+                  (= :db/transact effect) #{:kb :data}
+                  (contains? #{:tool/call :eval/native :process/run :room/gc
+                               :db/create :db/delete} effect) #{:kb :data :repo :book}
+                  :else #{})]
+      (some (fn [{:keys [system]}]
+              (when (and (contains? types (:system/type system))
+                         (or (nil? (:system-id resource))
+                             (= (:system-id resource) (:system/id system))))
+                (trunk-write-refusal room-id (:system/id system))))
+            (sdb/systems-for-room room-id)))))
+
+(defn room-effect-write-refusal
+  "The policy refusal for an effect acting on a Room. No policy means no
+   registry access, preserving host calls on rooms without provisioned stores."
+  [room effect]
+  (when (and room @trunk-write-policy-hook)
+    (effect-write-refusal (:room/id (sdb/room-by-slug
+                                     (or (some-> room :meta deref :origin-slug) (:slug room))))
+                          effect)))
+
 (defn grant-permits?
   "Whether a grant with `permission` lets the room do `action` (`:write`) to
    the attached system: the host hook's answer (`set-grant-permits!`), else
@@ -430,6 +485,7 @@
        (mapv (fn [{:keys [system permission]}]
                {:slug (:system/name system)
                 :path (:system/scope system)
+                :system-id (:system/id system)
                 :permission permission}))))
 
 (defn room-repos
@@ -730,8 +786,9 @@
   "Whether sandbox code may transact a database of `type` the room holds on a
    grant with `permission`. A messages store never: messages are posted
    through the posting API, which records who posted them."
-  [type permission]
-  (and (not= :msgs type) (grant-permits? permission :write)))
+  [room-id type permission system-id]
+  (and (not= :msgs type) (grant-permits? permission :write)
+       (nil? (trunk-write-refusal room-id system-id))))
 
 (defn room-databases
   "Every datahike database attached to `room-id` as `{:name :type :permission
@@ -741,9 +798,9 @@
    `dvergr.room/databases` discovery surface."
   [room-id]
   (vec (for [[type dbs] [[:kb (room-kbs room-id)] [:msgs (room-msgs room-id)] [:data (room-data-dbs room-id)]]
-             {:keys [slug permission]} dbs]
+             {:keys [slug permission system-id]} dbs]
          {:name slug :type type :permission permission
-          :writable? (sandbox-writable? type permission)})))
+          :writable? (sandbox-writable? room-id type permission system-id)})))
 
 (defn room-database-by-name
   "The datahike database attached to `room-id` named `db-name` — a data DB,
@@ -753,11 +810,12 @@
   [room-id db-name]
   (let [nm (name db-name)]
     (some (fn [[type dbs system-name]]
-            (some (fn [{:keys [slug path permission]}]
+            (some (fn [{:keys [slug path permission system-id]}]
                     (when (= nm slug)
                       (when-let [conn (:conn (ygg/system (system-name path)))]
                         {:conn conn :type type :permission permission
-                         :writable? (sandbox-writable? type permission)})))
+                         :writable? (sandbox-writable? room-id type permission system-id)
+                         :write-refusal (trunk-write-refusal room-id system-id)})))
                   dbs))
           [[:data (room-data-dbs room-id) data-system-name]
            [:kb (room-kbs room-id) kb-system-name]
@@ -783,6 +841,17 @@
     :book (book-system-name scope)
     nil))
 
+(defn connection-system-id
+  "The registry id of `conn` in the bound world, when a trunk policy is set.
+   Tool transaction effects carry this so an unrelated protected KB does not
+   refuse a write to this connection."
+  [conn]
+  (when (and @trunk-write-policy-hook (ec/execution-context-bound?))
+    (some (fn [{:system/keys [id type scope]}]
+            (when-let [sid (system-name type scope)]
+              (when (identical? conn (:conn (ygg/system sid))) id)))
+          (sdb/all-systems))))
+
 (defn system-write-check
   "A predicate over Yggdrasil system ids: whether the room `room-id` may
    write the system (transact it, collect its storage, merge a fork's changes
@@ -790,16 +859,22 @@
    book) only on a grant of this room that permits `:write`; a detached one,
    still registered in the room's composite, not at all. A system the
    registry does not know (a mailbox) is the room's own. Read once: call it
-   again after the grants change."
-  [room-id]
-  (let [registry (into #{} (keep #(system-name (:system/type %) (:system/scope %)))
-                       (sdb/all-systems))
-        writable (into #{}
-                       (keep (fn [{:keys [system permission]}]
-                               (when (grant-permits? permission :write)
-                                 (system-name (:system/type system) (:system/scope system)))))
-                       (when room-id (sdb/systems-for-room room-id)))]
-    (fn [sid] (or (contains? writable sid) (not (contains? registry sid))))))
+   again after the grants change. The trunk policy is checked on each call
+   of the predicate. The second arity disables only that policy for merge
+   settlement, which still checks grants."
+  ([room-id] (system-write-check room-id true))
+  ([room-id trunk-policy?]
+   (let [systems (sdb/all-systems)
+         ids (into {} (map #(vector (system-name (:system/type %) (:system/scope %)) (:system/id %))) systems)
+         registry (set (keys ids))
+         writable (into #{}
+                        (keep (fn [{:keys [system permission]}]
+                                (when (grant-permits? permission :write)
+                                  (system-name (:system/type system) (:system/scope system)))))
+                        (when room-id (sdb/systems-for-room room-id)))]
+     (fn [sid]
+       (and (or (contains? writable sid) (not (contains? registry sid)))
+            (or (not trunk-policy?) (nil? (trunk-write-refusal room-id (get ids sid sid)))))))))
 
 (defn- delta-changed?
   "Whether a fork's merge-base delta of one system (`ygg/context-diff`)
@@ -828,7 +903,7 @@
    The room is named by its `slug`: the durable room's, for a fork of a fork."
   [slug fork-ctx]
   (let [room-id (some-> slug sdb/room-by-slug :room/id)
-        may-write? (system-write-check room-id)
+        may-write? (system-write-check room-id false)
         blocked (binding [ec/*execution-context* fork-ctx]
                   (into #{} (remove may-write?) (keys (ygg/registered-systems))))]
     (when (seq blocked)
