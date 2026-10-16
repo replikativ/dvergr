@@ -28,6 +28,7 @@
    :room/unarchive :admin, :room/purge :admin, :catalog/promote :admin, :run/resume :admin
 
    :room/fork :worlds, :room/diff :worlds, :room/review :worlds,
+   :review/list :reviews,
    :room/merge :worlds, :room/discard :worlds,
    :room/import :worlds, :room/export :worlds
 
@@ -66,6 +67,7 @@
    :worlds   "Forks of a room: fork, diff, merge, discard"
    :attempts "Run a task N times per model on forks, as a job; Attempts, Scorecards"
    :runs     "The blocking workflow_attempt, and Runs (lower level)"
+   :reviews  "Reviews of retained worlds: checks, verdict, decision; what waits for a person"
    :catalog  "Workflows with their own checker and benchmark set"
    :bench    "Benchmark models on a workflow's benchmark set; experiment progress and reports"
    :wallets  "Budgets and model prices"
@@ -87,8 +89,8 @@
    :bench    {:toolsets #{:rooms :files :attempts :catalog :bench :wallets}}
    ;; REPL-first: the whole API as `dvergr.ops` functions in `clojure_eval`
    :code     {:toolsets #{:repl :describe}
-              :repl-toolsets #{:rooms :files :worlds :attempts :catalog :bench :wallets}}
-   :readonly {:toolsets #{:rooms :files :worlds :attempts :catalog :bench :wallets :agents :system}
+              :repl-toolsets #{:rooms :files :worlds :reviews :attempts :catalog :bench :wallets}}
+   :readonly {:toolsets #{:rooms :files :worlds :reviews :attempts :catalog :bench :wallets :agents :system}
               :read-only? true}
    :admin    {:toolsets (set (keys toolsets))}})
 

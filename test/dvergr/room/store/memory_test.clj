@@ -16,6 +16,9 @@
 (deftest attention-projection-contract
   (contract/assert-attention-projection! (memory/make) :attention-memory))
 
+(deftest review-records-contract
+  (contract/assert-review-records! (memory/make) :reviews-memory))
+
 (deftest concurrent-attention-identity-contract
   (contract/assert-concurrent-attention-identity!
    (memory/make) :attention-race-memory))

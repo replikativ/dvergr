@@ -34,6 +34,7 @@
             [dvergr.agent.ops :as aops]
             [dvergr.agent.run :as run]
             [dvergr.agent.program :as program]
+            [dvergr.agent.review :as review]
             [dvergr.agent.workflow :as workflow]
             [dvergr.agent.grounds :as grounds]
             [dvergr.catalog :as catalog]
@@ -1050,6 +1051,36 @@
                                                    model (assoc :model model)
                                                    status (assoc :status (keyword status))))))))}
 
+   :review/list
+   {:doc (str "Reviews of a room's retained worlds, newest first: the world, its checks (each passed "
+              "or not, with evidence), the reviewer's verdict, and the decision: merged, escalated "
+              "to a person, or discarded. `decision: escalated` lists what waits for a person; "
+              "adopt such a world with room_merge {room: world, expect-state: state_token}.")
+    :kind :read
+    :schema [:map [:room Room]
+             [:decision {:optional true} [:enum {:description "merged | escalated | discarded"} "merged" "escalated" "discarded"]]
+             [:run {:optional true} [:string {:description "the work Run's id"}]]
+             [:limit {:optional true} [:int {:description "max reviews (default 50)"}]]]
+    :impl (fn [daemon {:keys [room decision run limit]}]
+            (when-let [r (resolve-room daemon room)]
+              (in-ctx daemon
+                      (mapv (fn [rv]
+                              (cond-> {:id (str (:review/id rv))
+                                       :world (:review/world rv)
+                                       :state_token (:review/state-token rv)
+                                       :decision (name (:review/decision rv))
+                                       :reasons (vec (:review/reasons rv))
+                                       :checks (mapv (fn [c] {:check (pr-str (:check c)) :passed (boolean (:pass? c))
+                                                              :evidence (pr-str (:evidence c))})
+                                                     (:review/checks rv))
+                                       :reviewed_at (str (.toInstant ^java.util.Date (:review/reviewed-at rv)))}
+                                (:review/run-id rv) (assoc :run (str (:review/run-id rv)))
+                                (:review/verdict rv) (assoc :verdict (update (:review/verdict rv) :review/verdict name))
+                                (:review/spot-check? rv) (assoc :spot_check true)))
+                            (review/reviews r (cond-> {:limit (or limit 50)}
+                                                decision (assoc :decision (keyword decision))
+                                                run (assoc :run-id (or (parse-uuid run) (throw (ex-info (str "Not a Run id: " run) {:run run}))))))))))}
+
    :attempt/export
    {:doc (str "A room's certified Attempts as trajectories, training and analysis data: the task, "
               "the candidate and model, every model turn with its tool calls and results, the "
@@ -1528,13 +1559,15 @@
     :impl (fn [daemon {:keys [room expect-state]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon
+                      ;; checked early for a clear error, and again inside the merge
+                      ;; (`forks/merge!`): nothing changes between the check and the merge
                       (when expect-state
                         (let [now (forks/state-token r)]
                           (when (not= expect-state now)
                             (throw (ex-info (str "Fork " (id->str (:id r)) " changed since it was reviewed"
                                                  " (reviewed " expect-state ", now " now "); review it again")
                                             {:type ::fork-changed :expected expect-state :actual now})))))
-                      (let [{:keys [ok? error] :as res} (forks/reconcile-merge! r)]
+                      (let [{:keys [ok? error] :as res} (forks/reconcile-merge! r :expect-state expect-state)]
                         (when-not ok?
                           (throw (ex-info (str "Merge of " (id->str (:id r)) " failed: " error)
                                           {:type ::merge-failed :error error})))

@@ -285,3 +285,45 @@ checkout and no agent in the room. The whole flow:
 
 To change the table, `room_write` it again and rerun `catalog_cases`; the room's history keeps
 every version.
+
+## Review: from a retained world to a decision
+
+A workflow Run that keeps its world (`:settlement :review`) leaves a fork to adopt.
+`dvergr.agent.review/review!` decides on it under a spec (portable data, e.g. on the
+bundle):
+
+```clojure
+{:review/checks     [:fork/review-tier [:diff/only-paths ["wiki/"]] [:diff/max-files 40] :wiki/v4]
+ :review/reviewer   {:instructions "Approve faithful updates; escalate anything that contradicts a source."}
+ :review/on-pass    :merge        ; or :propose: approved, the merge left to a person
+ :review/on-fail    :escalate     ; or :discard
+ :review/spot-check {:rate 0.1 :seed 7}}
+```
+
+1. Checks, deterministic and first: no conflicts; every changed or uncommitted file under
+   the workflow's declared paths and no other system changed (a workflow writes only what
+   it declares: membership, grants, code, schedules and the bundle itself always go to a
+   person); at most N files; a catalog checker without gold (`:wiki/v4` scores the
+   world's wiki with `score-structure`). A failed check escalates (or discards) and the
+   reviewer is never asked.
+2. The reviewer, when the spec names one: a function the host passes, given the world,
+   its state token, the changed files and the check results, returning
+   `{:review/verdict :approve|:escalate :review/reasons [..] :review/concerns [..]}`.
+   Scripted in tests; a model-backed reviewer runs as its own Run and never edits the
+   world.
+3. A deterministic spot check (`hash(review id, seed) < rate`) sends a sample of approved
+   reviews to a person.
+4. The decision: merged, pinned to the state token that was reviewed (a world that
+   changed since is not merged and escalates), through `ops` as a principal when the host
+   passes `:invoke`; escalated, with a `:review/escalated` message in the room; or
+   discarded.
+
+Each review is one immutable Review record in the room's store (`PReviewStore`, memory
+and Datahike): world, state token, checks with evidence, verdict, decision, the policy's
+content id. `review_list` (MCP toolset `reviews`; `decision: escalated` is what waits
+for a person) lists them.
+
+Next: the model-backed reviewer as a hired Run under its own principal (#316's
+`:authorize`), the review started by the workflow's settlement, and the reviewer
+benchmark (generated good and damaged updates: does it approve the good and escalate the
+bad?).

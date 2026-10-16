@@ -48,6 +48,7 @@
                    (update :scorecard-index
                            #(apply dissoc % scorecard-ids))
                    (update :attention dissoc room-id)
+                   (update :reviews dissoc room-id)
                    (update :attention-index
                            #(apply dissoc % attention-ids)))))))
 
@@ -402,6 +403,32 @@
                           #(str (:attention/id %))))
            (take-last (or limit 1000))
            vec))))
+
+(extend-type MemoryStore
+  store/PReviewStore
+
+  (-store-review! [{:keys [state]} room-id review]
+    (let [review (store/validate-review! review)
+          id (:review/id review)
+          [_ after] (swap-vals! state (fn [s] (if (get-in s [:review-index id])
+                                                s
+                                                (-> s
+                                                    (assoc-in [:reviews room-id id] review)
+                                                    (assoc-in [:review-index id] {:room-id room-id :review review})))))]
+      (when-not (= {:room-id room-id :review review} (get-in after [:review-index id]))
+        (throw (ex-info "A Review is immutable" {:type :room-store/review-identity-collision :review/id id})))
+      review))
+
+  (-load-review [{:keys [state]} room-id review-id]
+    (get-in @state [:reviews room-id review-id]))
+
+  (-list-reviews [{:keys [state]} room-id {:keys [decision run-id limit]}]
+    (->> (vals (get-in @state [:reviews room-id] {}))
+         (filter #(or (nil? decision) (= decision (:review/decision %))))
+         (filter #(or (nil? run-id) (= run-id (:review/run-id %))))
+         (sort-by (juxt #(- (.getTime ^java.util.Date (:review/reviewed-at %))) #(str (:review/id %))))
+         (take (or limit 100))
+         vec)))
 
 (extend-protocol store/PFactFeed
   MemoryStore

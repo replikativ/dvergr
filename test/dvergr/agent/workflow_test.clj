@@ -183,7 +183,7 @@
   (with-room [room :workflow-merge-fail-test]
     (let [daemon {:execution-ctx (:ctx room)}
           fork (binding [ec/*execution-context* (:ctx room)] (forks/fork! room))]
-      (with-redefs [forks/reconcile-merge! (fn [_] {:ok? false :error "parent is gone"})]
+      (with-redefs [forks/reconcile-merge! (fn [& _] {:ok? false :error "parent is gone"})]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"failed: parent is gone"
                               (ops/invoke daemon dvergr.principal/local-principal :room/merge {:room (name (:id fork))})))))))
 

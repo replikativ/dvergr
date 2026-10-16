@@ -598,3 +598,35 @@
            :attention/status :ready
            :attention/metadata {:callback (fn [])}
            :attention/created-at (java.util.Date.)})))))
+
+(defn assert-review-records!
+  "Reviews are immutable, listed newest first, filtered by decision and Run."
+  [st room-id]
+  (testing "a Review is stored once and listed"
+    (store/-store-room! st room-id {:slug (name room-id) :title "Reviews"})
+    (let [run-id (random-uuid)
+          a {:review/id (random-uuid) :review/run-id run-id :review/world "fork-a"
+             :review/state-token "s1" :review/checks [{:check :fork/review-tier :pass? true}]
+             :review/decision :merged :review/reviewed-at (java.util.Date. 1787860800000)}
+          b {:review/id (random-uuid) :review/world "fork-b" :review/state-token "s2"
+             :review/checks [{:check [:diff/only-paths ["/wiki/"]] :pass? false :evidence {:outside ["/x.md"]}}]
+             :review/decision :escalated :review/reasons ["outside the workflow's writes"]
+             :review/reviewed-at (java.util.Date. 1787860800001)}]
+      (is (= a (store/-store-review! st room-id a)))
+      (is (= a (store/-store-review! st room-id a)) "identical content is idempotent")
+      (store/-store-review! st room-id b)
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"immutable"
+                            (store/-store-review! st room-id (assoc a :review/decision :discarded))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (store/-store-review! st room-id (assoc b :review/id (random-uuid) :review/decision :maybe))))
+      (is (= a (store/-load-review st room-id (:review/id a))))
+      (is (nil? (store/-load-review st room-id (random-uuid))))
+      (is (= [b a] (store/-list-reviews st room-id {})) "newest first")
+      (is (= [b] (store/-list-reviews st room-id {:decision :escalated})))
+      (is (= [a] (store/-list-reviews st room-id {:run-id run-id})))
+      (is (= [b] (store/-list-reviews st room-id {:limit 1})))
+      (let [other (keyword (str (name room-id) "-other"))]
+        (store/-store-room! st other {:slug (name other) :title "Other"})
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"immutable" (store/-store-review! st other a))
+            "a Review belongs to one room")
+        (is (empty? (store/-list-reviews st other {})))))))

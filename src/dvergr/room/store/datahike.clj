@@ -825,6 +825,10 @@
                                 (into (map (fn [aid]
                                              [:db/retractEntity [:attention/id aid]])
                                            attention-ids))
+                                (into (map (fn [id] [:db/retractEntity [:review/id id]]))
+                                      (dh/q '[:find [?id ...] :in $ ?cid
+                                              :where [?c :chat/id ?cid] [?r :review/chat ?c] [?r :review/id ?id]]
+                                            @conn chat-id))
                                 (conj [:db/retractEntity [:chat/id chat-id]])))))))
 
   (-list-rooms [_]
@@ -1594,6 +1598,61 @@
   (-unlisten! [this key]
     (dh/unlisten (:conn this) key)
     nil))
+
+(defn- entity->review [entity]
+  (some-> (:review/payload-edn entity) edn/read-string))
+
+(extend-type DatahikeStore
+  store/PReviewStore
+
+  (-store-review! [{:keys [conn]} room-id review]
+    (let [review (store/validate-review! review)
+          id (:review/id review)
+          payload (pr-str review)
+          ent (room-by-slug conn (store/room-id->slug room-id))
+          _ (when-not ent
+              (throw (ex-info "No room to store a Review in" {:type :room-store/unknown-room :room-id room-id})))
+          existing (fn [] (dh/q '[:find [?cid ?p] :in $ ?id
+                                  :where [?r :review/id ?id] [?r :review/payload-edn ?p]
+                                  [?r :review/chat ?c] [?c :chat/id ?cid]]
+                                @conn id))
+          same? (fn [[cid p]] (and (= cid (:chat/id ent)) (= p payload)))
+          collision #(ex-info "A Review is immutable" {:type :room-store/review-identity-collision :review/id id})]
+      (if-let [e (existing)]
+        (if (same? e) review (throw (collision)))
+        (do (try (dh/transact conn [(cond-> {:db/id "review"
+                                             :review/id id
+                                             :review/chat [:chat/id (:chat/id ent)]
+                                             :review/world (:review/world review)
+                                             :review/decision (:review/decision review)
+                                             :review/reviewed-at (:review/reviewed-at review)
+                                             :review/payload-edn payload}
+                                      (:review/run-id review) (assoc :review/run-id (:review/run-id review)))])
+                 ;; a concurrent writer of the same id won (unique value): identical is fine
+                 (catch Throwable t
+                   (let [e (existing)]
+                     (when-not (and e (same? e)) (throw (if e (collision) t))))))
+            review))))
+
+  (-load-review [{:keys [conn]} room-id review-id]
+    (when-let [ent (room-by-slug conn (store/room-id->slug room-id))]
+      (some-> (dh/q '[:find ?p . :in $ ?cid ?id
+                      :where [?c :chat/id ?cid] [?r :review/chat ?c] [?r :review/id ?id] [?r :review/payload-edn ?p]]
+                    @conn (:chat/id ent) review-id)
+              edn/read-string)))
+
+  (-list-reviews [{:keys [conn]} room-id {:keys [decision run-id limit]}]
+    (if-let [ent (room-by-slug conn (store/room-id->slug room-id))]
+      (->> (dh/q '[:find [(pull ?r [:review/payload-edn]) ...] :in $ ?cid
+                   :where [?c :chat/id ?cid] [?r :review/chat ?c]]
+                 @conn (:chat/id ent))
+           (map entity->review)
+           (filter #(or (nil? decision) (= decision (:review/decision %))))
+           (filter #(or (nil? run-id) (= run-id (:review/run-id %))))
+           (sort-by (juxt #(- (.getTime ^java.util.Date (:review/reviewed-at %))) #(str (:review/id %))))
+           (take (or limit 100))
+           vec)
+      [])))
 
 (defn make
   "Create a DatahikeStore over an existing Datahike connection. An optional
