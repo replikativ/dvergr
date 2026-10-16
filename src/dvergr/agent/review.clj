@@ -29,13 +29,20 @@
 
    `review!` blocks (diffs, checks, a merge): call it at a boundary or from a
    worker, never inside a Spin."
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
+            [datahike.constants :as dc]
             [dvergr.discourse :as d]
+            [dvergr.kb.wiki :as kb-wiki]
+            [dvergr.room.registry :as rreg]
             [dvergr.room.store :as store]
             [dvergr.rooms.forks :as forks]
-            [dvergr.room.registry :as rreg]
+            [dvergr.system.db :as sdb]
+            [dvergr.system.rooms :as rooms]
             [hasch.core :as hasch]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.yggdrasil :as ygg]
+            [yggdrasil.protocols :as yp]))
 
 (def default-spec
   {:review/checks [:fork/review-tier]
@@ -51,7 +58,8 @@
 (defmulti run-check
   "Run one check of a spec on a retained world: `{:pass? bool :evidence data}`.
    `ctx` is `{:fork room :review forks/review-map :files [paths] :other-systems
-   [ids]}`."
+   [ids] :kb-systems [yggdrasil-ids]}`. `review!` derives `:kb-systems` from
+   the spec for composition with `:diff/only-paths`."
   (fn [check _ctx] (check-key check)))
 
 (defmethod run-check :default [check _]
@@ -64,8 +72,9 @@
   (let [p (str/replace (str path) #"^/+" "")]
     (some #(str/starts-with? p (str/replace (str %) #"^/+" "")) prefixes)))
 
-(defmethod run-check :diff/only-paths [[_ prefixes] {:keys [files other-systems]}]
-  (let [outside (vec (remove #(under? % prefixes) files))]
+(defmethod run-check :diff/only-paths [[_ prefixes] {:keys [files other-systems kb-systems]}]
+  (let [other-systems (remove (set kb-systems) other-systems)
+        outside (vec (remove #(under? % prefixes) files))]
     {:pass? (and (empty? outside) (empty? other-systems))
      :evidence (cond-> {}
                  (seq outside) (assoc :outside (vec (take 20 outside)))
@@ -101,6 +110,62 @@
                                      p)
                                    (map :path (forks/uncommitted fork)))))
      :other-systems (vec (sort others))}))
+
+(defn- kb-system-id [registry-id]
+  (let [system (sdb/system-by-id registry-id)]
+    (when-not (= :kb (:system/type system))
+      (throw (ex-info "Review scope must name a registered KB" {:system registry-id})))
+    (rooms/kb-system-name (:system/scope system))))
+
+(defn- kb-snapshots [fork sid]
+  (binding [ec/*execution-context* (:ctx fork)]
+    (let [child (ygg/system sid)
+          parent (when child (ygg/parent-system child))]
+      (when-not (and child parent)
+        (throw (ex-info "Review KB is missing from fork or parent" {:system sid})))
+      (let [head (yp/snapshot-id child)
+            base (yp/common-ancestor child (yp/snapshot-id parent) head)]
+        (when-not base
+          (throw (ex-info "Review KB has no merge base" {:system sid})))
+        [(yp/as-of parent base) (yp/as-of child head)]))))
+
+(defn- kb-offenders
+  ([before after kinds] (kb-offenders before after kinds (kb-wiki/attrs nil nil)))
+  ([before after kinds a]
+   (let [page-attrs (set (map a [:title :name :kind :source :entry-point :archived :created-at :updated-at]))
+         block-attrs (set (map a [:parent :order :content :collapsed :references :mentions]))
+         index (fn [datoms] (reduce (fn [m [e attr v]] (assoc-in m [e attr] v)) {} datoms))
+         before-index (index before) after-index (index after)
+         wiki? (fn [entities id]
+                 (loop [id id seen #{} depth 0]
+                   (let [entity (entities id)]
+                     (cond
+                       (or (seen id) (> depth 1000) (nil? entity)) false
+                       (contains? entity (:kind a)) (contains? kinds (get entity (:kind a)))
+                       (contains? entity (:parent a)) (recur (get entity (:parent a)) (conj seen id) (inc depth))
+                       :else false))))
+         allowed? (fn [entities e attr]
+                    (let [entity (entities e)]
+                      (and (wiki? entities e)
+                           (contains? (if (contains? entity (:kind a)) page-attrs block-attrs) attr))))]
+     (->> (set/union (set/difference after before) (set/difference before after))
+         ;; Datahike's generated transaction clock is not authored KB content.
+          (remove (fn [[e attr]] (and (<= dc/tx0 e) (= :db/txInstant attr))))
+          (keep (fn [[e attr]]
+                  (when-not (and (or (nil? (before-index e)) (allowed? before-index e attr))
+                                 (or (nil? (after-index e)) (allowed? after-index e attr)))
+                    {:entity e :attribute attr})))
+          distinct (sort-by (juxt :entity (comp str :attribute))) (take 20) vec))))
+
+(defmethod run-check :diff/only-kb-pages
+  [[_ {:keys [system kinds]}] {:keys [fork other-systems]}]
+  (let [sid (kb-system-id system)
+        [before after] (kb-snapshots fork sid)
+        offenders (kb-offenders (kb-wiki/datoms before) (kb-wiki/datoms after) kinds (kb-wiki/attrs before nil))
+        others (vec (remove #{sid} other-systems))]
+    {:pass? (and (empty? offenders) (empty? others))
+     :evidence (cond-> {:offenders offenders}
+                 (seq others) (assoc :other-systems others))}))
 
 ;; ============================================================================
 ;; The review
@@ -180,7 +245,11 @@
           rev (or (forks/review fork)
                   (throw (ex-info (str world " is not a reviewable fork") {:type ::not-reviewable :world world})))
           state (:state rev)
-          ctx (merge {:fork fork :review rev} (changed-files fork rev))
+          ctx (merge {:fork fork :review rev
+                      :kb-systems (vec (for [[k opts] (filter vector? (:review/checks spec))
+                                             :when (= :diff/only-kb-pages k)]
+                                         (try (kb-system-id (:system opts)) (catch Exception _ nil))))}
+                     (changed-files fork rev))
           checks (vec (for [c (:review/checks spec)]
                         (merge {:check c} (try (run-check c ctx)
                                                (catch Throwable t {:pass? false :evidence {:error (.getMessage t)}})))))

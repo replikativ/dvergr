@@ -6,6 +6,7 @@
         hato/hato                  {:mvn/version "1.0.0"}
         ;; document processing (dvergr.media.doc — pdf text extraction)
         org.apache.pdfbox/pdfbox   {:mvn/version "3.0.3"}
+        org.jsoup/jsoup           {:mvn/version "1.22.1"}
 
         ;; JSON encoding/decoding
         metosin/jsonista           {:mvn/version "0.3.8"}

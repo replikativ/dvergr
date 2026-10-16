@@ -2,7 +2,11 @@
   "The review stage over retained worlds, with a scripted reviewer: checks
    first (a failed one never asks the reviewer), the verdict, spot checks,
    merges pinned to the reviewed state, escalation and the stored record."
-  (:require [clojure.string :as str]
+  (:require [datahike.api :as dh]
+            [dvergr.catalog.kb-pages-test :as kb-pages]
+            [dvergr.system.rooms :as rooms]
+            [org.replikativ.spindel.engine.core :as ec]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.agent.review :as review]
             [dvergr.catalog :as catalog]
@@ -254,3 +258,35 @@
     (is (= {"/wiki/a.md" "a\n" "/wiki/b.md" "b\n"} (catalog/read-tree (r) "/wiki")))
     (is (= #{(:review/id ra) (:review/id rb)} (set (map :review/id (review/reviews (r)))))
         "each Review once")))
+
+(deftest kb-review-reads-the-merge-base-and-composes-with-paths
+  (let [room (:id (op :room/create {:title "rv-kb" :slug "rv-kb"}))
+        parent (ops/resolve-room *daemon* room)
+        rid (:room/id (sdb/room-by-slug "rv-kb"))
+        registry-id (binding [ec/*execution-context* (:ctx parent)]
+                      (let [conn (rooms/room-kb-conn rid)]
+                        (dh/transact conn kb-pages/schema)
+                        (dh/transact conn (mapv #(cond-> (update % :db/id + 10000)
+                                                   (:block/parent %) (update :block/parent + 10000))
+                                                kb-pages/fixture))
+                        (:system/id (:system (first (sdb/systems-for-room-of-type rid :kb))))))
+        fork-name (:id (op :room/fork {:room room}))
+        fork (ops/resolve-room *daemon* fork-name)
+        spec {:review/checks [[:diff/only-paths ["wiki/"]]
+                              [:diff/only-kb-pages {:system registry-id
+                                                    :kinds #{:wiki/atom :wiki/overview :wiki/index}}]]
+              :review/on-pass :propose}]
+    (binding [ec/*execution-context* (:ctx parent)]
+      (dh/transact (rooms/room-kb-conn rid) [{:db/id 10300 :S.Page/title "Concurrent notes" :S.Page/kind :note}]))
+    (binding [ec/*execution-context* (:ctx fork)]
+      (dh/transact (rooms/room-kb-conn rid) [{:db/id 10104 :block/content "<p>Edited</p>" :block/references 10100}]))
+    (let [rv (review/review! parent (:id fork) spec)]
+      (is (every? :pass? (:review/checks rv)) (pr-str (:review/checks rv))))
+    (binding [ec/*execution-context* (:ctx fork)]
+      (dh/transact (rooms/room-kb-conn rid) [{:db/id 10100 :grant/permission :owner}]))
+    (let [rv (review/review! parent (:id fork) spec)]
+      (is (not (get-in rv [:review/checks 1 :pass?])))
+      (is (= [{:entity 10100 :attribute :grant/permission}]
+             (get-in rv [:review/checks 1 :evidence :offenders]))))
+    (is (not (:pass? (review/run-check (second (:review/checks spec))
+                                       {:fork fork :other-systems ["another-kb"]}))))))

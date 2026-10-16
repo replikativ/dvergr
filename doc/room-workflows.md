@@ -323,6 +323,11 @@ and Datahike): world, state token, checks with evidence, verdict, decision, the 
 content id. `review_list` (MCP toolset `reviews`; `decision: escalated` is what waits
 for a person) lists them.
 
+For KB wikis, `wiki-v4/kb->pages` projects tiptap blocks into the same scorer
+input, and `:diff/only-kb-pages` restricts review to wiki datoms in one named KB.
+See [the KB wiki contract](kb-wiki.md) for the projection and composing it with
+`only-paths`.
+
 Next: the model-backed reviewer as a hired Run under its own principal (#316's
 `:authorize`), the review started by the workflow's settlement, and the reviewer
 benchmark (generated good and damaged updates: does it approve the good and escalate the
