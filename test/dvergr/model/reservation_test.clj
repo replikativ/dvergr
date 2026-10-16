@@ -266,6 +266,15 @@
                                  (apply move args)))}
               #(is (thrown? Exception (resource/charge-spend! 100M)))))
           (is (= 100M (held))))
+        (testing "a hold that cannot be read sends nothing to the wallet"
+          (let [read resource/balance]
+            (with-redefs [resource/balance (fn [r account]
+                                             (if (= account hold)
+                                               (throw (ex-info "ledger unavailable" {}))
+                                               (read r account)))]
+              (is (thrown? Exception (resource/charge-spend! 100M)))))
+          (is (= 100M (held)))
+          (is (= 999900M (left room run-id))))
         (testing "the charge made again draws on it"
           (binding [resource/*spend-wallet* (resource/spending (resource/spend-wallet room run-id)
                                                                [:test run-id])]

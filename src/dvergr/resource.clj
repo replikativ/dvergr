@@ -468,8 +468,13 @@
    debit `id`; returns the amount drawn. Its caller holds the wallet's lock."
   [{:keys [room wallet] :as payer} id cost]
   (let [hold (hold-wallet-id wallet)
+        ;; no hold opened yet holds nothing; any other failure to read it
+        ;; must not send the charge to the wallet
         has (get (try (balance room (kontor/account-ref hold))
-                      (catch clojure.lang.ExceptionInfo _ {}))
+                      (catch clojure.lang.ExceptionInfo e
+                        (if (= :kontor.resource/account-not-found (:type (ex-data e)))
+                          {}
+                          (throw e))))
                  microdollars 0M)
         n (min cost has)]
     (move! payer hold :consume id kontor/sink-account n)
