@@ -7,6 +7,7 @@
             [dvergr.agent.workflow :as workflow]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.discourse :as d]
+            [dvergr.rooms.forks :as forks]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.providers :as providers]
             [dvergr.room.registry :as rreg]
@@ -79,8 +80,10 @@
         (testing "every member's Run records the search, its weight and its decision"
           (doseq [{:keys [run/id search/weight search/decision]} members]
             (is (= {:search/id (:search/id outcome) :search/policy :automatic :search/members 3
-                    :search/weight weight :search/decision decision :search/status :settled}
-                   (durable-search room id)))))
+                    :search/weight weight :search/decision decision :search/status :settled
+                    :search/outcome ({:merge :merged :review :review :discard :discarded} decision)}
+                   (dissoc (durable-search room id) :search/manifest)))
+            (is (= 3 (count (:search/manifest (durable-search room id)))) "every record carries the manifest")))
         (testing "the Runs' settlement follows the decision"
           (let [status #(:run/settlement-status
                          (store/-load-run (:store room) (store/conversation-id room) (:run/id %)))]
@@ -187,3 +190,43 @@
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"member of another search"
                                 (run/record-search! room (:run/id (first (:search/members first-run)))
                                                     {:search/id (random-uuid)}))))))))
+
+(deftest concurrent-selections-of-one-search-merge-one-world
+  (with-room :search-concurrent-test
+    (fn [room]
+      (let [members (held room 2 search/speculative-effects)
+            id (random-uuid)
+            start (promise)
+            run (fn [w] (future @start (search/select! room members {:policy :automatic :search-id id
+                                                                     :weigh (fn [m] (if (= m (first members)) w (- w)))})))
+            a (run 1.0) b (run -1.0)]
+        (deliver start true)
+        (let [outcomes [@a @b]]
+          (is (apply = (map :search/selected outcomes)) "both report the one winner")
+          (is (= 1 (count (filter #(= :merged (:search/outcome %)) (:search/members (first outcomes)))))))))))
+
+(deftest a-merge-whose-cleanup-failed-is-merged-and-incomplete-until-reconciled
+  (with-room :search-incomplete-test
+    (fn [room]
+      (let [members (held room 2 search/speculative-effects)
+            merge! forks/merge!
+            outcome (with-redefs [forks/merge! (fn [fork & opts]
+                                                 (apply merge! fork opts)
+                                                 {:ok? false :error "cleanup failed"})]
+                      (search/select! room members {:policy :automatic}))
+            winner (some #(when (= :merge (:search/decision %)) %) (:search/members outcome))]
+        (is (= [:merged :incomplete] ((juxt :search/outcome :search/status) winner)))
+        (is (= (:run/id winner) (:search/selected outcome)) "the parent has its changes")
+        (let [again (search/select! room members {:policy :automatic :search-id (:search/id outcome)})
+              winner (some #(when (= :merge (:search/decision %)) %) (:search/members again))]
+          (is (= [:merged :settled] ((juxt :search/outcome :search/status) winner))))))))
+
+(deftest claims-are-all-or-none
+  (with-room :search-claim-test
+    (fn [room]
+      (let [[a b c] (map #(get-in % [:attempt :attempt/receipt :attempt/run-id])
+                         (held room 3 search/speculative-effects))]
+        (run/claim-search! room {a {:search/id 1} b {:search/id 1}})
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"member of another search"
+                              (run/claim-search! room {b {:search/id 2} c {:search/id 2}})))
+        (is (nil? (durable-search room c)) "nothing of the losing claim was written")))))

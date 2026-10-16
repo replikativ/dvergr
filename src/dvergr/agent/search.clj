@@ -40,6 +40,7 @@
   (:require [clojure.set :as set]
             [dvergr.agent.run :as run]
             [dvergr.agent.workflow :as workflow]
+            [dvergr.discourse :as d]
             [dvergr.effects :as effects]
             [dvergr.room.registry :as rreg]
             [dvergr.room.store :as store]
@@ -157,111 +158,135 @@
       (refuse "a member to merge needs its review token"))))
 
 (defn- settle!
-  "Settle a held member's world by `decision`. Returns `{:decision actual
-   :ok? bool :error message}`. A merge refused before the world was merged
-   leaves it in review; one that merged but failed afterwards (its Run's
-   settlement record) still merged."
-  [room {:keys [world review] :as member} decision]
-  (let [fork (rreg/lookup world)
+  "Settle a held member's world by `decision`. Returns `{:outcome :merged |
+   :review | :discarded | nil, :status :settled | :failed | :incomplete,
+   :error message}`. A merge refused before the world was merged leaves it in
+   review; one whose substrate merged but whose cleanup or durable projection
+   failed is `:merged` and `:incomplete` (the parent has its changes)."
+  [room member decision]
+  (let [fork (rreg/lookup (:world member))
         attempt (fn [f] (try (f) (catch Throwable t {:ok? false :error (.getMessage t)})))]
     (case decision
       :discard (let [r (attempt #(forks/discard-deferred! fork :search-unselected))]
-                 {:decision :discard :ok? (boolean (:ok? r)) :error (:error r)})
+                 (if (:ok? r)
+                   {:outcome :discarded :status :settled}
+                   {:status :failed :error (:error r)}))
       :review (let [r (attempt #(forks/release-deferred! fork :search-retained))]
-                {:decision :review :ok? (boolean (:ok? r)) :error (:error r)})
+                (if (:ok? r)
+                  {:outcome :review :status :settled}
+                  {:status :failed :error (:error r)}))
       :merge (let [released (attempt #(forks/release-deferred! fork :search-selected))]
                (if-not (:ok? released)
-                 {:decision :merge :ok? false :error (:error released)}
-                 (let [merged (attempt #(forks/merge! fork :expect-state (:state review)))]
+                 {:status :failed :error (:error released)}
+                 (let [merged (attempt #(forks/merge! fork :expect-state (get-in member [:review :state])))
+                       substrate (or (d/settlement fork) (d/settlement-claim fork))
+                       durable (:run/settlement-status (durable-run room (run-id-of member)))]
                    (cond
-                     (:ok? merged) {:decision :merge :ok? true}
-                     ;; merged, then a later step failed: the world is gone
-                     (or (nil? (rreg/lookup world))
-                         (= :merged (:run/settlement-status (durable-run room (run-id-of member)))))
-                     {:decision :merge :ok? true :error (:error merged)}
+                     (and (:ok? merged) (= :merged durable)) {:outcome :merged :status :settled}
+                     ;; the substrate merged, its cleanup or projection did not
+                     (= :merged (:op substrate))
+                     {:outcome :merged :status :incomplete :error (:error merged)}
                      ;; refused before merging: it waits in review for a person
-                     :else {:decision :review :ok? true :error (:error merged)})))))))
+                     :else {:outcome :review :status :settled :error (:error merged)})))))))
 
 (defn- reconciled
-  "A pending member's outcome when its world was settled but the outcome not
-   recorded (a failed write, a crash): read from its Run's durable settlement
-   and its world. nil while the member is still held."
+  "The outcome of a member whose world was settled but not recorded (a failed
+   write, a crash), or whose merge was incomplete and has since completed:
+   read from its Run's durable settlement and its world. nil while it is
+   still held or incomplete."
   [room member]
   (let [status (:run/settlement-status (durable-run room (run-id-of member)))
         fork (rreg/lookup (:world member))]
     (cond
-      (= :merged status) :merge
-      (= :discarded status) :discard
+      (and (= :merged status) (nil? fork)) :merged
+      (= :discarded status) :discarded
       (and (= :review status) fork (not (forks/deferred? fork))) :review
       :else nil)))
+
+(defonce ^:private search-locks (atom {}))
+
+(defn- search-lock [search-id]
+  (or (get @search-locks search-id)
+      (get (swap! search-locks #(if (contains? % search-id) % (assoc % search-id (Object.)))) search-id)))
 
 (defn select!
   "Join the `members` of one search (the rows of `workflow/attempt!` with
    `:hold? true` under `speculative` effects) in `room`: weigh them, decide,
-   claim every member with its intended decision, settle each world, and
-   record each outcome. Call at a boundary, not inside a Spin.
+   claim every member with the decisions, settle each world, and record each
+   outcome. Call at a boundary, not inside a Spin.
 
-   A Run is a member of one search: claiming it records the search's id, and
-   another search's claim is refused (in Run order, so a losing search claims
-   nothing). Again with the same `:search-id`, `select!` keeps the recorded
-   weights and decisions, reconciles members whose world was settled but
-   whose outcome was not recorded, and settles the rest.
+   What a search decides is written once: every member's record carries the
+   manifest of all members' weights and decisions, and a later record of the
+   same search changes only the outcome. A Run is a member of one search,
+   claimed for it all or none (`dvergr.agent.run/claim-search!`). Selection
+   is serialized per search in this process. Again with the same `:search-id`
+   (a crash, a failed write), `select!` takes the decisions from the
+   manifest, claims what was not claimed, reconciles what was settled but not
+   recorded, and settles the rest.
 
    Options: `:policy` (`:automatic`, default), `:weigh` (member -> log
    weight, default `reward-weight`), `:retain` (default 0), `:search-id`.
    Returns `{:search/id :search/policy :search/selected run-id-or-nil
    :search/members [{:run/id :world :search/weight :search/decision
-   :search/status :search/error}]}`."
+   :search/outcome :search/status :search/error}]}`."
   [room members {:keys [policy weigh search-id] :or {policy :automatic} :as opts}]
   (validate-options! opts)
-  (binding [ec/*execution-context* (:ctx room)]
-    (let [search-id (or search-id (random-uuid))
-          prior (mapv #(some-> (durable-run room (run-id-of %)) run/search-record) members)
-          retry? (some #(= search-id (:search/id %)) prior)
-          _ (when (and retry? (not (every? #(and (= search-id (:search/id %))
-                                                 (= policy (:search/policy %))
-                                                 (= (count members) (:search/members %)))
+  (let [search-id (or search-id (random-uuid))]
+    (locking (search-lock search-id)
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [run-ids (mapv run-id-of members)
+              records #(mapv (fn [m] (some-> (durable-run room (run-id-of m)) run/search-record)) members)
+              prior (records)
+              manifest (some #(when (= search-id (:search/id %)) (:search/manifest %)) prior)
+              _ (when (and manifest
+                           (or (not= (set (map str run-ids)) (set (keys manifest)))
+                               (not-every? #(or (nil? %) (and (= search-id (:search/id %))
+                                                              (= policy (:search/policy %))))
                                            prior)))
-              (throw (ex-info "A retried search must have the same members and policy"
-                              {:type ::incompatible-retry :search/id search-id})))
-          ;; a retry keeps what was decided: a judge asked again may differ
-          weights (if retry? (mapv :search/weight prior) (mapv #(double ((or weigh reward-weight) %)) members))
-          decisions (if retry? (mapv :search/decision prior) (decide weights (assoc opts :policy policy)))
-          base (fn [i] {:search/id search-id :search/policy policy
-                        :search/members (count members)
-                        :search/weight (nth weights i)})
-          record! (fn [i decision status & [error]]
-                    (run/record-search! room (run-id-of (nth members i))
-                                        (cond-> (assoc (base i) :search/decision decision
-                                                       :search/status status)
-                                          error (assoc :search/error error))))
-          ;; members whose world was settled but whose outcome was not recorded
-          _ (doseq [i (range (count members))
-                    :when (= :pending (:search/status (nth prior i)))
-                    :let [outcome (reconciled room (nth members i))]
-                    :when outcome]
-              (record! i outcome :settled))
-          now (mapv #(some-> (durable-run room (run-id-of %)) run/search-record) members)
-          todo (vec (remove #(= :settled (:search/status (nth now %))) (range (count members))))]
-      (preflight! room members decisions todo)
-      ;; 1. claim each member with its intended decision, durably, in Run order
-      (doseq [i (sort-by #(str (run-id-of (nth members %))) todo)]
-        (record! i (nth decisions i) :pending))
-      ;; 2. settle, the merge first; 3. record each outcome
-      (doseq [i (sort-by #(if (= :merge (nth decisions %)) 0 1) todo)]
-        (let [{:keys [decision ok? error]} (settle! room (nth members i) (nth decisions i))]
-          (record! i decision (if ok? :settled :failed) error)))
-      (let [rows (mapv (fn [member]
-                         (-> (run/search-record (durable-run room (run-id-of member)))
-                             (assoc :run/id (run-id-of member) :world (:world member))))
-                       members)]
-        {:search/id search-id
-         :search/policy policy
-         :search/selected (some #(when (and (= :merge (:search/decision %))
-                                            (= :settled (:search/status %)))
-                                   (:run/id %))
-                                rows)
-         :search/members rows}))))
+                  (throw (ex-info "A retried search must have the same members and policy"
+                                  {:type ::incompatible-retry :search/id search-id})))
+              ;; a retry keeps what was decided: a judge asked again may differ
+              weights (if manifest
+                        (mapv #(first (get manifest (str %))) run-ids)
+                        (mapv #(double ((or weigh reward-weight) %)) members))
+              decisions (if manifest
+                          (mapv #(second (get manifest (str %))) run-ids)
+                          (decide weights (assoc opts :policy policy)))
+              manifest (or manifest (zipmap (map str run-ids) (map vector weights decisions)))
+              intent (fn [i] {:search/id search-id :search/policy policy
+                              :search/members (count members) :search/manifest manifest
+                              :search/weight (nth weights i) :search/decision (nth decisions i)})
+              record! (fn [i outcome]
+                        (run/record-search! room (nth run-ids i)
+                                            (merge (intent i) (select-keys outcome [:search/outcome :search/status :search/error]))))]
+          ;; members settled but not recorded, or incomplete merges completed since
+          (doseq [i (range (count members))
+                  :let [p (nth prior i)]
+                  :when (and (= search-id (:search/id p)) (#{:pending :incomplete} (:search/status p)))
+                  :let [outcome (reconciled room (nth members i))]
+                  :when outcome]
+            (record! i {:search/outcome outcome :search/status :settled}))
+          (let [now (records)
+                done? #(#{:settled :incomplete} (:search/status (nth now %)))
+                todo (vec (remove done? (range (count members))))]
+            (preflight! room members decisions todo)
+            ;; 1. claim the members, all or none, with the decisions
+            (run/claim-search! room (into {} (map (fn [i] [(nth run-ids i) (assoc (intent i) :search/status :pending)])) todo))
+            ;; 2. settle, the merge first; 3. record each outcome
+            (doseq [i (sort-by #(if (= :merge (nth decisions %)) 0 1) todo)]
+              (let [{:keys [outcome status error]} (settle! room (nth members i) (nth decisions i))]
+                (record! i (cond-> {:search/status status}
+                             outcome (assoc :search/outcome outcome)
+                             error (assoc :search/error error))))))
+          (let [rows (mapv (fn [member]
+                             (-> (run/search-record (durable-run room (run-id-of member)))
+                                 (dissoc :search/manifest)
+                                 (assoc :run/id (run-id-of member) :world (:world member))))
+                           members)]
+            {:search/id search-id
+             :search/policy policy
+             :search/selected (some #(when (= :merged (:search/outcome %)) (:run/id %)) rows)
+             :search/members rows}))))))
 
 (defn search!
   "Attempt `task` in `room` as a search: `workflow/attempt!` (its options:
