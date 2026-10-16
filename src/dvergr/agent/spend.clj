@@ -56,17 +56,22 @@
    and Claude Code report it): the cached part is billed at the cache rates
    (`:cache-read`; `:cache-write`, else the input rate), the rest at the
    input rate. Billing cached input at the full rate overstated a Luna
-   attempt by about a fifth."
+   attempt by about a fifth. `:cache-write-1h-tokens`, the part of the cache
+   writes kept an hour, is billed at `:cache-write-1h` (twice the input rate
+   when the registry has none)."
   [model usage]
-  (when-let [pricing (and model (acct/get-model-pricing model))]
+  (when-let [pricing (and model (or (registry/long-context-pricing model (get usage :input-tokens))
+                                    (acct/get-model-pricing model)))]
     (let [n #(long (or (get usage %) 0))
           cache-read (n :cache-read-tokens)
           cache-write (+ (n :cache-creation-tokens) (n :cache-write-tokens))
+          hour (min cache-write (n :cache-write-1h-tokens))
           fresh (max 0 (- (n :input-tokens) cache-read cache-write))
           at (fn [tokens rate] (Math/round (double (* tokens (double rate)))))]
       (+ (at fresh (:input pricing 1))
          (at cache-read (:cache-read pricing (:input pricing 1)))
-         (at cache-write (:cache-write pricing (:input pricing 1)))
+         (at (- cache-write hour) (:cache-write pricing (:input pricing 1)))
+         (at hour (:cache-write-1h pricing (* 2 (:input pricing 1))))
          (at (n :output-tokens) (:output pricing 1))
          (at (n :reasoning-output-tokens) (:output pricing 1))))))
 
@@ -119,7 +124,11 @@
   [model {:keys [used by-type]}]
   ;; a chat budget accounts uncached input under :input-tokens and cached
   ;; input apart (`dvergr.chat.agent`); a spend's input counts both
-  (let [cached (+ (get by-type :cache-read-tokens 0) (get by-type :cache-creation-tokens 0))
+  ;; and the writes kept an hour apart from the other writes, a usage counts
+  ;; them among its writes
+  (let [hour (get by-type :cache-write-1h-tokens 0)
+        by-type (cond-> by-type (pos? hour) (update :cache-creation-tokens (fnil + 0) hour))
+        cached (+ (get by-type :cache-read-tokens 0) (get by-type :cache-creation-tokens 0))
         by-type (cond-> by-type (pos? cached) (update :input-tokens (fnil + 0) cached))
         tokens (tokens-of by-type)
         worth (notional model by-type)

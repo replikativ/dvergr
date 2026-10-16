@@ -89,8 +89,13 @@
        :auth auth})))
 
 (defn- dispatch! [request]
-  (resource/admit-model-dispatch!)
-  (let [response (*request-fn* request)]
+  ;; a funded dispatch reserves its bound first, then spends its admission;
+  ;; both are refused before anything leaves (doc/design/runs-as-worlds.md)
+  (resource/reserve-dispatch!)
+  (try (resource/admit-model-dispatch!)
+       (catch Throwable e (resource/dispatch-status! :refused) (throw e)))
+  (let [response (*request-fn* request)
+        _ (resource/dispatch-status! (:status response))]
     (when (and resource/*model-scope* (<= 300 (:status response) 399))
       (close-body! response)
       (throw (ex-info "Governed model dispatch does not follow redirects"

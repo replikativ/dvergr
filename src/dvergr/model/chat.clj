@@ -177,8 +177,16 @@
   (let [;; Build request using provider
         {:keys [url headers body credentials]} (p/build-request provider messages opts)
 
-        ;; Make HTTP request
-        response (make-request (p/provider-id provider) url headers body credentials)
+        ;; Make HTTP request; a funded dispatch reserves a bound of its cost
+        ;; (`resource/reserve-dispatch!`)
+        response (binding [resource/*dispatch-bound*
+                           (when resource/*model-scope*
+                             (resource/dispatch-bound
+                              model-def
+                              body
+                              (alength (.getBytes ^String (json/write-value-as-string body) "UTF-8"))
+                              (some body [:max_tokens :max_completion_tokens :max_output_tokens])))]
+                   (make-request (p/provider-id provider) url headers body credentials))
         last-read (java.util.concurrent.atomic.AtomicLong. (System/currentTimeMillis))
         stalled (atom false)
         ^java.io.InputStream raw (:body response)
@@ -340,18 +348,42 @@
       ;; Standard HTTP+SSE streaming path. A model call has no side effect,
       ;; so a stream that stalls or breaks while it is read is asked again,
       ;; as a request that fails to open is (`stream-chat`).
-      (loop [attempt 0]
-        (let [r (try {:response (consume-stream provider model-def messages opts)}
-                     (catch IOException e
-                       (if (< attempt 2) {:retry e} (throw e))))]
-          (if-let [e (:retry r)]
-            (do (log/log! {:level :warn :id :model/stream-retry
-                           :data {:attempt (inc attempt) :provider provider-key :model model-id
-                                  :error (.getMessage ^Exception e)}}
-                          "The response stream stalled or broke; asking again")
-                (Thread/sleep (long (calculate-backoff attempt nil)))
-                (recur (inc attempt)))
-            (:response r)))))))
+      ;; Every dispatch of a funded call reserved a bound of its cost; they
+      ;; are settled here, once each: the answer's against its usage, the
+      ;; rest kept unless the provider refused them (`resource/settle-dispatches!`).
+      (binding [resource/*dispatches* (atom [])]
+        (let [response
+              (try
+                (loop [attempt 0]
+                  (let [r (try {:response (consume-stream provider model-def messages opts)}
+                               (catch IOException e
+                                 (if (< attempt 2) {:retry e} (throw e))))]
+                    (if-let [e (:retry r)]
+                      (do (log/log! {:level :warn :id :model/stream-retry
+                                     :data {:attempt (inc attempt) :provider provider-key :model model-id
+                                            :error (.getMessage ^Exception e)}}
+                                    "The response stream stalled or broke; asking again")
+                          (Thread/sleep (long (calculate-backoff attempt nil)))
+                          (recur (inc attempt)))
+                      (:response r))))
+                (catch Throwable e
+                  (resource/settle-dispatches! nil)
+                  (throw e)))
+              reserved? (seq @resource/*dispatches*)
+              ;; only usage the provider reported as final settles: a stream
+              ;; that ended without it, or an unpriced answer, forfeits its
+              ;; reservation, which then stands for its cost, so no usage is
+              ;; left for the caller to charge
+              cost (when-let [usage (and (:usage-final? response) (:usage response))]
+                     (let [{:keys [microdollars priced?]}
+                           ((requiring-resolve 'dvergr.agent.spend/of-usage) model-id usage)]
+                       (when priced? microdollars)))]
+          (resource/settle-dispatches! cost)
+          (if (and reserved? (nil? cost))
+            (assoc response
+                   :usage {:input-tokens 0 :output-tokens 0}
+                   :usage-forfeited (:usage response))
+            response))))))
 
 (defn- consume-stream
   "Stream one response and accumulate it (see `chat`)."

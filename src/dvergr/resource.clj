@@ -6,6 +6,7 @@
    settle this authority: a child receives resources only through one governed
    Kontor transfer from its parent wallet."
   (:require [dvergr.agent.attempt.governance :as attempt-governance]
+            [dvergr.model.registry :as registry]
             [dvergr.room.store :as store]
             [kontor.resource :as kontor]
             [org.replikativ.spindel.engine.core :as ec]
@@ -273,6 +274,229 @@
       {:payer (:payer bound)
        :id (spend-debit-id (:scope bound) (swap! (:debits bound) inc))})))
 
+(defn- current-payer
+  "The wallet a charge made now would come from (`world-charge`), without
+   naming a debit: `{:room :wallet}` or nil."
+  []
+  (let [bound *spend-wallet*
+        ctx ec/*execution-context*
+        {:keys [wallet room-id]} (some-> ctx (rtp/get-state [:dvergr/wallet]))
+        room (when wallet (or (get @ledger-rooms room-id) (get-in bound [:payer :room])))]
+    (cond
+      (and wallet room) {:room room :wallet wallet}
+      (:payer bound) (:payer bound))))
+
+;; ---------------------------------------------------------------------------
+;; Dispatch reservations (doc/design/runs-as-worlds.md, Budgets as a tree)
+;;
+;; Admissions cap the number of provider calls, not their cost: a call in
+;; flight when the process dies, or a streamed retry, can incur usage that is
+;; never charged. A governed call that has a paying wallet therefore reserves
+;; a conservative bound of its cost before every HTTP dispatch, under the
+;; dispatch's own id, and each reservation is settled once:
+;;
+;; - a definitive refusal (an HTTP error status, or refused before it left)
+;;   is returned whole at once, so the next attempt can reserve;
+;; - the answer, when the provider reported its final usage, returns what
+;;   exceeds that usage's cost to the wallet and moves the cost to the
+;;   wallet's hold (`hold-wallet-id`), a durable account the charges that
+;;   follow from the same usage (`charge-spend!`) consume first, under their
+;;   own debit ids;
+;; - every other outcome (a broken or truncated stream, an exception, a
+;;   crash) is consumed whole.
+;;
+;; What a hold has is never spendable again, and it survives a restart: a
+;; charge made, or replayed, after one draws on it, so a dispatch costs its
+;; wallet its usage, or its bound when the outcome is unknown.
+;; ---------------------------------------------------------------------------
+
+(def ^:dynamic *dispatch-bound*
+  "The microdollars a dispatch made now may cost at most, computed from the
+   request (`dispatch-bound`), or nil."
+  nil)
+
+(def ^:dynamic *dispatches*
+  "An atom of the dispatches of one model call (`[{:id :wallet :amount
+   :payer :status :settled?}]`), bound by the caller that settles them."
+  nil)
+
+(defn hold-wallet-id
+  "The account that holds, for the charges that follow, the settled cost of
+   the answers `wallet` paid for."
+  [wallet]
+  (stable-id [:dvergr/hold wallet]))
+
+(def dispatch-overhead-tokens
+  "Input tokens a provider may add to a request on its own (a tool-use system
+   prompt), beyond what the request body says."
+  4096)
+
+(def image-tokens
+  "Input tokens one image part may cost at most, whatever its encoded size:
+   providers scale an image to a bounded number of tiles."
+  10000)
+
+(defn- content-parts
+  "The maps of a request body's content, without what is data to the model
+   rather than content the provider reads: a tool call's arguments (`:input`
+   of a `tool_use` part, `:arguments`), tool definitions (`:tools`)."
+  [body]
+  (letfn [(kind [m] (or (:type m) (get m "type")))
+          (children [x]
+            (cond
+              (map? x) (vals (cond-> (apply dissoc x [:tools "tools" :arguments "arguments"])
+                               (#{"tool_use" "function_call"} (kind x))
+                               (dissoc :input "input")))
+              (coll? x) (seq x)))]
+    (filter map? (tree-seq coll? children body))))
+
+(def ^:private unbounded-part-types
+  "Content parts whose cost their encoded size does not bound: a document's
+   extracted text and page images, audio and video by duration."
+  #{"document" "file" "input_file" "input_audio" "audio" "video"})
+
+(defn- unbounded-content?
+  "Does the request carry content whose cost its body does not show: content
+   the provider fetches or keeps itself (a URL that is not a data URL, an
+   uploaded file), or a document, audio or video part?"
+  [body]
+  (some (fn [m]
+          (or (some (fn [k] (let [v (get m k)]
+                              (and (string? v) (not (.startsWith ^String v "data:")))))
+                    [:url "url"])
+              (some #(contains? m %) [:file_id "file_id"])
+              (contains? unbounded-part-types (or (:type m) (get m "type")))))
+        (content-parts body)))
+
+(defn- image-count [body]
+  (count (filter (fn [m] (contains? #{"image" "image_url" "input_image"}
+                                    (or (:type m) (get m "type"))))
+                 (content-parts body))))
+
+(defn dispatch-bound
+  "A conservative bound, in microdollars, of what a request costs: its
+   `body-bytes` (an upper bound on its text input tokens), what a provider
+   adds on its own (`dispatch-overhead-tokens`) and `image-tokens` for each
+   image part, at the model's highest input-side price (input, cache
+   writes) in any of its bands (`registry/highest-pricing`, long context
+   included); plus its enforced output limit `max-output` (reasoning
+   included) at the highest output price; all doubled for what the registry
+   does not model (service tiers). Prices are USD per million
+   tokens, so microdollars per token. nil when no reliable bound exists: no
+   output limit, no input or output price, or content whose cost its size
+   does not bound (`unbounded-content?`; `body`, the request, is checked)."
+  [model-def body body-bytes max-output]
+  (let [{:keys [input output cache-write cache-write-1h]} (registry/highest-pricing model-def)]
+    (when (and (number? input) (number? output) (pos-int? max-output) (pos-int? body-bytes)
+               (not (unbounded-content? body)))
+      (let [in-price (apply max (filter number? [input cache-write cache-write-1h]))
+            in-tokens (+ body-bytes dispatch-overhead-tokens (* image-tokens (image-count body)))]
+        (.setScale (bigdec (* 2 (+ (* in-tokens in-price) (* max-output output))))
+                   0 java.math.RoundingMode/CEILING)))))
+
+(defn- reserve!
+  "Move `amount` from the paying wallet into a reservation of its own."
+  [{:keys [room wallet] :as payer} amount]
+  (let [id (UUID/randomUUID)
+        reservation (stable-id [:dvergr/reservation id])]
+    ;; an empty reservation left by a crash before the grant holds nothing
+    (store/-open-resource-wallet! (resource-store! room)
+                                  {:id reservation :name (str "dispatch " id)})
+    (store/-transfer-resources! (resource-store! room)
+                                {:id (stable-id [:dvergr/reserve id]) :kind :grant
+                                 :source (kontor/account-ref wallet)
+                                 :destination (kontor/account-ref reservation)
+                                 :effective-date (java.util.Date.) :resources {microdollars amount}})
+    (let [record {:id id :wallet reservation :amount amount :payer payer}]
+      (swap! *dispatches* conj record)
+      record)))
+
+(defn reserve-dispatch!
+  "Before a governed dispatch that has a paying wallet: move its bound
+   (`*dispatch-bound*`) from that wallet into a reservation of its own; the
+   ledger refuses what the wallet cannot cover. A dispatch without a bound,
+   or without a model call to settle it (`*dispatches*`), is refused."
+  []
+  (when-let [payer (when *model-scope* (current-payer))]
+    (let [amount *dispatch-bound*]
+      (when-not (and amount (pos? amount))
+        (throw (ex-info "A funded model dispatch needs a bound on its cost: a priced model, an output limit, no remote content"
+                        {:type ::unbounded-dispatch})))
+      (when-not *dispatches*
+        (throw (ex-info "A funded model dispatch must be made by a model call that settles it"
+                        {:type ::unsettled-dispatch})))
+      (reserve! payer amount))))
+
+(defn- move! [payer reservation kind id destination amount]
+  (when (pos? amount)
+    (store/-transfer-resources! (resource-store! (:room payer))
+                                {:id id :kind kind
+                                 :source (kontor/account-ref reservation)
+                                 :destination destination
+                                 :effective-date (java.util.Date.)
+                                 :resources {microdollars amount}})))
+
+(defn- release! [{:keys [id wallet amount payer]}]
+  (move! payer wallet :return (stable-id [:dvergr/release id])
+         (kontor/account-ref (:wallet payer)) amount))
+
+(defn- forfeit! [{:keys [id wallet amount payer]}]
+  (move! payer wallet :consume (stable-id [:dvergr/forfeit id]) kontor/sink-account amount))
+
+(defn- hold! [{:keys [id wallet amount payer]} cost]
+  (let [cost (min amount (max 0M (bigdec cost)))
+        hold (hold-wallet-id (:wallet payer))]
+    (when (pos? cost)
+      (store/-open-resource-wallet! (resource-store! (:room payer))
+                                    {:id hold :name (str "hold " (:wallet payer))})
+      (move! payer wallet :grant (stable-id [:dvergr/hold id]) (kontor/account-ref hold) cost))
+    (move! payer wallet :return (stable-id [:dvergr/release id])
+           (kontor/account-ref (:wallet payer)) (- amount cost))))
+
+(defn- refused? [status]
+  (or (= :refused status) (and (number? status) (>= status 400))))
+
+(defn dispatch-status!
+  "Note the HTTP status of the latest dispatch of this model call; a refused
+   dispatch's reservation is returned at once."
+  [status]
+  (when-let [ds *dispatches*]
+    (when-let [r (peek @ds)]
+      (when (and (not (:settled? r)) (nil? (:status r)))
+        (when (refused? status) (release! r))
+        (swap! ds (fn [v] (assoc v (dec (count v))
+                                 (cond-> (assoc (peek v) :status status)
+                                   (refused? status) (assoc :settled? true)))))))))
+
+(defn settle-dispatches!
+  "Settle the dispatches of one model call (`*dispatches*`) not settled yet:
+   the latest successful one holds `cost` (microdollars from the final usage
+   the provider reported, nil when it reported none) and returns the rest;
+   every other one is consumed."
+  [cost]
+  (when-let [ds *dispatches*]
+    (let [records (remove :settled? (first (reset-vals! ds [])))
+          final (when cost (last (filter #(and (number? (:status %)) (< (:status %) 300)) records)))]
+      (doseq [r records]
+        (if (= r final) (hold! r cost) (forfeit! r))))))
+
+(defn- draw-held!
+  "Consume up to `cost` of what `payer`'s hold has (`hold-wallet-id`), under
+   debit `id`; returns the amount drawn. Its caller holds the wallet's lock."
+  [{:keys [room wallet] :as payer} id cost]
+  (let [hold (hold-wallet-id wallet)
+        ;; no hold opened yet holds nothing; any other failure to read it
+        ;; must not send the charge to the wallet
+        has (get (try (balance room (kontor/account-ref hold))
+                      (catch clojure.lang.ExceptionInfo e
+                        (if (= :kontor.resource/account-not-found (:type (ex-data e)))
+                          {}
+                          (throw e))))
+                 microdollars 0M)
+        n (min cost has)]
+    (move! payer hold :consume id kontor/sink-account n)
+    (max n 0M)))
+
 (defn charge-spend!
   "Consume `cost` microdollars of model spend from the bound spend wallet.
    The provider was already paid, so the ledger cannot refuse it: a cost
@@ -284,44 +508,54 @@
    `{:charged n :exhausted? bool}`, or nil when no wallet is bound or there is
    nothing to charge.
 
+   What the wallet's hold has (settled dispatch reservations,
+   `hold-wallet-id`) is consumed first, a debit of its own derived from the
+   charge's id, the rest from the wallet under the charge's id: a charge
+   whose wallet debit exists is complete, and a replayed charge finds its
+   draw. Which charge of a wallet draws on the hold does not change what the
+   wallet pays in all.
+
    Spend follows the world (doc/design/speculation.md, Law 4): when the
    current world was granted a wallet of its own by the ledger authority
-   (`dvergr.resource.authority`), the charge is taken from that wallet, so a
-   forked world cannot spend more than its share, also where no charge scope
-   is bound (particle code on an executor thread); otherwise the bound payer
-   pays.  See `world-charge`."
+   (`dvergr.resource.authority`), that wallet pays.  See `world-charge`."
   [cost]
   (when (pos? cost)
     (when-let [{:keys [payer id]} (world-charge)]
       (let [{:keys [room wallet]} payer]
         (locking (wallet-lock wallet)
-          (if-let [done (store/-resource-receipt (resource-store! room) id)]
-            {:charged (get-in done [:resources microdollars] 0M)
-             :exhausted? (<= (wallet-left payer) 0M)}
-            ;; Other writers (a grant to a new Run, a fork's escrow) may take
-            ;; from the wallet between the read and the debit; the ledger then
-            ;; refuses the debit. The provider was paid: read the rest again
-            ;; and take that.
-            (loop [tries 0]
-              (let [left (wallet-left payer)
-                    amount (min (bigdec cost) left)
-                    outcome (try
-                              (when (pos? amount)
-                                (store/-transfer-resources!
-                                 (resource-store! room)
-                                 {:id id
-                                  :kind :consume
-                                  :source (kontor/account-ref wallet)
-                                  :destination kontor/sink-account
-                                  :resources {microdollars amount}}))
-                              {:charged amount :exhausted? (<= left (bigdec cost))}
-                              (catch clojure.lang.ExceptionInfo e e))]
-                (cond
-                  (map? outcome) outcome
-                  (store/-resource-receipt (resource-store! room) id)
-                  {:charged amount :exhausted? (<= left (bigdec cost))}
-                  (and (< tries 8) (< (wallet-left payer) amount)) (recur (inc tries))
-                  :else (throw outcome))))))))))
+          (let [done (store/-resource-receipt (resource-store! room) id)
+                draw-id (stable-id [:dvergr/held id])
+                drawn (if-let [d (store/-resource-receipt (resource-store! room) draw-id)]
+                        (get-in d [:resources microdollars] 0M)
+                        (if done 0M (draw-held! payer draw-id (bigdec cost))))
+                cost (- (bigdec cost) drawn)]
+            (if (or done (not (pos? cost)))
+              {:charged (+ drawn (get-in done [:resources microdollars] 0M))
+               :exhausted? (<= (wallet-left payer) 0M)}
+              ;; Other writers (a grant to a new Run, a fork's escrow) may take
+                ;; from the wallet between the read and the debit; the ledger then
+                ;; refuses the debit. The provider was paid: read the rest again
+                ;; and take that.
+              (loop [tries 0]
+                (let [left (wallet-left payer)
+                      amount (min cost left)
+                      outcome (try
+                                (when (pos? amount)
+                                  (store/-transfer-resources!
+                                   (resource-store! room)
+                                   {:id id
+                                    :kind :consume
+                                    :source (kontor/account-ref wallet)
+                                    :destination kontor/sink-account
+                                    :resources {microdollars amount}}))
+                                {:charged (+ drawn amount) :exhausted? (<= left cost)}
+                                (catch clojure.lang.ExceptionInfo e e))]
+                  (cond
+                    (map? outcome) outcome
+                    (store/-resource-receipt (resource-store! room) id)
+                    {:charged (+ drawn amount) :exhausted? (<= left cost)}
+                    (and (< tries 8) (< (wallet-left payer) amount)) (recur (inc tries))
+                    :else (throw outcome)))))))))))
 
 (defn charge-usage!
   "Record one model call's provider `usage` under `model` in the bound

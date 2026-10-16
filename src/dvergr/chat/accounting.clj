@@ -87,16 +87,21 @@
    Args:
      resource-type - Keyword (:token-input :token-output :web-search etc.)
      amount        - Amount in natural units
-     opts          - {:model model-id} for token-based resources
+     opts          - {:model model-id} for token-based resources, and
+                     :prompt-tokens, the request's whole input, for the
+                     pricing band it is billed in
 
    Returns: Cost in microdollars (long)"
-  [resource-type amount {:keys [model]}]
+  [resource-type amount {:keys [model prompt-tokens]}]
   ;; Round to whole μ$ once per CALL (rates are fractional μ$/token doubles).
-  (letfn [(cost [rate] (Math/round (double (* amount rate))))]
+  (letfn [(cost [rate] (Math/round (double (* amount rate))))
+          ;; the band the whole request is billed in
+          (band [model] (or (registry/long-context-pricing model prompt-tokens)
+                            (get-model-pricing model)))]
     (case resource-type
       ;; Token-based resources need model pricing
       (:token-input :input-tokens)
-      (if-let [pricing (get-model-pricing model)]
+      (if-let [pricing (band model)]
         (cost (:input pricing 1))
         ;; Fallback: assume $1/M tokens = 1 μ$/token.
         ;; TODO(policy): replace the silent invented price with recorded-
@@ -105,18 +110,24 @@
         amount)
 
       (:token-output :output-tokens)
-      (if-let [pricing (get-model-pricing model)]
+      (if-let [pricing (band model)]
         (cost (:output pricing 1))
         amount)
 
       (:token-cache-read :cache-read-tokens)
-      (if-let [pricing (get-model-pricing model)]
+      (if-let [pricing (band model)]
         (cost (:cache-read pricing (:input pricing 0)))
         0)
 
       (:token-cache-write :cache-write-tokens :cache-creation-tokens)
-      (if-let [pricing (get-model-pricing model)]
+      (if-let [pricing (band model)]
         (cost (:cache-write pricing (:input pricing 0)))
+        0)
+
+      ;; cache writes kept an hour (Anthropic), billed higher
+      :cache-write-1h-tokens
+      (if-let [pricing (band model)]
+        (cost (:cache-write-1h pricing (* 2 (:input pricing 0))))
         0)
 
       ;; Static pricing for everything else
@@ -257,8 +268,8 @@
 
    Returns:
      {:ledger-id uuid :cost-microdollars N}"
-  [conn chat-id resource-type amount & {:keys [model provider tool metadata]}]
-  (let [cost (calculate-cost resource-type amount {:model model})
+  [conn chat-id resource-type amount & {:keys [model provider tool metadata prompt-tokens]}]
+  (let [cost (calculate-cost resource-type amount {:model model :prompt-tokens prompt-tokens})
         ledger-id (random-uuid)
         prior-used (or (d/q '[:find ?u .
                               :in $ ?cid
