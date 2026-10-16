@@ -285,3 +285,56 @@
           (is (= [:merged :settled] ((juxt :search/outcome :search/status) winner)))
           (is (= :merged (:run/settlement-status
                           (store/-load-run (:store room) (store/conversation-id room) (:run/id winner))))))))))
+
+(deftest a-member-of-another-search-is-refused-even-when-settled
+  (with-room :search-foreign-settled-test
+    (fn [room]
+      (let [[a b] (held room 2 search/speculative-effects)
+            _ (search/select! room [a b] {:policy :automatic})
+            [c] (held room 1 search/speculative-effects)]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"member of another search"
+                              (search/select! room [a c] {:policy :automatic})))
+        (is (nil? (durable-search room (get-in c [:attempt :attempt/receipt :attempt/run-id])))
+            "the fresh member was not claimed")))))
+
+(deftest a-merge-whose-world-stays-registered-is-incomplete
+  (with-room :search-registered-test
+    (fn [room]
+      (let [members (held room 2 search/speculative-effects)
+            lookup rreg/lookup
+            kept (atom {})
+            outcome (with-redefs [rreg/lookup (fn [id] (or (lookup id) (get @kept id)))
+                                  forks/merge! (let [merge! forks/merge!]
+                                                 (fn [fork & opts]
+                                                   (swap! kept assoc (:id fork) fork)
+                                                   (apply merge! fork opts)))]
+                      (search/select! room members {:policy :automatic}))
+            winner (some #(when (= :merge (:search/decision %)) %) (:search/members outcome))]
+        (is (= [:merged :incomplete] ((juxt :search/outcome :search/status) winner))
+            "cleanup did not finish: the world is still registered")
+        (let [again (search/select! room members {:policy :automatic :search-id (:search/id outcome)})]
+          (is (= [:merged :settled] ((juxt :search/outcome :search/status)
+                                     (some #(when (= :merge (:search/decision %)) %) (:search/members again))))
+              "once the world has left, a retry settles it"))))))
+
+(deftest a-merge-whose-every-write-failed-is-reconciled-from-what-this-process-saw
+  (with-room :search-sustained-failure-test
+    (fn [room]
+      (let [members (held room 2 search/speculative-effects)
+            record! run/record-search!
+            update! run/update-durable-settlement!
+            outcome-writes-fail? (atom true)
+            id (random-uuid)]
+        (with-redefs [run/record-search! (fn [r rid search]
+                                           (if (and @outcome-writes-fail? (not= :pending (:search/status search)))
+                                             (throw (ex-info "storage down" {}))
+                                             (record! r rid search)))
+                      run/update-durable-settlement! (fn [r rid status & more]
+                                                       (if (and @outcome-writes-fail? (= :merged status))
+                                                         (throw (ex-info "storage down" {}))
+                                                         (apply update! r rid status more)))]
+          (is (thrown? Exception (search/select! room members {:policy :automatic :search-id id}))))
+        (reset! outcome-writes-fail? false)
+        (let [again (search/select! room members {:policy :automatic :search-id id})]
+          (is (some #(= [:merged :settled] ((juxt :search/outcome :search/status) %)) (:search/members again))
+              "the merged world is settled from this process's evidence"))))))

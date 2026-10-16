@@ -157,6 +157,11 @@
       (and (= :merge (nth decisions i)) (nil? (get-in member [:review :state])))
       (refuse "a member to merge needs its review token"))))
 
+(defonce ^:private merged-worlds
+  ;; worlds whose substrate this process saw merged into their parent: the
+  ;; evidence a retry reconciles from when the writes after the merge failed
+  (atom #{}))
+
 (defn- project-merged!
   "Record durably that `member`'s world merged, when its substrate merged but
    the Run's settlement was not written: true once its Run reads `:merged`."
@@ -191,14 +196,19 @@
                  (let [merged (attempt #(forks/merge! fork :expect-state (get-in member [:review :state])))
                        substrate (or (d/settlement fork) (d/settlement-claim fork))
                        durable (:run/settlement-status (durable-run room (run-id-of member)))]
+                   (when (= :merged (:op substrate)) (swap! merged-worlds conj (:world member)))
                    (cond
-                     (and (:ok? merged) (= :merged durable)) {:outcome :merged :status :settled}
+                     (and (:ok? merged) (= :merged durable) (nil? (rreg/lookup (:world member))))
+                     {:outcome :merged :status :settled}
                      ;; the substrate merged, its cleanup or projection did
                      ;; not: project the settlement again, never merge again
                      (= :merged (:op substrate))
-                     (if (project-merged! room member)
-                       {:outcome :merged :status :settled :error (:error merged)}
-                       {:outcome :merged :status :incomplete :error (:error merged)})
+                     (do (swap! merged-worlds conj (:world member))
+                         (if (and (project-merged! room member) (nil? (rreg/lookup (:world member))))
+                           {:outcome :merged :status :settled :error (:error merged)}
+                           ;; its cleanup did not finish (the world is still
+                           ;; registered): kept incomplete for the host
+                           {:outcome :merged :status :incomplete :error (:error merged)}))
                      ;; refused before merging: it waits in review for a person
                      :else {:outcome :review :status :settled :error (:error merged)})))))))
 
@@ -213,8 +223,11 @@
         fork (rreg/lookup (:world member))]
     (cond
       (and (= :merged status) (nil? fork)) :merged
-      (and (= :merged (:search/outcome prior)) (= :incomplete (:search/status prior)))
-      (when (project-merged! room member) :merged)
+      ;; its substrate merged (recorded, or seen by this process), and its
+      ;; settlement and cleanup have finished since
+      (or (and (= :merged (:search/outcome prior)) (= :incomplete (:search/status prior)))
+          (contains? @merged-worlds (:world member)))
+      (when (and (project-merged! room member) (nil? fork)) :merged)
       (= :discarded status) :discarded
       (and (= :review status) fork (not (forks/deferred? fork))) :review
       :else nil)))
@@ -287,12 +300,19 @@
           ;; members settled but not recorded, or incomplete merges completed since
           (doseq [i (range (count members))
                   :let [p (nth prior i)]
-                  :when (and (= search-id (:search/id p)) (#{:pending :incomplete} (:search/status p)))
+                  :when (or (and (= search-id (:search/id p)) (#{:pending :incomplete} (:search/status p)))
+                            (and (nil? p) (contains? @merged-worlds (:world (nth members i)))))
                   :let [outcome (reconciled room (nth members i) p)]
                   :when outcome]
             (record! i {:search/outcome outcome :search/status :settled}))
           (let [now (records)
-                done? #(#{:settled :incomplete} (:search/status (nth now %)))
+                _ (doseq [[i r] (map-indexed vector now)
+                          :when (and r (not= search-id (:search/id r)))]
+                    (throw (ex-info (str "Search member " (nth run-ids i) " is a member of another search")
+                                    {:type ::claimed-by-another-search :run/id (nth run-ids i)
+                                     :claimed-by (:search/id r)})))
+                done? #(and (= search-id (:search/id (nth now %)))
+                            (#{:settled :incomplete} (:search/status (nth now %))))
                 todo (vec (remove done? (range (count members))))]
             (preflight! room members decisions todo)
             ;; 1. claim the members, all or none, with the decisions
