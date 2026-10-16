@@ -850,6 +850,7 @@
   ;; cancelled while its Run is being admitted cancels the admitted Run
   (let [entered (promise)
         release (promise)
+        group (evaluation/cleanup-group)
         room (d/make-room {:id :evaluation-cancel-admission
                            :store (->BlockingStartStore (memory/make) entered release)})
         team (roster/make-agent (roster/make-roster)
@@ -862,19 +863,101 @@
                     :verify (fn [_ _] {:checks {:verified? true} :reward 1.0})})]
     (try
       (binding [ec/*execution-context* (:ctx room)]
-        (let [attempt (evaluation/evaluate room team :candidate env evaluator)
+        (let [attempt (evaluation/evaluate room team :candidate env evaluator {:cleanup-group group})
               settled (future (try @attempt (catch Throwable _ ::cancelled)))]
           (let [run-id (deref entered 5000 ::timeout)]
             (is (uuid? run-id) "admission reached the Run's durable start")
             (spin-core/cancel-spin! attempt)
             (is (= ::cancelled (deref settled 5000 ::timeout)) "the cell is cancelled while admission is blocked")
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (evaluation/await-cleanups-for! room group 1))
+                "a cancelled cell still owns its blocked admission")
             (deliver release true)
-            (is (wait-until #(let [r (run/run room run-id)]
-                               (and r (not= :running (:run/status r))
-                                    (not (contains? (set (map :run/id (run/active-runs))) run-id))))
-                            5000)
+            (is (true? (evaluation/await-cleanups-for! room group 5000)))
+            (is (let [r (run/run room run-id)]
+                  (and r (not= :running (:run/status r))
+                       (not (contains? (set (map :run/id (run/active-runs))) run-id))))
                 "the Run admitted for the cancelled cell does not stay live")
             (is (nil? (store/-load-attempt (:store room) (:id room) run-id))
                 "a cancelled cell certifies no Attempt"))))
       (finally
+        (d/close-room! room)))))
+
+(deftest queued-admission-is-owned-before-executor-start
+  (let [room (test-room :tracked-queued-admission)
+        group (evaluation/cleanup-group)
+        queued (promise)
+        admitted (atom 0)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [admission (with-redefs [clojure.core/future-call
+                                      (fn [f] (deliver queued f) (promise))]
+                          (#'evaluation/tracked-admission
+                           room group #(swap! admitted inc) (fn [_])))]
+          ((:cancel! admission))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (evaluation/await-cleanups-for! room group 1))
+              "the real cleanup gate exists while executor work is queued")
+          (@queued)
+          (is (zero? @admitted))
+          (is (true? (evaluation/await-cleanups-for! room group 5000)))
+          (is (thrown? java.util.concurrent.CancellationException
+                       ((:await admission))))))
+      (finally (d/close-room! room)))))
+
+(deftest successful-handoff-remains-owned-until-physical-completion
+  (let [room (test-room :tracked-admission-completion)
+        group (evaluation/cleanup-group)
+        returned (promise)
+        observed (promise)
+        cancelled (promise)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (with-redefs [program/result-spin (fn [h] (deliver observed h) returned)]
+          (let [admission (#'evaluation/tracked-admission
+                           room group (constantly :handle) #(deliver cancelled %))]
+            (is (= :handle ((:await admission))))
+            (is (= :handle (deref observed 5000 ::timeout)))
+            ((:cancel! admission))
+            (is (= :handle (deref cancelled 5000 ::timeout)))
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (evaluation/await-cleanups-for! room group 1)))
+            (deliver returned {:run/status :cancelled})
+            (is (true? (evaluation/await-cleanups-for! room group 5000))))))
+      (finally
+        (deliver returned {:run/status :cancelled})
+        (d/close-room! room)))))
+
+(deftest failed-abandon-cannot-release-a-live-child-cleanup-gate
+  (let [room (test-room :tracked-admission-abandon-error)
+        group (evaluation/cleanup-group)
+        entered (promise)
+        admit (promise)
+        observed (promise)
+        completed (promise)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (with-redefs [program/result-spin (fn [_] (deliver observed true) completed)]
+          (let [admission (#'evaluation/tracked-admission
+                           room group #(do (deliver entered true) @admit)
+                           (fn [_] (throw (ex-info "cancel transport failed" {}))))]
+            (is (= true (deref entered 5000 ::timeout)))
+            ((:cancel! admission))
+            (deliver admit :handle)
+            (is (= :handle ((:await admission))))
+            (is (= true (deref observed 5000 ::timeout)))
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (evaluation/await-cleanups-for! room group 1))
+                "failure to cancel does not imply physical completion")
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (evaluation/await-cleanups-for! room group 1))
+                "repeated joins cannot forget a still-live child")
+            (deliver completed {:run/status :completed})
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (evaluation/await-cleanups-for! room group 5000))
+                "the cancellation failure is reported, after physical completion")
+            (is (true? (evaluation/await-cleanups-for! room group 5000))))))
+      (finally
+        (deliver admit :handle)
+        (deliver completed {:run/status :completed})
         (d/close-room! room)))))

@@ -40,29 +40,50 @@
 
 (defonce ^:private pending-tasks (atom {}))
 
-(declare positive-timeout!)
+(declare positive-timeout! start-task!)
 
-(defn- admit-uninterruptibly
-  "`admit` as the body of a `blocking` call that a cancelled cell does not
-   interrupt half way: admission runs to the end on its own thread, and a
-   Run admitted for a cell cancelled meanwhile is cancelled (`abandon`)
-   instead of left without an owner."
-  [admit abandon]
-  (fn []
-    (let [outcome (promise)
-          admit (bound-fn* admit)
-          abandon (bound-fn* abandon)]
-      (doto (Thread. ^Runnable (fn [] (deliver outcome (try {:ok (admit)} (catch Throwable t {:error t}))))
-                     "dvergr-admission")
-        (.setDaemon true)
-        (.start))
-      (try
-        (let [{:keys [ok error]} @outcome]
-          (if error (throw error) ok))
-        (catch InterruptedException e
-          (future (when-let [handle (:ok @outcome)]
-                    (try (abandon handle) (catch Throwable _ nil))))
-          (throw e))))))
+(defn- tracked-admission
+  "Register BEFORE handing admission to an executor. Cancellation never
+   interrupts admission half-way, nor releases its cleanup gate early: a late
+   handle is cancelled and its passive physical-completion edge is joined.
+   Successful handoffs are tracked too, until their Run resources return."
+  [room group admit abandon]
+  (let [outcome (promise)
+        state (atom {:phase :pending})
+        cancel! (fn []
+                  (let [after (swap! state
+                                     #(cond-> (assoc % :cancelled? true)
+                                        (= :pending (:phase %)) (assoc :phase :cancelled)))]
+                    (when-let [handle (:handle after)] (abandon handle))))]
+    (start-task!
+     room group
+     (fn []
+       (let [[before _] (swap-vals! state
+                                    #(if (= :pending (:phase %))
+                                       (assoc % :phase :admitting) %))]
+         (if (= :cancelled (:phase before))
+           (deliver outcome {:error (java.util.concurrent.CancellationException.
+                                     "Evaluation cancelled before admission")})
+           (try
+             (let [handle (admit)
+                   after (swap! state assoc :phase :admitted :handle handle)]
+               (deliver outcome {:ok handle})
+               (let [cancel-error (when (:cancelled? after)
+                                    (try (abandon handle) nil
+                                         (catch Throwable error error)))]
+                 ;; Even a failed cancellation request cannot release a live
+                 ;; child's gate. This fresh passive observer is not owned by
+                 ;; the cancelled graph. Completion follows resource return.
+                 @(program/result-spin handle)
+                 (swap! state assoc :phase :done)
+                 (when cancel-error (throw cancel-error))))
+             (catch Throwable error
+               (deliver outcome {:error error})
+               (throw error)))))))
+    {:cancel! cancel!
+     :await (fn []
+              (let [{:keys [ok error]} @outcome]
+                (if error (throw error) ok)))}))
 
 (defn- cleanup-scope [room]
   [(:id room) (:incarnation room)])
@@ -175,7 +196,8 @@
   "Block a Room teardown boundary until all detached evaluation cleanup completes.
 
    Evaluation cancellation itself stays non-blocking for the Spindel drain.
-   Ephemeral Room owners must call this outside a Spin before closing the Room.
+   Includes admission and the physical completion of admitted Runs, not only
+   detached certification. Ephemeral Room owners must call this outside a Spin before closing the Room.
    Throws on timeout or a cleanup failure."
   ([room] (await-cleanups! room 30000))
   ([room timeout-ms]
@@ -758,12 +780,16 @@
             ;; the store, so it runs off the drain. (It once hung there at
             ;; :parallelism 8: spins built on several threads at once shared
             ;; ids, spindel#110.)
-            handle (sp/await
-                    (blocking/blocking
-                     (admit-uninterruptibly
-                      #(program/hire-prepared-in! room (or world-parent room) team agent-ref
-                                                  hire-opts prepare-world! hosted-protocol)
-                      #(program/cancel! room %))))
+            admission (tracked-admission
+                       room cleanup-group
+                       #(program/hire-prepared-in! room (or world-parent room) team agent-ref
+                                                   hire-opts prepare-world! hosted-protocol)
+                       #(program/cancel! room %))
+            handle (try
+                     (sp/await (blocking/blocking (:await admission)))
+                     (catch Throwable error
+                       ((:cancel! admission))
+                       (throw error)))
             timed-out ::timed-out
             initial (sp/await
                      (comb/timeout (program/owned-result-spin handle)
