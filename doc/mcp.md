@@ -172,6 +172,16 @@ naming one), or, for a host that runs dvergr's rooms without a daemon, process-w
   principal grants it again instead of answering "exists". A catalog fixture room whose grant
   failed stays ungranted; each benchmark makes a new one.
 
+`dvergr.principal/mint-run-token!` takes `{:actor :room :tools :ttl-ms :claims}` and
+returns a bearer token. `:ttl-ms` defaults to an hour. `:claims` is an optional map
+merged into the principal, for example `{:principal/delegation "delegation/1"
+:principal/run "run/1"}`. `principal/run-token-principal` returns that principal while
+the token is live; `principal/revoke-run-token!` ends it. The host's `:authorize`
+receives the claims untouched. Claims may contain only keys dvergr does not interpret:
+`:principal/id`, `:principal/actor`, `:principal/room`, `:principal/tools`,
+`:principal/kind`, `:principal/scopes` and `:dvergr.principal/local` are refused,
+even with nil values. Claims do not widen the token's room or tool pins or its lifetime.
+
 A principal never receives a room it did not create: `room_create` and `room_import` refuse
 an existing slug (409) unless that principal created it, and `agent_open` gives each
 principal other than the local one a DM room of its own (`dm-<agent>-<hash>`; the local
