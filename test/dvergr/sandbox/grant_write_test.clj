@@ -549,53 +549,70 @@
           (is (= before (grepo/head-commit conn)))
           (is (= staged (:staged (grepo/status conn))))
           (srooms/set-trunk-write-policy! nil)
-          (is (some #(= "export-policy.txt" (:path %)) (:files (room-repo/export room))))))))
+          (is (some #(= "export-policy.txt" (:path %)) (:files (room-repo/export room)))))))))
 
-  (deftest file-and-git-gates-target-one-repository
-    (with-policy-room
-      "policy-two-repos"
-      (fn [room rid]
-        (let [other (:b @world)
-              other-id (:repo-id other)
-              workspace-fn gs/current-workspace
-              workspace (gs/current-workspace)
-              other-system (:system (some #(when (= other-id (get-in % [:system :system/id])) %)
-                                          (sdb/systems-for-room (:room-id other))))]
-          (sdb/attach! rid other-id :read-write)
-          (#'srooms/register-system-into-current! other-system)
-        ;; Select A explicitly: both repos are attached to the same world.
-          (with-redefs [gs/current-workspace (constantly workspace)]
-            (let [sci (sandbox/fork-for-session (:ctx room))]
-              (sandbox/setup-agent-namespaces! sci (:ctx room) :room-id rid)
-              (srooms/set-trunk-write-policy! (fn [r s] (when (and (= rid r) (= other-id s)) :fork-only)))
-              (is (string? (:commit (files/write! room {"repo-a.txt" {:text "allowed"}} {}))))
-              (binding [rtc/*execution-context* (:root @world)]
-                (is (string? (:commit (files/write! room {"repo-a-host.txt" {:text "allowed"}}
-                                                    {:boundary (tools/effect-boundary {:room room})})))))
-              (doseq [code ["(spit \"/repo-a-sci.txt\" \"allowed\")"
-                            "(require '[babashka.fs :as fs]) (fs/create-dir \"/repo-a-dir\")"
-                            "(require '[git :as git]) (git/add \"repo-a-sci.txt\") (git/commit \"allowed\")"]]
-                (is (:success (sandbox/eval-code sci code)) code))
-              (is (= "allowed" (:text (files/read-file room "repo-a.txt" {}))))
-              (let [other-workspace (with-redefs [gs/current-system
-                                                  (constantly (ygg/system (#'srooms/repo-system-name (:repo-path other))))]
-                                      (workspace-fn))]
-                (with-redefs [gs/current-workspace (constantly other-workspace)]
-                  (let [other-sci (sandbox/fork-for-session (:ctx room))]
-                    (sandbox/setup-agent-namespaces! other-sci (:ctx room) :room-id rid)
-                    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"this room's workflow writes through forks"
-                                          (files/write! room {"repo-b.txt" {:text "refused"}} {})))
-                    (doseq [code ["(spit \"/repo-b.txt\" \"refused\")"
-                                  "(require '[git :as git]) (git/add \".\")"
-                                  "(git/commit \"refused\")"]]
-                      (is (re-find #"this room's workflow writes through forks"
-                                   (get-in (sandbox/eval-code other-sci code) [:error :message])))))))
-              (let [own-id (srooms/connection-system-id (:conn workspace))]
-                (is (some? own-id))
-                (srooms/set-trunk-write-policy! (fn [r s] (when (and (= rid r) (= own-id s)) :fork-only))))
-              (is (thrown-with-msg? clojure.lang.ExceptionInfo #"this room's workflow writes through forks"
-                                    (files/write! room {"repo-a.txt" {:text "refused"}} {})))
-              (doseq [code ["(spit \"/repo-a-sci.txt\" \"refused\")" "(git/add \".\")" "(git/commit \"refused\")"]]
-                (is (re-find #"this room's workflow writes through forks"
-                             (get-in (sandbox/eval-code sci code) [:error :message]))))
-              (is (= "allowed" (:text (files/read-file room "repo-a.txt" {})))))))))))
+(deftest file-and-git-gates-target-one-repository
+  (with-policy-room
+    "policy-two-repos"
+    (fn [room rid]
+      (let [other (:b @world)
+            other-id (:repo-id other)
+            workspace-fn gs/current-workspace
+            workspace (gs/current-workspace)
+            other-system (:system (some #(when (= other-id (get-in % [:system :system/id])) %)
+                                        (sdb/systems-for-room (:room-id other))))]
+        (sdb/attach! rid other-id :read-write)
+        (#'srooms/register-system-into-current! other-system)
+      ;; Select A explicitly: both repos are attached to the same world.
+        (with-redefs [gs/current-workspace (constantly workspace)]
+          (let [sci (sandbox/fork-for-session (:ctx room))]
+            (sandbox/setup-agent-namespaces! sci (:ctx room) :room-id rid)
+            (srooms/set-trunk-write-policy! (fn [r s] (when (and (= rid r) (= other-id s)) :fork-only)))
+            (is (string? (:commit (files/write! room {"repo-a.txt" {:text "allowed"}} {}))))
+            (binding [rtc/*execution-context* (:root @world)]
+              (is (string? (:commit (files/write! room {"repo-a-host.txt" {:text "allowed"}}
+                                                  {:boundary (tools/effect-boundary {:room room})})))))
+            (doseq [code ["(spit \"/repo-a-sci.txt\" \"allowed\")"
+                          "(require '[babashka.fs :as fs]) (fs/create-dir \"/repo-a-dir\")"
+                          "(dvergr.skills/author! \"repo-a-skill\" {:description \"d\"} \"body\")"
+                          "(dvergr.skills/lift! \"repo-a-lifted\" \"source\" \"body\")"
+                          "(dvergr.skills/promote! \"repo-a-skill\" \"reviewer\" \"2026-10-16\")"
+                          "(require '[git :as git]) (git/add \"repo-a-sci.txt\") (git/commit \"allowed\")"]]
+              (is (:success (sandbox/eval-code sci code)) code))
+            (is (= "allowed" (:text (files/read-file room "repo-a.txt" {}))))
+            (is (true? (get-in (sandbox/eval-code sci "(get (dvergr.skills/all) \"repo-a-skill\")")
+                               [:value :vetted])))
+            (is (false? (get-in (sandbox/eval-code sci "(get (dvergr.skills/all) \"repo-a-lifted\")")
+                                [:value :vetted])))
+            (let [other-workspace (with-redefs [gs/current-system
+                                                (constantly (ygg/system (#'srooms/repo-system-name (:repo-path other))))]
+                                    (workspace-fn))]
+              (with-redefs [gs/current-workspace (constantly other-workspace)]
+                (let [other-sci (sandbox/fork-for-session (:ctx room))]
+                  (sandbox/setup-agent-namespaces! other-sci (:ctx room) :room-id rid)
+                  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"this room's workflow writes through forks"
+                                        (files/write! room {"repo-b.txt" {:text "refused"}} {})))
+                  (doseq [code ["(spit \"/repo-b.txt\" \"refused\")"
+                                "(dvergr.skills/author! \"repo-a-skill\" {:description \"d\"} \"body\")"
+                                "(dvergr.skills/lift! \"repo-a-lifted\" \"source\" \"body\")"
+                                "(dvergr.skills/promote! \"repo-a-skill\" \"reviewer\" \"2026-10-16\")"
+                                "(require '[git :as git]) (git/add \".\")"
+                                "(git/commit \"refused\")"]]
+                    (is (re-find #"this room's workflow writes through forks"
+                                 (get-in (sandbox/eval-code other-sci code) [:error :message])))))))
+            (let [own-id (srooms/connection-system-id (:conn workspace))]
+              (is (some? own-id))
+              (srooms/set-trunk-write-policy! (fn [r s] (when (and (= rid r) (= own-id s)) :fork-only))))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"this room's workflow writes through forks"
+                                  (files/write! room {"repo-a.txt" {:text "refused"}} {})))
+            (doseq [code ["(spit \"/repo-a-sci.txt\" \"refused\")" "(git/add \".\")" "(git/commit \"refused\")"
+                          "(dvergr.skills/author! \"refused-skill\" {} \"body\")"
+                          "(dvergr.skills/lift! \"refused-lifted\" \"source\" \"body\")"
+                          "(dvergr.skills/promote! \"repo-a-lifted\" \"reviewer\" \"2026-10-16\")"]]
+              (is (re-find #"this room's workflow writes through forks"
+                           (get-in (sandbox/eval-code sci code) [:error :message]))))
+            (is (= "allowed" (:text (files/read-file room "repo-a.txt" {}))))
+            (is (nil? (get (grepo/worktree (:conn workspace)) "skills/refused-skill.md")))
+            (is (nil? (get (grepo/worktree (:conn workspace)) "skills/refused-lifted.md")))
+            (is (false? (get-in (sandbox/eval-code sci "(get (dvergr.skills/all) \"repo-a-lifted\")")
+                                [:value :vetted])))))))))
