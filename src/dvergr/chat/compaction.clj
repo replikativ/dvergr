@@ -465,7 +465,7 @@ Summary:")
 
    Uses a cheap/fast model to minimize cost."
   [messages {:keys [model provider]
-             :or {model "accounts/fireworks/models/minimax-m2p7"
+             :or {model "accounts/fireworks/models/minimax-m3"
                   provider :fireworks}}]
   (let [formatted (format-messages-for-summary messages)
         prompt (format summarization-prompt formatted)
@@ -521,7 +521,7 @@ Summary:")
    - :wiki-links - Extracted wiki-links
    - :summary - Generated summary"
   [chat-ctx & {:keys [model provider summarizer on-wiki-links context-window]
-               :or {model "accounts/fireworks/models/minimax-m2p7"
+               :or {model "accounts/fireworks/models/minimax-m3"
                     provider :fireworks
                     context-window 128000}}]
   (let [messages (chat-ctx/get-messages chat-ctx)
@@ -746,7 +746,7 @@ Summary:")
 
   ;; Manual compaction
   (compact! chat-ctx
-            :model "accounts/fireworks/models/minimax-m2p7"
+            :model "accounts/fireworks/models/minimax-m3"
             :on-wiki-links (fn [links]
                              (println "Extracted:" links)))
 

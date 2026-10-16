@@ -124,10 +124,10 @@ export FIREWORKS_BASE_URL=https://api.fireworks.ai/inference/v1 # optional
 - **The model an unpinned agent gets.** `providers/default-spec` picks the
   first registered provider in the order Anthropic, Fireworks, OpenAI, Codex
   subscription, Codex CLI, Claude Code, with that provider's preferred model:
-  for Fireworks that is `accounts/fireworks/models/minimax-m2p7`
+  for Fireworks that is `accounts/fireworks/models/minimax-m3`
   (`preferred-default-model` in `model/providers.clj`). The registry's
   `:defaults` in `resources/models.edn` name `minimax-m3` for compaction, and
-  the alias `minimax` resolves to m3; pin `:model` to get m3 for an agent.
+  the alias `minimax` also resolves to m3.
 - **Claude Code** has **no API key** — it auto-detects by running `claude --version`.
   If the CLI exits 0, `:claude-code` registers and bills against your Claude
   subscription (model pricing is `0`). Reports still price subscription models
@@ -168,7 +168,7 @@ model `:codex-subscription-cli` / `"codex-subscription-cli"`.
 | Claude Code subscription | Logged-in `claude` on `PATH` | `:claude-code` / `"claude-code-sonnet"` |
 | ChatGPT Codex subscription | `codex login` with ChatGPT | `:codex-subscription` / `"codex-subscription"` |
 | Keyring-only Codex login | Logged-in `codex` on `PATH` | `:codex-subscription-cli` / `"codex-subscription-cli"` |
-| Fireworks account | `FIREWORKS_API_KEY` | `:fireworks` / `"accounts/fireworks/models/minimax-m2p7"` (unpinned; pin `minimax-m3`) |
+| Fireworks account | `FIREWORKS_API_KEY` | `:fireworks` / `"accounts/fireworks/models/minimax-m3"` |
 | OpenAI API account | `OPENAI_API_KEY`, plus an OpenAI registry entry | `:openai` / the registered model id |
 
 The built-in registry carries Anthropic, Claude Code, Codex subscription, five
@@ -251,10 +251,20 @@ registry.
 
 **Vision models** carry `:vision` in `:capabilities`. `dvergr.media.vision`
 (image describe/extract) picks the registry's vision default, overridable with
-`DVERGR_VISION_MODEL`. The bundled default is what's deployed on the reference
-Fireworks account (probe-verified); a dedicated Qwen-VL is cheaper per token if
-your account has one — register it and point `DVERGR_VISION_MODEL` at it. See
-[media.md](media.md#vision--images-to-text-and-data).
+`DVERGR_VISION_MODEL`. The bundled default is OpenAI `gpt-5.4-mini`
+(requires `OPENAI_API_KEY`): none of the served Fireworks models is marked
+image-capable in the registry. `LLM_CALL_MODEL` defaults to Fireworks
+`accounts/fireworks/models/minimax-m3`.
+
+Retired ids remain in the registry with `:retired true` and `:successor`.
+Alias resolution follows successors and emits one warning naming the retired
+id and the resolved id per resolution. Kimi K2.6 and K2.5 resolve to Kimi K3,
+GLM 5.2 to GLM 5.3, and MiniMax M2.7 to MiniMax M3. K3 is text-only in this
+registry; vision calls reject it before sending images. Set an image-capable
+`DVERGR_VISION_MODEL` instead. A provider's 404 "Model not found" error names
+the resolved model and its source config key (`:model` for direct calls).
+`vision/describe` throws on failed or empty descriptions so screen intake can
+report a failure instead of silently dropping a frame.
 
 Some Fireworks models leak their tool-call envelope into content (Kimi, GLM);
 their `:quirks` (`:kimi-tool-id-format?`, `:glm-tool-format?`) turn on the

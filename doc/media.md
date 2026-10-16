@@ -67,8 +67,8 @@ backends:
 
 `dvergr.media.vision` describes and extracts from images via a vision LLM,
 routed through `dvergr.model.chat/chat` (so it gets provider/key resolution and
-429/5xx retry). The default model is set in `resources/models.edn` and
-overridable with `DVERGR_VISION_MODEL` — see
+429/5xx retry). The default is OpenAI `gpt-5.4-mini` (requires `OPENAI_API_KEY`),
+set in `resources/models.edn` and overridable with `DVERGR_VISION_MODEL` — see
 [provider-setup.md](provider-setup.md).
 
 ### `vision/describe` — OCR + scene description

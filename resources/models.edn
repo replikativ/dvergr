@@ -14,11 +14,10 @@
 
   "accounts/fireworks/models/kimi-k2p6"
   {:name "Kimi K2.6"
+   :retired true
+   :successor "accounts/fireworks/models/kimi-k3"
    :provider :fireworks
    :api-type :openai-chat
-   ;; :vision — verified deployed + accurate on this account (probe 2026-07-05);
-   ;; the dvergr.media.vision default. Reasoning model, so give vision/extract a
-   ;; generous max-tokens (it spends output budget thinking before the answer).
    :capabilities #{:tools :vision :streaming}
    :context 262144
    :max-output 8192
@@ -31,9 +30,10 @@
 
   "accounts/fireworks/models/kimi-k2p5"
   {:name "Kimi K2.5"
+   :retired true
+   :successor "accounts/fireworks/models/kimi-k3"
    :provider :fireworks
    :api-type :openai-chat
-   ;; :vision — the fallback vision model (see the Vision section below).
    :capabilities #{:tools :vision :streaming}
    :context 262144
    :max-output 8192
@@ -87,6 +87,8 @@
 
   "accounts/fireworks/models/glm-5p2"
   {:name "GLM 5.2"
+   :retired true
+   :successor "accounts/fireworks/models/glm-5p3"
    :provider :fireworks
    :api-type :openai-chat
    :capabilities #{:tools :streaming}
@@ -109,6 +111,8 @@
 
   "accounts/fireworks/models/minimax-m2p7"
   {:name "MiniMax M2.7"
+   :retired true
+   :successor "accounts/fireworks/models/minimax-m3"
    :provider :fireworks
    :api-type :openai-chat
    :capabilities #{:tools :streaming}
@@ -202,14 +206,9 @@
   ;; path). OpenAI-compat chat endpoint takes image_url content parts. Override
   ;; with DVERGR_VISION_MODEL.
   ;;
-  ;; The vision DEFAULT is Kimi K2.6 (above, :vision-tagged): probed
-  ;; 2026-07-05, it's the only deployed model on this account that accepts
-  ;; image input, and it extracts business-document fields accurately. The
-  ;; dedicated Qwen-VL models (qwen3-vl-32b/30b-a3b, qwen2.5-vl-32b) return
-  ;; 404 "not deployed" here — re-probe and register them if the account adds
-  ;; them (they'd be cheaper: $0.50–0.90/M vs Kimi's $4/M output). GLM-5 and
-  ;; DeepSeek-V4 are deployed but text-only ("does not support image inputs").
-  ;; Kimi K2.5 (above) is the vision fallback.
+  ;; None of the served Fireworks models is tagged :vision (2026-10-16).
+  ;; Use the registered OpenAI gpt-5.4-mini via image_url content parts.
+  ;; Retired Kimi ids resolve to text-only K3; vision callers reject them.
 
   }
 
@@ -235,6 +234,7 @@
  ;; the cheapest one-off summary model.
 
  :defaults
- {:compaction-model "accounts/fireworks/models/minimax-m3"
+ {:vision-model     "gpt-5.4-mini"
+  :compaction-model "accounts/fireworks/models/minimax-m3"
   :primary-model    "accounts/fireworks/models/minimax-m3"
   :summary-model    "accounts/fireworks/models/gpt-oss-20b"}}

@@ -130,7 +130,7 @@
   "Make HTTP request with error handling. Returns response or throws. The
    usage a subscription provider reports in the headers is recorded, also
    on a refusal."
-  [provider-id url headers body credentials]
+  [provider-id url headers body credentials opts]
   (let [response (gateway/request! {:method :post
                                     :url url
                                     :headers headers
@@ -142,7 +142,16 @@
     (try (subscription/observe-headers! provider-id (:headers response))
          (catch Exception _ nil))
     (if (>= (:status response) 400)
-      (throw (wrap-api-error response))
+      (let [error (wrap-api-error response)
+            config-key (or (:model-config-key opts) :model)]
+        (if (and (= 404 (:status response))
+                 (str/includes? (str/lower-case (:message (ex-data error))) "model not found"))
+          (throw (ex-info (str "Model " (:model opts) " from " config-key
+                               " is unavailable: " (.getMessage error))
+                          (assoc (ex-data error) :type ::model-not-found
+                                 :model (:model opts) :config-key config-key)
+                          error))
+          (throw error)))
       response)))
 
 ;; ============================================================================
@@ -178,7 +187,7 @@
         {:keys [url headers body credentials]} (p/build-request provider messages opts)
 
         ;; Make HTTP request
-        response (make-request (p/provider-id provider) url headers body credentials)
+        response (make-request (p/provider-id provider) url headers body credentials opts)
         last-read (java.util.concurrent.atomic.AtomicLong. (System/currentTimeMillis))
         stalled (atom false)
         ^java.io.InputStream raw (:body response)
@@ -272,6 +281,7 @@
 
    Options:
      :model     - Model ID (required)
+     :model-config-key - Source config key for model error diagnostics (default :model)
      :provider  - Provider keyword (optional, inferred from model)
      :max-tokens - Max output tokens
      :system    - System prompt (overrides system message in messages)
