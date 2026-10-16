@@ -18,14 +18,39 @@
    descriptions → knowledge bases)."
   (:require [dvergr.model.chat :as chat]
             [dvergr.model.registry :as registry]
+            [dvergr.model.providers :as providers]
             [clojure.string :as str]
             [jsonista.core :as json]
             [taoensso.telemere :as tel]))
 
+(defn- system-env [key] (System/getenv key))
+
 (defn- model-id [model]
   (registry/ensure-models-loaded!)
-  (or model (System/getenv "DVERGR_VISION_MODEL")
-      (registry/get-default :vision-model)))
+  (let [configured (or model (not-empty (system-env "DVERGR_VISION_MODEL"))
+                       (registry/get-default :vision-model))
+        fail! (fn [reason]
+                (throw (ex-info
+                        (str "Configure :defaults :vision-model in models.edn or DVERGR_VISION_MODEL "
+                             "(or pass :model): " reason)
+                        {:type ::configuration :config-key :vision-model :model configured})))
+        _ (when (str/blank? configured) (fail! "an explicit image-capable model is required"))
+        mid (registry/resolve-alias configured)
+        _ (registry/assert-capability! mid :vision)
+        _ (providers/ensure-initialized!)
+        provider-key (registry/provider-of mid)
+        provider (or (providers/get-provider provider-key)
+                     (fail! (str "provider " provider-key " is not registered; configure its credentials")))
+        base-url (get-in provider [:config :base-url])
+        host (some-> base-url java.net.URI. .getHost str/lower-case)
+        route-provider (cond
+                         (= host "api.fireworks.ai") :fireworks
+                         (= host "api.openai.com") :openai
+                         (= host "api.anthropic.com") :anthropic)]
+    (when (and route-provider (not= provider-key route-provider))
+      (fail! (str mid " belongs to " provider-key " but its provider routes to " base-url
+                  "; correct the provider :base-url / OPENAI_BASE_URL or choose a model served there")))
+    mid))
 
 (defn- image-message [data-url text]
   {:role "user"
@@ -54,7 +79,8 @@
 (defn describe
   "Describe image bytes → text. Throws on failure so frame intake can report it.
    Routes through dvergr.model.chat/chat with a base64 image_url content part.
-   opts: :prompt (default: detailed description + OCR), :model, :max-tokens."
+   opts: :prompt (default: detailed description + OCR), :model, :max-tokens.
+   Model must be explicit: :model, DVERGR_VISION_MODEL, or :defaults :vision-model."
   [^bytes bytes mime & [{:keys [prompt model max-tokens]}]]
   (let [messages [(image-message (->data-url bytes mime) (or prompt default-prompt))]
         content (:content (call-model messages
@@ -141,7 +167,7 @@
 
    opts:
      :schema        (required) field description, as above
-     :model         vision model id (default: gpt-5.4-mini)
+     :model         explicit vision model id; otherwise DVERGR_VISION_MODEL or :defaults :vision-model
      :verify-fields collection of field keywords to re-verify with a second
                     targeted pass — use for the load-bearing numbers
                     (:total, :amount_due …). Each gets one extra LLM call.

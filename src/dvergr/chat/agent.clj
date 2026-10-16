@@ -246,7 +246,8 @@
                                             "accounts/fireworks/models/minimax-m3")
                                  :provider (or provider :fireworks)))
 
-    (let [;; Get active messages (filtered by compaction point)
+    (let [model (model-registry/resolve-alias model)
+          ;; Get active messages (filtered by compaction point)
           messages (cond->> (compaction/get-active-messages chat-ctx)
                      ;; Transient per-turn system note (e.g. the /plan-mode
                      ;; guideline): appended to the FIRST system message for THIS

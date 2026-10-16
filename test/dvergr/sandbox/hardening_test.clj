@@ -94,7 +94,8 @@
           (is (thrown-with-msg? Exception #"Budget exceeded" (sci/eval-string* sci-ctx "(llm/call \"s\" \"c\")"))))))
     (testing "vision reports every response, so the sandbox wrapper can charge it"
       (let [seen (atom nil)]
-        (with-redefs [model-chat/chat (fn [_ _] {:content "a cat" :usage {:input-tokens 7}})]
+        (with-redefs [model-chat/chat (fn [_ _] {:content "a cat" :usage {:input-tokens 7}})
+                      vision/model-id (constantly "gpt-5.4-mini")]
           (binding [vision/*on-response* #(reset! seen %)]
             (is (= "a cat" (vision/describe (byte-array [1 2 3]) "image/png")))))
         (is (= {:input-tokens 7} (:usage @seen)))))))

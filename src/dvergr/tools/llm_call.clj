@@ -12,6 +12,7 @@
    Budget: tokens are accounted to the calling agent's chat-ctx when
    :chat-ctx is present in the tool execution context."
   (:require [dvergr.model.chat :as model-chat]
+            [dvergr.model.registry :as registry]
             [dvergr.chat.context :as chat-ctx]
             [dvergr.tools :as tools]))
 
@@ -30,7 +31,7 @@
    - :system     — optional system prompt string"
   [prompt content opts]
   (try
-    (let [model      (or (:model opts) default-model)
+    (let [model      (registry/resolve-alias (or (:model opts) default-model))
           max-tokens (or (:max-tokens opts) 500)
           system     (:system opts)
           full-prompt (if (seq content)

@@ -207,7 +207,7 @@
   ;; with DVERGR_VISION_MODEL.
   ;;
   ;; None of the served Fireworks models is tagged :vision (2026-10-16).
-  ;; Use the registered OpenAI gpt-5.4-mini via image_url content parts.
+  ;; Configure :defaults :vision-model or DVERGR_VISION_MODEL explicitly.
   ;; Retired Kimi ids resolve to text-only K3; vision callers reject them.
 
   }
@@ -234,7 +234,7 @@
  ;; the cheapest one-off summary model.
 
  :defaults
- {:vision-model     "gpt-5.4-mini"
+ {:vision-model     nil
   :compaction-model "accounts/fireworks/models/minimax-m3"
   :primary-model    "accounts/fireworks/models/minimax-m3"
   :summary-model    "accounts/fireworks/models/gpt-oss-20b"}}

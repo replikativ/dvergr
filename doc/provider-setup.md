@@ -250,10 +250,16 @@ snapshot in `model/registry.clj`; `resources/models.edn` is a distinct curated
 registry.
 
 **Vision models** carry `:vision` in `:capabilities`. `dvergr.media.vision`
-(image describe/extract) picks the registry's vision default, overridable with
-`DVERGR_VISION_MODEL`. The bundled default is OpenAI `gpt-5.4-mini`
-(requires `OPENAI_API_KEY`): none of the served Fireworks models is marked
-image-capable in the registry. `LLM_CALL_MODEL` defaults to Fireworks
+(image describe/extract) requires an explicitly configured model: per-call
+`:model`, then `DVERGR_VISION_MODEL`, then `:defaults {:vision-model "…"}` in
+models.edn (in that order). There is no bundled vision default. For example,
+`gpt-5.4-mini` needs an OpenAI provider with `OPENAI_API_KEY` and an OpenAI
+endpoint. If `OPENAI_BASE_URL` points at Fireworks, correct that routing before
+using an OpenAI vision model. None of the served bundled Fireworks models is
+marked image-capable. Missing configuration, missing providers, and known
+provider/endpoint mismatches fail before HTTP, naming `:vision-model` and
+`DVERGR_VISION_MODEL`. Unknown custom proxy URLs must serve the selected model;
+they cannot be validated locally. `LLM_CALL_MODEL` defaults to Fireworks
 `accounts/fireworks/models/minimax-m3`.
 
 Retired ids remain in the registry with `:retired true` and `:successor`.

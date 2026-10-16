@@ -1,5 +1,7 @@
 (ns dvergr.model.retired-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [dvergr.media.vision :as vision]
             [dvergr.model.api.openai :as openai]
             [dvergr.model.chat :as chat]
@@ -22,7 +24,10 @@
   (fn [f]
     (registry/ensure-models-loaded!)
     (with-redefs [providers/ensure-initialized! (constantly nil)
-                  providers/get-provider! (fn [_] (openai/create {:api-key "test"} {}))]
+                  providers/providers (atom {:openai (openai/create {:api-key "test"} {})
+                                             :fireworks (openai/create-fireworks {:api-key "test"} {})})
+                  vision/system-env (constantly nil)
+                  registry/defaults (atom (assoc @registry/defaults :vision-model "gpt-5.4-mini"))]
       (f))))
 
 (deftest retired-ids-and-aliases-resolve
@@ -40,10 +45,11 @@
       (with-redefs [gateway/request! (fn [request]
                                        (swap! requests conj (json/read-value (:body request) json/keyword-keys-object-mapper))
                                        {:status 200 :body (stream "data: [DONE]\n\n")})]
-        (chat/chat [{:role "user" :content "hi"}] {:model (fireworks old)})
+        (is (= (fireworks successor)
+               (:model (chat/chat [{:role "user" :content "hi"}] {:model (fireworks old)}))))
         (is (= [(fireworks successor)] (mapv :model @requests)))))))
 
-(deftest vision-default-accepts-image-parts
+(deftest configured-vision-accepts-image-parts
   (let [request (atom nil)]
     (is (= "gpt-5.4-mini" (registry/get-default :vision-model)))
     (is (registry/supports? (registry/get-default :vision-model) :vision))
@@ -94,3 +100,38 @@
     (is (= 1 (count signals)))
     (is (= :warn (:level (first signals))))
     (is (= {:model old :successor successor} (:data (first signals))))))
+
+(deftest vision-requires-explicit-usable-routing
+  (with-redefs [gateway/request! (fn [_] (throw (AssertionError. "must fail before HTTP")))]
+    (with-redefs [registry/defaults (atom {})]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #":vision-model.*DVERGR_VISION_MODEL"
+                            (vision/describe (byte-array [1]) "image/png")))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #":vision-model"
+                            (vision/extract (byte-array [1]) "image/png" {:schema "total"}))))
+    ;; Use the real constructor and lookup: this is the documented Fireworks env.
+    (let [env {"OPENAI_API_KEY" "test" "OPENAI_BASE_URL" "https://api.fireworks.ai/inference/v1"}]
+      (with-redefs [providers/providers (atom {:openai (openai/create {} env)})
+                    vision/system-env {"DVERGR_VISION_MODEL" "gpt-5.4-mini"}]
+        (doseq [invoke [#(vision/describe (byte-array [1]) "image/png")
+                        #(vision/extract (byte-array [1]) "image/png" {:schema "total"})]]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #":vision-model.*OPENAI_BASE_URL"
+                                (invoke))))))))
+
+(deftest cheap-call-attributes-successor
+  (with-redefs [gateway/request! (fn [_] {:status 200 :body (stream "data: [DONE]\n\n")})]
+    (is (= (fireworks "kimi-k3")
+           (:model (llm/cheap-llm-call "hi" "" {:model "kimi-k2p5"}))))))
+
+(deftest bundled-vision-has-no-default
+  (is (nil? (get-in (edn/read-string (slurp (io/resource "models.edn")))
+                    [:defaults :vision-model]))))
+
+(deftest vision-configuration-precedence
+  (with-redefs [vision/system-env {"DVERGR_VISION_MODEL" "gpt-5.4-mini"}
+                registry/defaults (atom {:vision-model (fireworks "kimi-k3")})
+                gateway/request! (fn [_] {:status 200 :body (stream "data: [DONE]\n\n")})]
+    (is (= "gpt-5.4-mini" (#'vision/model-id nil)))
+    (is (= "gpt-5.5" (#'vision/model-id "gpt-5.5"))))
+  (with-redefs [providers/providers (atom {})]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #":vision-model.*provider :openai is not registered"
+                          (#'vision/model-id "gpt-5.4-mini")))))

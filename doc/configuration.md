@@ -97,7 +97,7 @@ and storage GC. The `.nrepl-port` of a REPL is written at the project root, not 
 
 **Models** — `ANTHROPIC_API_KEY` · `OPENAI_API_KEY` / `OPENAI_BASE_URL` ·
 `FIREWORKS_API_KEY` / `FIREWORKS_BASE_URL` · `CODEX_HOME` (providers) ·
-`GROQ_API_KEY` (ASR) · `DVERGR_VISION_MODEL` (override the vision model). See
+`GROQ_API_KEY` (ASR) · `DVERGR_VISION_MODEL` (explicit vision model; no implicit default). See
 [provider-setup.md](provider-setup.md).
 
 **Media / voice** (see [media.md](media.md)) — `DVERGR_RECORD_CMD` (mic-capture

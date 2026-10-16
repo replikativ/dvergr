@@ -338,6 +338,7 @@
 
         ;; Ensure model is in opts
         opts (assoc opts :model model-id)]
+    ;; Response identity is the execution id used for pricing and attribution.
 
     ;; DirectChat providers bypass the HTTP+SSE path entirely
     (if (p/implements-direct-chat? provider)
@@ -345,7 +346,7 @@
         (throw (ex-info "Dispatch-governed Runs require a native HTTP provider"
                         {:type ::unsupported-dispatch-accounting
                          :provider provider-key}))
-        (p/direct-chat provider messages opts))
+        (assoc (p/direct-chat provider messages opts) :model model-id))
 
       ;; Standard HTTP+SSE streaming path. A model call has no side effect,
       ;; so a stream that stalls or breaks while it is read is asked again,
@@ -361,7 +362,7 @@
                           "The response stream stalled or broke; asking again")
                 (Thread/sleep (long (calculate-backoff attempt nil)))
                 (recur (inc attempt)))
-            (:response r)))))))
+            (assoc (:response r) :model model-id)))))))
 
 (defn- consume-stream
   "Stream one response and accumulate it (see `chat`)."
