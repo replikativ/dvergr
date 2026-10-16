@@ -241,6 +241,35 @@
       (let [t (principal/mint-run-token! {:actor :worker :room "r1" :tools [] :ttl-ms -1})]
         (is (nil? (auth {:transport :mcp-tcp :bearer t})) "expired")))))
 
+(deftest run-token-claims-reach-the-host-authorizer
+  (let [claims {:principal/delegation "delegation/1" :principal/run "run/1"
+                :host/evidence {:actions #{:merge} :nested [nil false {:x 1}]}}
+        t (principal/mint-run-token! {:actor :worker :room "authz-open" :tools ["room_detail"]
+                                      :claims claims})
+        p (principal/run-token-principal t)
+        seen (atom nil)]
+    (try
+      (is (= claims (select-keys p (keys claims))))
+      (is (= :worker (principal/actor p)))
+      (is (= :agent (:principal/kind p)))
+      (is (empty? (:principal/scopes p)))
+      (is (:allow? (principal/decide (daemon (fn [who _] (reset! seen who) true)) p
+                                     {:op :room/detail :action :read :resource [:room "authz-open"]
+                                      :resolved {:room "authz-open"}})))
+      (is (identical? p @seen) "the host sees the principal untouched")
+      (finally (principal/revoke-run-token! t)))))
+
+(deftest run-token-claims-cannot-override-authority
+  (doseq [k [:principal/id :principal/actor :principal/room :principal/tools
+             :principal/kind :principal/scopes :dvergr.principal/local]
+          value [nil (get principal/local-principal k)]]
+    (testing (str k " with " (pr-str value))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"may not override dvergr authority"
+                            (principal/mint-run-token! {:room "r" :tools [] :claims {k value}})))))
+  (doseq [claims [[] [:principal/run "run/1"] "claims" false]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"claims must be a map"
+                          (principal/mint-run-token! {:room "r" :tools [] :claims claims})))))
+
 (deftest a-run-token-works-in-its-room-only
   (let [t (principal/mint-run-token! {:actor :worker :room "authz-open" :tools ["room_detail"]})
         p (principal/run-token-principal t)]

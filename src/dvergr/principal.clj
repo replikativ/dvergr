@@ -225,17 +225,29 @@
   ;; token -> {:principal :expires-at :on-revoke #{fn}}
   (atom {}))
 
+(def ^:private reserved-run-claim-keys
+  #{:principal/id :principal/actor :principal/room :principal/tools
+    :principal/kind :principal/scopes ::local})
+
 (defn mint-run-token!
   "A token for one invocation of an agent that reaches dvergr over MCP (a
    `claude -p` candidate through `bin/dvergr-mcp`): it authenticates as
    `(agent-principal actor)`, pinned to room `room` (an id string) and the
    tool names `tools`, until `revoke-run-token!` or `ttl-ms` (default an
    hour). It carries no scope of its own: the pins are all it may use, over
-   MCP only. Returns the token."
-  [{:keys [actor room tools ttl-ms] :or {ttl-ms 3600000}}]
+   MCP only. Optional `claims` is a map merged into the principal and passed
+   untouched to the host authorizer. It may not contain :principal/id,
+   :principal/actor, :principal/room, :principal/tools, :principal/kind,
+   :principal/scopes or :dvergr.principal/local. Returns the token."
+  [{:keys [actor room tools ttl-ms claims] :or {ttl-ms 3600000}}]
+  (when-not (or (nil? claims) (map? claims))
+    (throw (ex-info "Run token claims must be a map" {:type ::invalid-run-claims})))
+  (when-let [reserved (not-empty (filterv reserved-run-claim-keys (keys claims)))]
+    (throw (ex-info "Run token claims may not override dvergr authority"
+                    {:type ::reserved-run-claims :keys reserved})))
   (let [t (random-token)]
     (swap! run-tokens assoc t
-           {:principal (assoc (agent-principal (or actor :agent))
+           {:principal (assoc (merge (agent-principal (or actor :agent)) claims)
                               :principal/id (str "run/" (subs t 0 16))
                               :principal/actor (or actor :agent)
                               :principal/room (str room)
