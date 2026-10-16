@@ -16,7 +16,6 @@
             [geschichte.repo :as repo]
             [clojure.string :as str]
             [hasch.core :as hasch]
-            [muschel.fs :as mfs]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [yggdrasil.protocols :as yp]))
@@ -342,35 +341,21 @@
   (refuse-dirty-parent! parent)
   (commit-workspace! fork (str "Work of fork " (name (:id fork)))))
 
-(defn porcelain-paths
-  "The paths of `git status --porcelain` lines (a rename names both)."
-  [lines]
-  (mapcat (fn [line]
-            (let [line (str line)]
-              (map str/trim (str/split (subs line (min 3 (count line))) #" -> "))))
-          lines))
-
-(defn- sha256 [^bytes bs]
-  (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
-    (apply str (map #(format "%02x" (bit-and (int %) 0xff)) d))))
-
-(defn- dirty-digest
-  "What the uncommitted paths of `room`'s workspace hold: `[path digest]`
-   sorted, a directory by everything under it, a removed path `:absent`. nil
-   when the workspace is clean."
+(defn uncommitted
+  "What `room`'s workspace holds that is not committed, exactly: one entry per
+   changed path from the repository's structured status (`repo/status-entries`;
+   no parsing of status lines), with the path's worktree and index entries
+   (content id and mode: a symbolic link by its target, an executable bit
+   too). Sorted by path; nil when clean or without a workspace."
   [room]
-  (when-let [changes (workspace-changes room)]
-    (binding [ec/*execution-context* (:ctx room)]
-      (let [fs (git/filesystem)
-            digest (fn digest [p]
-                     (try
-                       (cond (not (mfs/exists? fs p)) [[p :absent]]
-                             (= :directory (:type (mfs/stat fs p)))
-                             (mapcat #(digest (str (str/replace p #"/+$" "") "/" (if (map? %) (:name %) %)))
-                                     (sort-by #(if (map? %) (:name %) (str %)) (mfs/list-dir fs p)))
-                             :else [[p (sha256 (mfs/read-bytes fs p))]])
-                       (catch Throwable _ [[p :unreadable]])))]
-        (vec (sort-by first (mapcat #(digest (str "/" (str/replace % #"/+$" ""))) (porcelain-paths changes))))))))
+  (binding [ec/*execution-context* (:ctx room)]
+    (when-let [{:keys [conn]} (git/current-workspace)]
+      (let [entries (repo/status-entries conn)]
+        (when (seq entries)
+          (let [work (repo/worktree conn)
+                index (repo/index-tree conn)]
+            (vec (for [{:keys [path] :as e} (sort-by :path entries)]
+                   {:path path :status e :worktree (get work path) :index (get index path)}))))))))
 
 (defn state-token
   "A content hash of `fork`'s state: its mergeable systems' snapshot ids
@@ -381,7 +366,7 @@
    merge). nil for non-`:ctx` forks."
   [fork]
   (when (ctx-fork? fork)
-    (let [dirty (dirty-digest fork)]
+    (let [dirty (uncommitted fork)]
       (binding [ec/*execution-context* (:ctx fork)]
         (str (hasch/uuid
               (cond-> (into (sorted-map)

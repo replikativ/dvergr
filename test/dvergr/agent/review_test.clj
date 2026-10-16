@@ -12,6 +12,7 @@
             [dvergr.discourse :as d]
             [muschel.fs]
             [dvergr.ops :as ops]
+            [dvergr.rooms.forks]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.principal :as principal]
             [dvergr.substrate.paths :as paths]
@@ -204,3 +205,16 @@
     (is (changed? {:error "diff failed"}))
     (is (changed? {:intents [{:op :book}]}))
     (is (changed? {:something :unknown}) "unclear goes to a person")))
+
+(deftest the-state-token-covers-uncommitted-names-contents-and-modes
+  (let [[_ fork] (room-with-fork "rv-token" {} {})
+        f #(ops/resolve-room *daemon* fork)
+        token #(dvergr.rooms.forks/state-token (f))]
+    (raw-write! fork "/wiki/a.md " "one")
+    (let [t1 (token)]
+      (is (= ["wiki/a.md "] (map :path (dvergr.rooms.forks/uncommitted (f)))) "the exact name, its space kept")
+      (raw-write! fork "/wiki/a.md " "two")
+      (let [t2 (token)]
+        (is (not= t1 t2) "a changed content changes the token")
+        (muschel.fs/chmod (dvergr.catalog.workspace/room-fs (f)) "/wiki/a.md " 0755)
+        (is (not= t2 (token)) "a changed mode too")))))

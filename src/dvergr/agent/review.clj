@@ -90,7 +90,7 @@
 (defn- changed-files
   "Every path the fork changed, committed (a workspace diff's files; a rename
    or copy names both) or not, and the systems other than files it changed."
-  [{:keys [diff uncommitted]}]
+  [fork {:keys [diff]}]
   (let [file-deltas (filter (fn [[_ delta]] (contains? delta :files)) diff)
         others (for [[sid delta] diff
                      :when (and (not (contains? delta :files)) (system-changed? delta))]
@@ -99,7 +99,7 @@
                                          {:keys [path]} (:files delta)
                                          p (str/split (str path) #"\t")]
                                      p)
-                                   (forks/porcelain-paths uncommitted))))
+                                   (map :path (forks/uncommitted fork)))))
      :other-systems (vec (sort others))}))
 
 ;; ============================================================================
@@ -177,7 +177,7 @@
           rev (or (forks/review fork)
                   (throw (ex-info (str world " is not a reviewable fork") {:type ::not-reviewable :world world})))
           state (:state rev)
-          ctx (merge {:fork fork :review rev} (changed-files rev))
+          ctx (merge {:fork fork :review rev} (changed-files fork rev))
           checks (vec (for [c (:review/checks spec)]
                         (merge {:check c} (try (run-check c ctx)
                                                (catch Throwable t {:pass? false :evidence {:error (.getMessage t)}})))))
