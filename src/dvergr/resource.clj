@@ -6,6 +6,7 @@
    settle this authority: a child receives resources only through one governed
    Kontor transfer from its parent wallet."
   (:require [dvergr.agent.attempt.governance :as attempt-governance]
+            [dvergr.model.registry :as registry]
             [dvergr.room.store :as store]
             [kontor.resource :as kontor]
             [org.replikativ.spindel.engine.core :as ec]
@@ -377,14 +378,15 @@
    `body-bytes` (an upper bound on its text input tokens), what a provider
    adds on its own (`dispatch-overhead-tokens`) and `image-tokens` for each
    image part, at the model's highest input-side price (input, cache
-   writes); plus its enforced output limit `max-output` (reasoning included)
-   at the output price; all doubled for the premiums the registry's base
-   rates leave out (long context, service tiers). Prices are USD per million
+   writes) in any of its bands (`registry/highest-pricing`, long context
+   included); plus its enforced output limit `max-output` (reasoning
+   included) at the highest output price; all doubled for what the registry
+   does not model (service tiers). Prices are USD per million
    tokens, so microdollars per token. nil when no reliable bound exists: no
    output limit, no input or output price, or content whose cost its size
    does not bound (`unbounded-content?`; `body`, the request, is checked)."
   [model-def body body-bytes max-output]
-  (let [{:keys [input output cache-write cache-write-1h]} (:pricing model-def)]
+  (let [{:keys [input output cache-write cache-write-1h]} (registry/highest-pricing model-def)]
     (when (and (number? input) (number? output) (pos-int? max-output) (pos-int? body-bytes)
                (not (unbounded-content? body)))
       (let [in-price (apply max (filter number? [input cache-write cache-write-1h]))

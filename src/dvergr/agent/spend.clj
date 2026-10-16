@@ -60,7 +60,8 @@
    writes kept an hour, is billed at `:cache-write-1h` (twice the input rate
    when the registry has none)."
   [model usage]
-  (when-let [pricing (and model (acct/get-model-pricing model))]
+  (when-let [pricing (and model (or (registry/long-context-pricing model (get usage :input-tokens))
+                                    (acct/get-model-pricing model)))]
     (let [n #(long (or (get usage %) 0))
           cache-read (n :cache-read-tokens)
           cache-write (+ (n :cache-creation-tokens) (n :cache-write-tokens))

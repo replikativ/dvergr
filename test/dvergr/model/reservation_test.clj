@@ -315,3 +315,19 @@
             (is (= 100M (:charged (resource/charge-spend! 100M)))))
           (is (= 0M (held)))
           (is (= 999900M (left room run-id))))))))
+
+(deftest a-long-prompt-is-bounded-settled-and-charged-at-its-band
+  (let [haiku (registry/get-model "claude-haiku-5-5")
+        usage {:input-tokens 100001 :output-tokens 64000}
+        billed (+ (* 100001 0.50) (* 64000 2.50))]
+    (is (<= billed (resource/dispatch-bound haiku {:messages []} 300000 64000))
+        "the bound covers the long-context band")
+    (is (= (Math/round billed) (:microdollars (dvergr.agent.spend/of-usage "claude-haiku-5-5" usage)))
+        "settlement prices the whole request in its band")
+    (is (= (Math/round (* 100001 0.50))
+           (dvergr.chat.accounting/calculate-cost :input-tokens 100001
+                                                  {:model "claude-haiku-5-5" :prompt-tokens 100001}))
+        "chat accounting prices it in the same band")
+    (is (= (Math/round (* 1000 0.10))
+           (dvergr.chat.accounting/calculate-cost :input-tokens 1000
+                                                  {:model "claude-haiku-5-5" :prompt-tokens 1000})))))
