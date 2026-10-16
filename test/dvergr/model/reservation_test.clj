@@ -11,6 +11,7 @@
             [dvergr.model.gateway :as gateway]
             [dvergr.model.provider :as provider]
             [dvergr.model.registry :as registry]
+            [dvergr.agent.spend]
             [dvergr.model.api.anthropic]
             [dvergr.resource :as resource]
             [dvergr.room.store :as store]
@@ -250,7 +251,18 @@
     (is (false? (:usage-final? started)) "the opening usage is not final")
     (is (= {:input-tokens 1210 :output-tokens 42 :cache-read-tokens 1000 :cache-creation-tokens 200}
            (:usage done)))
-    (is (true? (:usage-final? done)))))
+    (is (true? (:usage-final? done)))
+    (testing "cache writes kept an hour are priced at their own rate"
+      (let [state (provider/accumulate-event p (provider/create-accumulator p nil) "message_start"
+                                             {:message {:usage {:input_tokens 0
+                                                                :cache_creation_input_tokens 10000
+                                                                :cache_creation {:ephemeral_5m_input_tokens 0
+                                                                                 :ephemeral_1h_input_tokens 10000}}}}
+                                             nil)
+            usage (:usage (provider/extract-response p state))]
+        (is (= 10000 (:cache-write-1h-tokens usage)))
+        (is (= 100000 (:microdollars (dvergr.agent.spend/of-usage "claude-opus-4-7" usage)))
+            "10,000 one-hour writes at $10 per million")))))
 
 (deftest the-hold-is-on-the-ledger-and-a-failed-draw-keeps-it
   (with-funded-run

@@ -80,11 +80,14 @@
             ;; (`dvergr.agent.spend`); Anthropic reports the parts
             (assoc :usage (let [u (:usage msg)
                                 cached (get u :cache_read_input_tokens 0)
-                                written (get u :cache_creation_input_tokens 0)]
+                                written (get u :cache_creation_input_tokens 0)
+                                ;; the part of the writes kept an hour, billed higher
+                                hour (get-in u [:cache_creation :ephemeral_1h_input_tokens] 0)]
                             (cond-> {:input-tokens (+ (get u :input_tokens 0) cached written)
                                      :output-tokens (get u :output_tokens 0)}
                               (pos? cached) (assoc :cache-read-tokens cached)
-                              (pos? written) (assoc :cache-creation-tokens written))))))
+                              (pos? written) (assoc :cache-creation-tokens written)
+                              (pos? hour) (assoc :cache-write-1h-tokens hour))))))
 
       "content_block_start"
       (let [idx (:index event-data)

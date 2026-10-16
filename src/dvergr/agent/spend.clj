@@ -56,17 +56,21 @@
    and Claude Code report it): the cached part is billed at the cache rates
    (`:cache-read`; `:cache-write`, else the input rate), the rest at the
    input rate. Billing cached input at the full rate overstated a Luna
-   attempt by about a fifth."
+   attempt by about a fifth. `:cache-write-1h-tokens`, the part of the cache
+   writes kept an hour, is billed at `:cache-write-1h` (twice the input rate
+   when the registry has none)."
   [model usage]
   (when-let [pricing (and model (acct/get-model-pricing model))]
     (let [n #(long (or (get usage %) 0))
           cache-read (n :cache-read-tokens)
           cache-write (+ (n :cache-creation-tokens) (n :cache-write-tokens))
+          hour (min cache-write (n :cache-write-1h-tokens))
           fresh (max 0 (- (n :input-tokens) cache-read cache-write))
           at (fn [tokens rate] (Math/round (double (* tokens (double rate)))))]
       (+ (at fresh (:input pricing 1))
          (at cache-read (:cache-read pricing (:input pricing 1)))
-         (at cache-write (:cache-write pricing (:input pricing 1)))
+         (at (- cache-write hour) (:cache-write pricing (:input pricing 1)))
+         (at hour (:cache-write-1h pricing (* 2 (:input pricing 1))))
          (at (n :output-tokens) (:output pricing 1))
          (at (n :reasoning-output-tokens) (:output pricing 1))))))
 
