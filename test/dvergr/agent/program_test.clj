@@ -19,6 +19,8 @@
             [dvergr.room.store :as room-store]
             [dvergr.room.store.memory :as memory]
             [dvergr.room.store.datahike :as datahike-store]
+            [dvergr.sandbox :as sandbox]
+            [dvergr.sandbox.ns.agent :as agent-ns]
             [dvergr.tools :as tools]
             [kontor.gate :as kontor-gate]
             [kontor.governance :as kontor-governance]
@@ -1946,3 +1948,112 @@
     (is (empty? (run/active-runs (:id room))))
     (is (= :cancelled (:run/status (program/observe room handle))))
     (is (nil? (d/close-room! room)) "close remains idempotent")))
+
+(deftest a-paid-run-hires-a-model-child-only-when-its-grant-funds-it
+  ;; doc/design/runs-as-worlds.md, Budgets as a tree: funded children
+  (let [[room conn] (resource-test-room :program-funded-child)
+        team (-> (roster/make-roster {:id :funded-team})
+                 (roster/make-agent {:id :parent :program {:kind :scripted :reply :unused}})
+                 (roster/make-agent {:id :child
+                                     :model-policy {:provider :codex-subscription
+                                                    :model "codex-subscription-sol"}
+                                     :program {:kind :llm :max-model-steps 2 :auto-compact? false}}))
+        parent-runtime (promise)
+        release-parent (promise)
+        seen (atom nil)
+        status-key (keyword "dvergr.agent.program" "status")
+        value-key (keyword "dvergr.agent.program" "value")
+        execute @#'program/execute-program
+        execute-program
+        (fn [control-room work-room run-id chat-id agent task trigger supervisor]
+          (if (= :parent (:agent/id agent))
+            (sp/spin
+             (deliver parent-runtime [supervisor work-room])
+             (sp/await (comb/sleep 100))
+             (deref release-parent 10000 nil)
+             {status-key :completed value-key :parent-done})
+            (execute control-room work-room run-id chat-id agent task trigger supervisor)))
+        funded {resource/microdollars 400000M resource/model-dispatches 4M}]
+    (try
+      (resource/install-unit! room {:symbol resource/model-dispatches
+                                    :name "Native model dispatch admission" :precision 0})
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 1000000M
+                                                          resource/model-dispatches 10M}})
+      (with-redefs-fn
+        {#'program/execute-program execute-program
+         #'providers/ensure-initialized! (constantly nil)
+         #'chat-agent/run-agent-turn!
+         (fn [chat-ctx _opts]
+           (reset! seen {:model-scope? (some? resource/*model-scope*)
+                         :spend-wallet? (some? resource/*spend-wallet*)})
+           (chat-context/add-message! chat-ctx {:role :assistant :content "child answer"})
+           :complete)}
+        (fn []
+          (binding [ec/*execution-context* (:ctx room)]
+            (let [parent (program/hire! room team :parent
+                                        {:task :coordinate
+                                         :resources {resource/microdollars 1000000M
+                                                     resource/model-dispatches 10M}})
+                  parent-id (program/run-id parent)
+                  [supervisor parent-work] (deref parent-runtime 5000 [::timeout nil])
+                  ceiling (#'program/child-program-authority parent-id supervisor)
+                  sci-ctx (sandbox/fork-for-session (:ctx parent-work))
+                  hire (fn [resources]
+                         (binding [ec/*execution-context* (:ctx parent-work)]
+                           (sandbox/eval-code
+                            sci-ctx
+                            (str "(require '[dvergr.agent :as agent]) "
+                                 "(let [team (-> (agent/roster) "
+                                 "               (agent/make-agent " (pr-str {:id :child
+                                                                              :model-policy {:provider :codex-subscription
+                                                                                             :model "codex-subscription-sol"}
+                                                                              :program {:kind :llm :max-model-steps 2
+                                                                                        :auto-compact? false}})
+                                 "))"
+                                 "      h (agent/hire! team :child (cond-> {:task \"answer\"} "
+                                 (pr-str (some? resources)) " (assoc :resources " (pr-str resources) ")))] "
+                                 "  (agent/run-id h))")
+                            :timeout-ms 15000)))]
+              (is (not= ::timeout supervisor))
+              (agent-ns/add-programming-ns! sci-ctx (:id parent-work) (:ctx parent-work) ceiling)
+              (testing "an unfunded model child is refused"
+                (let [r (hire nil)]
+                  (is (not (:success r)))
+                  (is (re-find #"delegation ceiling" (pr-str (:error r))))))
+              (testing "money without admissions does not fund provider calls"
+                (is (not (:success (hire {resource/microdollars 400000M}))))
+                (is (= {resource/microdollars 1000000M resource/model-dispatches 10M}
+                       (resource/run-balance room parent-id))))
+              (testing "a funded model child runs on its own wallet, split from the parent's"
+                (let [r (hire funded)
+                      child-id (:value r)]
+                  (is (:success r) (pr-str (:error r)))
+                  (is (uuid? child-id))
+                  (is (wait-until #(= :completed (:run/status (run/run room child-id))) 10000))
+                  (is (= {:model-scope? true :spend-wallet? true} @seen)
+                      "its model calls are admitted and paid from its own grant")
+                  (is (wait-until #(= {resource/microdollars 1000000M resource/model-dispatches 10M}
+                                      (resource/run-balance room parent-id))
+                                  5000)
+                      "what the child did not spend returns to the parent")))
+              (deliver release-parent true)
+              (is (= :parent-done (:run/value (deref parent 10000 ::timeout))))))))
+      (finally
+        (deliver release-parent true)
+        (deliver parent-runtime [::closed nil])
+        (close-resource-test-room! room conn)))))
+
+(deftest the-delegate-tool-admits-a-model-child-only-when-funded
+  (let [enforce! #'tools/enforce-delegation-authority!
+        ceiling (#'program/child-program-authority (random-uuid) nil)
+        funded {resource/microdollars 500000M resource/model-dispatches 64M}]
+    (is (nil? (enforce! ceiling :llm funded)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"delegation authority"
+                          (enforce! ceiling :llm nil)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"delegation authority"
+                          (enforce! ceiling :llm {resource/model-dispatches 64M})))
+    (testing "a ceiling without funded kinds still refuses model children"
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (enforce! {:program-kinds #{:echo :scripted} :provider-effects? false}
+                             :llm funded))))
+    (is (nil? (enforce! ceiling :scripted nil)))))
