@@ -368,16 +368,22 @@
                       (:response r))))
                 (catch Throwable e
                   (resource/settle-dispatches! nil)
-                  (throw e)))]
-          ;; only usage the provider reported as final settles: a stream
-          ;; that ended without it keeps its reservation
-          (resource/settle-dispatches!
-           (when-let [usage (and (:usage-final? response) (:usage response))]
-             (let [{:keys [microdollars priced?]}
-                   ((requiring-resolve 'dvergr.agent.spend/of-usage) model-id usage)]
-               ;; an unpriced answer settles nothing: its reservation stays spent
-               (when priced? microdollars))))
-          response)))))
+                  (throw e)))
+              reserved? (seq @resource/*dispatches*)
+              ;; only usage the provider reported as final settles: a stream
+              ;; that ended without it, or an unpriced answer, forfeits its
+              ;; reservation, which then stands for its cost, so no usage is
+              ;; left for the caller to charge
+              cost (when-let [usage (and (:usage-final? response) (:usage response))]
+                     (let [{:keys [microdollars priced?]}
+                           ((requiring-resolve 'dvergr.agent.spend/of-usage) model-id usage)]
+                       (when priced? microdollars)))]
+          (resource/settle-dispatches! cost)
+          (if (and reserved? (nil? cost))
+            (assoc response
+                   :usage {:input-tokens 0 :output-tokens 0}
+                   :usage-forfeited (:usage response))
+            response))))))
 
 (defn- consume-stream
   "Stream one response and accumulate it (see `chat`)."

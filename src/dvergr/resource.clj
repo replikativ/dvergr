@@ -458,24 +458,42 @@
       (doseq [r records]
         (if (= r final) (hold! r cost) (forfeit! r))))))
 
+(defn- held-draw-id
+  "The debit id of the `n`th draw (from 0) a charge with debit id `id` makes
+   on what settled answers hold."
+  [id n]
+  (stable-id [:dvergr/held id n]))
+
 (defn- draw-held!
   "Consume up to `cost` of what settled answers hold for `payer`'s wallet,
-   under debit `id`; returns the amount drawn."
-  [payer id cost]
-  (let [claim (volatile! nil)]
-    (swap! held (fn [m]
-                  (let [[h & more] (get m (:wallet payer))]
-                    (if-not h
-                      (do (vreset! claim nil) m)
-                      (let [n (min cost (:left h))
-                            left (- (:left h) n)]
-                        (vreset! claim (assoc h :n n))
-                        (assoc m (:wallet payer)
-                               (vec (if (pos? left) (cons (assoc h :left left) more) more))))))))
-    (if-let [{:keys [reservation n]} @claim]
-      (do (move! payer reservation :consume id kontor/sink-account n)
-          n)
-      0M)))
+   one draw per reservation, numbered from `n` (`held-draw-id`); returns the
+   amount drawn."
+  [payer id n cost]
+  (loop [n n cost cost drawn 0M]
+    (let [claim (volatile! nil)]
+      (when (pos? cost)
+        (swap! held (fn [m]
+                      (let [[h & more] (get m (:wallet payer))]
+                        (if-not h
+                          (do (vreset! claim nil) m)
+                          (let [k (min cost (:left h))
+                                left (- (:left h) k)]
+                            (vreset! claim (assoc h :n k))
+                            (assoc m (:wallet payer)
+                                   (vec (if (pos? left) (cons (assoc h :left left) more) more)))))))))
+      (if-let [{:keys [reservation] k :n} @claim]
+        (do (move! payer reservation :consume (held-draw-id id n) kontor/sink-account k)
+            (recur (inc n) (- cost k) (+ drawn k)))
+        drawn))))
+
+(defn- drawn-before
+  "What a charge with debit id `id` already drew on held reservations, and
+   the number of its draws, from their receipts."
+  [room id]
+  (loop [n 0 drawn 0M]
+    (if-let [r (store/-resource-receipt (resource-store! room) (held-draw-id id n))]
+      (recur (inc n) (+ drawn (get-in r [:resources microdollars] 0M)))
+      [drawn n])))
 
 (defn charge-spend!
   "Consume `cost` microdollars of model spend from the bound spend wallet.
@@ -488,10 +506,12 @@
    `{:charged n :exhausted? bool}`, or nil when no wallet is bound or there is
    nothing to charge.
 
-   What a settled dispatch reservation holds for the wallet is consumed first
-   (a debit of its own, derived from the charge's id), the rest from the
-   wallet. Which charge of a wallet draws on which reservation does not change
-   what the wallet pays in all.
+   What settled dispatch reservations hold for the wallet is consumed first
+   (one debit per reservation, derived from the charge's id), the rest from
+   the wallet under the charge's id, last: a charge whose wallet debit exists
+   is complete, and a replayed charge resumes from the draws it already made.
+   Which charge of a wallet draws on which reservation does not change what
+   the wallet pays in all.
 
    Spend follows the world (doc/design/speculation.md, Law 4): when the
    current world was granted a wallet of its own by the ledger authority
@@ -499,42 +519,41 @@
   [cost]
   (when (pos? cost)
     (when-let [{:keys [payer id]} (world-charge)]
-      (let [{:keys [room wallet]} payer
-            held-id (stable-id [:dvergr/held id])]
+      (let [{:keys [room wallet]} payer]
         (locking (wallet-lock wallet)
-          (let [drawn (if-let [done (store/-resource-receipt (resource-store! room) held-id)]
-                        (get-in done [:resources microdollars] 0M)
-                        (draw-held! payer held-id (bigdec cost)))
+          (let [[before n] (drawn-before room id)
+                done (store/-resource-receipt (resource-store! room) id)
+                drawn (if (or done (>= before (bigdec cost)))
+                        before
+                        (+ before (draw-held! payer id n (- (bigdec cost) before))))
                 cost (- (bigdec cost) drawn)]
-            (if-not (pos? cost)
-              {:charged drawn :exhausted? (<= (wallet-left payer) 0M)}
-              (if-let [done (store/-resource-receipt (resource-store! room) id)]
-                {:charged (+ drawn (get-in done [:resources microdollars] 0M))
-                 :exhausted? (<= (wallet-left payer) 0M)}
-                ;; Other writers (a grant to a new Run, a fork's escrow) may take
+            (if (or done (not (pos? cost)))
+              {:charged (+ drawn (get-in done [:resources microdollars] 0M))
+               :exhausted? (<= (wallet-left payer) 0M)}
+              ;; Other writers (a grant to a new Run, a fork's escrow) may take
                 ;; from the wallet between the read and the debit; the ledger then
                 ;; refuses the debit. The provider was paid: read the rest again
                 ;; and take that.
-                (loop [tries 0]
-                  (let [left (wallet-left payer)
-                        amount (min cost left)
-                        outcome (try
-                                  (when (pos? amount)
-                                    (store/-transfer-resources!
-                                     (resource-store! room)
-                                     {:id id
-                                      :kind :consume
-                                      :source (kontor/account-ref wallet)
-                                      :destination kontor/sink-account
-                                      :resources {microdollars amount}}))
-                                  {:charged (+ drawn amount) :exhausted? (<= left cost)}
-                                  (catch clojure.lang.ExceptionInfo e e))]
-                    (cond
-                      (map? outcome) outcome
-                      (store/-resource-receipt (resource-store! room) id)
-                      {:charged (+ drawn amount) :exhausted? (<= left cost)}
-                      (and (< tries 8) (< (wallet-left payer) amount)) (recur (inc tries))
-                      :else (throw outcome))))))))))))
+              (loop [tries 0]
+                (let [left (wallet-left payer)
+                      amount (min cost left)
+                      outcome (try
+                                (when (pos? amount)
+                                  (store/-transfer-resources!
+                                   (resource-store! room)
+                                   {:id id
+                                    :kind :consume
+                                    :source (kontor/account-ref wallet)
+                                    :destination kontor/sink-account
+                                    :resources {microdollars amount}}))
+                                {:charged (+ drawn amount) :exhausted? (<= left cost)}
+                                (catch clojure.lang.ExceptionInfo e e))]
+                  (cond
+                    (map? outcome) outcome
+                    (store/-resource-receipt (resource-store! room) id)
+                    {:charged (+ drawn amount) :exhausted? (<= left cost)}
+                    (and (< tries 8) (< (wallet-left payer) amount)) (recur (inc tries))
+                    :else (throw outcome)))))))))))
 
 (defn charge-usage!
   "Record one model call's provider `usage` under `model` in the bound

@@ -164,9 +164,47 @@
                            #'resource/settle-dispatches!
                            (let [settle resource/settle-dispatches!]
                              (fn [cost] (reset! spent cost) (settle cost)))}
-            #(chat/chat [{:role "user" :content "hello"}] {:model model :max-tokens 100})))
+            #(let [response (chat/chat [{:role "user" :content "hello"}] {:model model :max-tokens 100})]
+               (is (= {:input-tokens 0 :output-tokens 0} (:usage response))
+                   "no usage is left for the caller to charge on top"))))
         (is (nil? @spent) "a truncated stream reports no final usage")
         (is (< (left room run-id) 10000000M) "its reservation is consumed whole")))))
+
+(defn- settled-dispatch!
+  "One funded dispatch whose answer settles at `cost`."
+  [cost]
+  (binding [gateway/*request-fn* (fn [_] {:status 200})
+            resource/*dispatches* (atom [])
+            resource/*dispatch-bound* 5000M]
+    (gateway/request! request)
+    (resource/settle-dispatches! cost)))
+
+(deftest a-charge-draws-on-every-hold-before-the-wallet
+  (with-funded-run
+    3M 1000000M
+    (fn [room run-id]
+      (settled-dispatch! 100M)
+      (settled-dispatch! 200M)
+      (is (= 999700M (left room run-id)))
+      (is (= 300M (:charged (resource/charge-spend! 300M))))
+      (is (= 999700M (left room run-id)) "both holds paid it, nothing stranded")
+      (is (= 50M (:charged (resource/charge-spend! 50M))))
+      (is (= 999650M (left room run-id))))))
+
+(deftest a-replayed-wallet-charge-does-not-draw-a-later-hold
+  (with-funded-run
+    2M 1000000M
+    (fn [room run-id]
+      (let [scope [:replay run-id]]
+        (binding [resource/*spend-wallet* (resource/spending (resource/spend-wallet room run-id) scope)]
+          (is (= 50M (:charged (resource/charge-spend! 50M)))))
+        (is (= 999950M (left room run-id)))
+        (settled-dispatch! 100M)
+        (is (= 999850M (left room run-id)))
+        (binding [resource/*spend-wallet* (resource/spending (resource/spend-wallet room run-id) scope)]
+          (is (= 50M (:charged (resource/charge-spend! 50M))) "the replay finds its wallet debit"))
+        (is (= 100M (:charged (resource/charge-spend! 100M))) "the hold is still there for its own charge")
+        (is (= 999850M (left room run-id)))))))
 
 (deftest a-model-call-reserves-from-its-request-and-settles-at-the-usage-price
   (with-funded-run
