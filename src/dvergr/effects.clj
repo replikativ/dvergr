@@ -278,10 +278,43 @@
                     " (its own room, rooms beneath it and rooms it takes part in; else a grant)"))
         (next effect)))))
 
+(def speculative-refused-ops
+  "Operations a speculative world refuses although their classes are
+   admitted: they act outside the world's own forked substrates (another
+   Room's messages or membership, a shared mail store and its account row),
+   or reach out in ways discarding the world cannot undo (an undeclared tool,
+   a mail sync)."
+  #{:room/post :room/write :room/join :room/merge :room/gc :tool/call
+    :mail/open :mail/sync})
+
+(def speculative-http-methods
+  "HTTP methods a speculative world may use: those that change nothing."
+  #{:get :head :options})
+
+(defn- speculative-handler
+  "The filter of a speculative world (doc/design/speculation.md, Law 7; a
+   search's members, `dvergr.agent.search`): refuses what discarding the
+   world could not undo, beyond what its class filter refuses already
+   (`speculative-refused-ops`, HTTP other than `speculative-http-methods`)."
+  [_ctx]
+  (fn [effect next]
+    (let [op (:effect effect)]
+      (cond
+        (contains? speculative-refused-ops op)
+        (deny! effect :speculative (str (name op) " acts outside this speculative world"))
+
+        (and (= :http/request op)
+             (not (contains? speculative-http-methods
+                             (some-> (get-in effect [:resource :method]) name str/lower-case keyword))))
+        (deny! effect :speculative "only requests that change nothing (GET, HEAD, OPTIONS) leave a speculative world")
+
+        :else (next effect)))))
+
 (def ^:private predicate-filters
   "Filters that are predicates over the subject and resource rather than
    class sets. Several of the same compose to one (idempotent)."
-  {:authority authority-handler})
+  {:authority authority-handler
+   :speculative speculative-handler})
 
 ;; ---------------------------------------------------------------------------
 ;; Answering handlers: record, replay, faults
@@ -635,10 +668,11 @@
      {:faults {:seed 7 :rate 0.1 :only #{:http/request} :kinds [:rate-limit]}
       :record true           ; record every effect (`:recording` id returned)
       :read-only true
+      :speculative true      ; refuse what discarding the world cannot undo
       :admit #{:read :network}
       :deny-hosts #{\"simm.is\"}  ; a task's answer sources
       :quota-bytes 50000000}      ; what the attempt may write"
-  [{:keys [faults record read-only admit deny-hosts allow-hosts quota-bytes]}]
+  [{:keys [faults record read-only admit deny-hosts allow-hosts quota-bytes speculative]}]
   (let [f (when faults (faults! faults))
         r (when record (recording!))
         q (when quota-bytes (quota! {:bytes quota-bytes}))]
@@ -647,6 +681,7 @@
               (seq deny-hosts) (conj [:deny-hosts (set deny-hosts)])
               allow-hosts (conj [:allow-hosts (set allow-hosts)])
               read-only (conj [:read-only])
+              speculative (conj [:speculative])
               r (conj [:record {:id r}])
               q (conj [:quota {:id q}])
               f (conj [:faults {:id f}]))

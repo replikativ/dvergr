@@ -690,6 +690,11 @@
     :db/cardinality :db.cardinality/one
     :db/doc "The Run that continues this one from its savepoint; a Run is resumed once"}
 
+   {:db/ident :run/search
+    :db/valueType :db.type/string
+    :db/cardinality :db.cardinality/one
+    :db/doc "The search this Run was a member of, EDN: its id and policy, the Run's weight and the decision on its world (dvergr.agent.search, doc/design/runs-as-worlds.md)"}
+
    {:db/ident :run/status
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one

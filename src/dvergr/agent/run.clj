@@ -488,23 +488,26 @@
   (when-not (keyword? status)
     (throw (ex-info "Run settlement status must be a keyword"
                     {:type ::invalid-settlement-status :status status})))
-  (when-let [room-store (:store room)]
-    (let [room-id (store/conversation-id room)
-          existing (store/-load-run room-store room-id run-id)]
-      (when-not existing
-        (throw (ex-info "Run settlement owner is not durable in this Room"
-                        {:type ::run-not-found
-                         :run/id run-id
-                         :run/room (:id room)})))
-      (let [updated (cond-> (assoc existing
-                                   :run/settlement-status status
-                                   :run/updated-at (java.util.Date.))
-                      reason (assoc :run/settlement-reason reason))]
-        (or (store/-store-run! room-store room-id updated)
-            (throw (ex-info "Run settlement update was not durable"
-                            {:type ::settlement-not-durable
-                             :run/id run-id
-                             :run/settlement-status status})))))))
+  ;; read and write under the Room's exclusive lock, as the resume claim and
+  ;; a search's record do, so none loses another's write
+  (with-room-exclusive (:id room)
+    (when-let [room-store (:store room)]
+      (let [room-id (store/conversation-id room)
+            existing (store/-load-run room-store room-id run-id)]
+        (when-not existing
+          (throw (ex-info "Run settlement owner is not durable in this Room"
+                          {:type ::run-not-found
+                           :run/id run-id
+                           :run/room (:id room)})))
+        (let [updated (cond-> (assoc existing
+                                     :run/settlement-status status
+                                     :run/updated-at (java.util.Date.))
+                        reason (assoc :run/settlement-reason reason))]
+          (or (store/-store-run! room-store room-id updated)
+              (throw (ex-info "Run settlement update was not durable"
+                              {:type ::settlement-not-durable
+                               :run/id run-id
+                               :run/settlement-status status}))))))))
 
 (defn record-savepoint!
   "Keep `data` (a portable savepoint, `savepoint.portable/persist`) as the live
@@ -523,6 +526,94 @@
                             {:type ::savepoint-not-durable :run/id run-id}))))
         (locking lifecycle-lock (swap! active assoc-in [run-id :run] run))
         run))))
+
+(def ^:private search-intent
+  "What a search decided for a member, written once and never changed by a
+   later record of the same search (only its outcome, status and error are)."
+  [:search/policy :search/members :search/manifest :search/weight :search/decision])
+
+(defn record-search!
+  "Record on durable Run `run-id` in `room` the search it is a member of
+   (`dvergr.agent.search`): `search` is portable data, kept as EDN. A Run is
+   a member of one search: a record of another search is refused. A record of
+   the same search keeps the intent already recorded (`search-intent`) and
+   updates the outcome. Read and written under the Room's exclusive lock, as
+   the resume claim and settlement updates, so none loses another's write.
+   Allowed on a terminal Run: it changes neither its lifecycle nor identity."
+  [room run-id search]
+  (when-let [room-store (:store room)]
+    (with-room-exclusive (:id room)
+      (let [room-id (store/conversation-id room)
+            existing (store/-load-run room-store room-id run-id)]
+        (when-not existing
+          (throw (ex-info "A search member is not a durable Run in this Room"
+                          {:type ::run-not-found :run/id run-id :run/room (:id room)})))
+        (let [prior (some-> (:run/search existing) clojure.edn/read-string)]
+          (when (and prior (not= (:search/id prior) (:search/id search)))
+            (throw (ex-info "This Run is a member of another search"
+                            {:type ::claimed-by-another-search :run/id run-id
+                             :search/id (:search/id search) :claimed-by (:search/id prior)})))
+          (or (store/-store-run! room-store room-id
+                                 (assoc existing
+                                        :run/search (pr-str (merge search (select-keys prior search-intent)))
+                                        :run/updated-at (java.util.Date.)))
+              (throw (ex-info "A search record was not durable"
+                              {:type ::search-not-durable :run/id run-id}))))))))
+
+(defonce ^:private search-reservations
+  ;; run id -> the search that reserved it in this process: made before a
+  ;; claim's durable writes, so a claim a failed write left partial is still
+  ;; this search's to resume (settling a member needs its live world, which
+  ;; is this process's too)
+  (atom {}))
+
+(defn- store-claim!
+  "The durable write of one member's claim (`claim-search!`)."
+  [room-store room-id existing search]
+  (or (store/-store-run! room-store room-id
+                         (assoc existing :run/search (pr-str search)
+                                :run/updated-at (java.util.Date.)))
+      (throw (ex-info "A search claim was not durable"
+                      {:type ::search-not-durable :run/id (:run/id existing)}))))
+
+(defn claim-search!
+  "Claim the Runs of `records` ({run-id search-record}) in `room` for one
+   search, all or none: under the Room's exclusive lock, refuse when any is
+   a member or reservation of another search, reserve them all in this
+   process, then record each not yet claimed by this one. A claim a failed
+   write left part way is resumed by claiming again, and no other search
+   can take its members meanwhile."
+  [room records]
+  (when-let [room-store (:store room)]
+    (with-room-exclusive (:id room)
+      (let [room-id (store/conversation-id room)
+            loaded (into {} (map (fn [[run-id _]] [run-id (store/-load-run room-store room-id run-id)])) records)]
+        (doseq [[run-id search] records
+                :let [reserved (get @search-reservations run-id)]]
+          (when (and reserved (not= reserved (:search/id search)))
+            (throw (ex-info "This Run is reserved by another search"
+                            {:type ::claimed-by-another-search :run/id run-id
+                             :search/id (:search/id search) :claimed-by reserved}))))
+        (doseq [[run-id search] records
+                :let [existing (get loaded run-id)
+                      prior (some-> (:run/search existing) clojure.edn/read-string)]]
+          (when-not existing
+            (throw (ex-info "A search member is not a durable Run in this Room"
+                            {:type ::run-not-found :run/id run-id :run/room (:id room)})))
+          (when (and prior (not= (:search/id prior) (:search/id search)))
+            (throw (ex-info "This Run is a member of another search"
+                            {:type ::claimed-by-another-search :run/id run-id
+                             :search/id (:search/id search) :claimed-by (:search/id prior)}))))
+        (swap! search-reservations into (map (fn [[run-id search]] [run-id (:search/id search)])) records)
+        (doseq [[run-id search] records
+                :let [existing (get loaded run-id)]
+                :when (nil? (:run/search existing))]
+          (store-claim! room-store room-id existing search))))))
+
+(defn search-record
+  "The search record of durable `run` (`record-search!`), as data, or nil."
+  [run]
+  (some-> (:run/search run) clojure.edn/read-string))
 
 (defn savepoint
   "The latest portable savepoint of durable `run`, as data, or nil."

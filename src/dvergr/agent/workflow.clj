@@ -87,7 +87,7 @@
   "The EnvironmentDef of `task`: its id is `environment-id` or the task's
    content hash, so the same task over time is one environment, and its
    Attempts line up. Verified by `evaluator` (default: completion)."
-  [task {:keys [timeout-ms evaluator environment-id]}]
+  [task {:keys [timeout-ms evaluator environment-id effects]}]
   (environment/make-environment
    {:id (or environment-id (keyword "workflow" (str "task-" (subs (str (hasch/uuid task)) 0 8))))
     :task task
@@ -95,7 +95,10 @@
                 {:id (:verifier/id ref) :version (:verifier/version ref)})
     :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000
              :on-timeout :verdict}
-    :world {:isolation :ctx :settlement :review}}))
+    :world (cond-> {:isolation :ctx :settlement :review}
+             ;; the attempt world's effect handlers (dvergr.effects), e.g. a
+             ;; search's speculative filter
+             effects (assoc :effects effects))}))
 
 (defn- delta-summary
   "A yggdrasil delta as plain data: files for a repository, datom counts for a
@@ -153,7 +156,7 @@
      :spin (binding [ec/*execution-context* ctx]
              (experiment/run-batches
               (mapv #(evaluation/evaluate room team % env evaluator
-                                          (select-keys opts [:parent-run]))
+                                          (select-keys opts [:parent-run :hold?]))
                     order)
               (max 1 (or (:parallelism opts) 4))))
      :finish (fn [results]

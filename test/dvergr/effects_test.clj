@@ -822,3 +822,28 @@
     (testing "other effects pass"
       (is (= :ok (effects/perform! (constantly {:handlers (effects/handlers [[:allow-hosts #{"a.com"}]])})
                                    {:effect :fs/read :resource {:path "x"}} (constantly :ok)))))))
+
+(deftest a-speculative-world-refuses-what-discarding-cannot-undo
+  ;; doc/design/speculation.md, Law 7: a search's members (dvergr.agent.search)
+  (let [sink (effects/make-sink)
+        specs (:specs (effects/environment-handlers! {:admit #{:read :write :spend :network}
+                                                      :speculative true}))
+        run! (fn [effect] (effects/perform! (boundary sink specs) effect (constantly :ok)))]
+    (testing "its own substrates, charged model calls and requests that change nothing pass"
+      (is (= :ok (run! {:effect :fs/write :resource {:path "a"}})))
+      (is (= :ok (run! {:effect :db/transact :resource {:datoms 3}})))
+      (is (= :ok (run! {:effect :model/call :resource {:model "cheap"}})))
+      (is (= :ok (run! {:effect :http/request :resource {:method :get :url "https://example.org"}}))))
+    (testing "writes to Rooms, undeclared tools and changing requests are refused"
+      (doseq [effect [{:effect :room/post :resource {:room "other"}}
+                      {:effect :room/join :resource {:room "other" :who "x"}}
+                      {:effect :tool/call :resource {:tool "send-invoice"}}
+                      {:effect :http/request :resource {:method :post :url "https://example.org"}}
+                      {:effect :http/request :resource {:method "DELETE" :url "https://example.org"}}]]
+        (is (thrown-with-msg? Exception #"speculative" (run! effect)) (str (:effect effect)))))
+    (testing "egress, processes, schedules and lifecycle are refused by the class filter"
+      (doseq [effect [{:effect :channel/call :resource {:tool "telegram"}}
+                      {:effect :process/run :resource {:cmd "git push"}}
+                      {:effect :schedule/create :resource {}}
+                      {:effect :room/delete :resource {:room "r"}}]]
+        (is (thrown-with-msg? Exception #"not granted" (run! effect)) (str (:effect effect)))))))
