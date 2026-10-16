@@ -340,16 +340,22 @@
   [body]
   (filter map? (tree-seq coll? seq body)))
 
-(defn- remote-content?
-  "Does the request refer to content the provider fetches or keeps itself (a
-   URL that is not a data URL, an uploaded file), whose size its body does
-   not show?"
+(def ^:private unbounded-part-types
+  "Content parts whose cost their encoded size does not bound: a document's
+   extracted text and page images, audio and video by duration."
+  #{"document" "file" "input_file" "input_audio" "audio" "video"})
+
+(defn- unbounded-content?
+  "Does the request carry content whose cost its body does not show: content
+   the provider fetches or keeps itself (a URL that is not a data URL, an
+   uploaded file), or a document, audio or video part?"
   [body]
   (some (fn [m]
           (or (some (fn [k] (let [v (get m k)]
                               (and (string? v) (not (.startsWith ^String v "data:")))))
                     [:url "url"])
-              (some #(contains? m %) [:file_id "file_id"])))
+              (some #(contains? m %) [:file_id "file_id"])
+              (contains? unbounded-part-types (or (:type m) (get m "type")))))
         (content-parts body)))
 
 (defn- image-count [body]
@@ -366,12 +372,12 @@
    at the output price; all doubled for the premiums the registry's base
    rates leave out (long context, service tiers). Prices are USD per million
    tokens, so microdollars per token. nil when no reliable bound exists: no
-   output limit, no input or output price, or content the provider fetches
-   itself (`body`, the request, is checked for it)."
+   output limit, no input or output price, or content whose cost its size
+   does not bound (`unbounded-content?`; `body`, the request, is checked)."
   [model-def body body-bytes max-output]
   (let [{:keys [input output cache-write cache-write-1h]} (:pricing model-def)]
     (when (and (number? input) (number? output) (pos-int? max-output) (pos-int? body-bytes)
-               (not (remote-content? body)))
+               (not (unbounded-content? body)))
       (let [in-price (apply max (filter number? [input cache-write cache-write-1h]))
             in-tokens (+ body-bytes dispatch-overhead-tokens (* image-tokens (image-count body)))]
         (.setScale (bigdec (* 2 (+ (* in-tokens in-price) (* max-output output))))

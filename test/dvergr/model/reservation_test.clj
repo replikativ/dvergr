@@ -138,12 +138,15 @@
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"settles it"
                               (gateway/request! request)))))))
 
-(deftest remote-content-has-no-bound
+(deftest content-its-size-does-not-bound-has-no-bound
   (let [model {:pricing {:input 1.0 :output 2.0}}]
     (is (some? (resource/dispatch-bound model {:messages [{:content "hi"}]} 100 10)))
     (is (nil? (resource/dispatch-bound model {:messages [{:content [{:type "image_url" :image_url {:url "https://example.org/a.png"}}]}]} 100 10)))
     (is (nil? (resource/dispatch-bound model {:messages [{:content [{:type "image" :source {:type "url" :url "https://example.org/a.png"}}]}]} 100 10)))
     (is (nil? (resource/dispatch-bound model {:input [{:type "input_file" :file_id "file-1"}]} 100 10)))
+    (is (nil? (resource/dispatch-bound model {:messages [{:content [{:type "document" :source {:type "base64" :media_type "application/pdf" :data "JVBERi0"}}]}]} 100 10))
+        "an inline PDF's encoded size does not bound its pages")
+    (is (nil? (resource/dispatch-bound model {:messages [{:content [{:type "input_audio" :input_audio {:data "AA" :format "wav"}}]}]} 100 10)))
     (is (nil? (resource/dispatch-bound model {:messages []} 100 nil)) "no output limit")
     (is (nil? (resource/dispatch-bound {:pricing {:input 1.0}} {} 100 10)) "no output price")
     (testing "an inline image is bounded by a per-image allowance, not its bytes"
