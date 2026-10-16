@@ -394,6 +394,15 @@
         (.setScale (bigdec (* 2 (+ (* in-tokens in-price) (* max-output output))))
                    0 java.math.RoundingMode/CEILING)))))
 
+(defn funded-grant?
+  "Does a child's grant `resources` fund provider calls: money to pay them
+   and admissions to make them (doc/design/runs-as-worlds.md, Budgets as a
+   tree)? A child so funded reserves each dispatch's cost from its own wallet
+   (`reserve-dispatch!`), so its parent's grant bounds what it can spend."
+  [resources]
+  (boolean (and (pos? (get resources microdollars 0))
+                (pos? (get resources model-dispatches 0)))))
+
 (defn- reserve!
   "Move `amount` from the paying wallet into a reservation of its own."
   [{:keys [room wallet] :as payer} amount]

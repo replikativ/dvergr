@@ -554,14 +554,20 @@
                              (throw (ex-info
                                      "Deferred settlement is reserved for trusted host policies"
                                      {:type ::deferred-settlement-forbidden})))
+                           ;; a kind the ceiling allows, or one it allows when
+                           ;; the grant funds provider calls (`resource/funded-grant?`)
                            (when (and allowed-kinds
-                                      (not (contains? allowed-kinds kind)))
+                                      (not (contains? allowed-kinds kind))
+                                      (not (and (contains? (:funded-program-kinds agent-program-ceiling) kind)
+                                                ((requiring-resolve 'dvergr.resource/funded-grant?)
+                                                 (:resources opts)))))
                              (throw (ex-info
                                      "Child program exceeds this sandbox's delegation ceiling"
                                      {:type ::program-ceiling-exceeded
                                       :agent-ref agent-ref
                                       :program-kind kind
-                                      :allowed-program-kinds allowed-kinds})))
+                                      :allowed-program-kinds allowed-kinds
+                                      :funded-program-kinds (:funded-program-kinds agent-program-ceiling)})))
                            (when (and ambient-parent
                                       (contains? opts :parent-run)
                                       (not= ambient-parent (:parent-run opts)))

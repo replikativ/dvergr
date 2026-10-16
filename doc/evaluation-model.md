@@ -306,9 +306,9 @@ only when it holds microdollars. Those calls are recorded, wallet or not, as
 `:judge-spend` in the receipt's metrics, apart from `:spend`: `report.md`
 lists them in a Judge table (list price and billed), `scorecard_detail` as
 `judge-spend` on each leaderboard row, and no candidate's cost per attempt or
-per pass includes them. Nested paid work stays closed
-(`:provider-effects? false` in `child-program-authority`): a provider's answer
-and its debit are still two writes.
+per pass includes them. A nested model Run is admitted only when its grant
+funds it (money and dispatch admissions, `dvergr.resource/funded-grant?`),
+each dispatch reserving a bound of its cost first.
 
 Not built: attempt wallets. The plan: an attempt is funded as follows. The caller grants an **attempt
 wallet**; the attempt sub-grants to each paid role, each an ordinary Run with
