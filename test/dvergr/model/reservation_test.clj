@@ -9,7 +9,9 @@
             [dvergr.model.api.openai :as openai]
             [dvergr.model.chat :as chat]
             [dvergr.model.gateway :as gateway]
+            [dvergr.model.provider :as provider]
             [dvergr.model.registry :as registry]
+            [dvergr.model.api.anthropic]
             [dvergr.resource :as resource]
             [dvergr.room.store :as store]
             [dvergr.room.store.datahike :as datahike-store])
@@ -71,7 +73,15 @@
           (is (= 998800M (left room run-id))))
         (testing "settling again changes nothing"
           (resource/settle-dispatches! 1200M)
-          (is (= 998800M (left room run-id))))))))
+          (is (= 998800M (left room run-id))))
+        (testing "the same charge replayed (its scope charged again) debits nothing"
+          (binding [resource/*spend-wallet* (resource/spending (resource/spend-wallet room run-id)
+                                                               [:test run-id])]
+            (is (= 1200M (:charged (resource/charge-spend! 1200M)))))
+          (is (= 998800M (left room run-id))))
+        (testing "a further charge, with nothing held, comes from the wallet"
+          (is (= 100M (:charged (resource/charge-spend! 100M))))
+          (is (= 998700M (left room run-id))))))))
 
 (deftest an-ambiguous-dispatch-keeps-its-reservation
   (with-funded-run
@@ -84,9 +94,9 @@
         (resource/settle-dispatches! nil)
         (is (= 995000M (left room run-id)))))))
 
-(deftest a-refused-dispatch-returns-its-reservation
+(deftest a-refused-dispatch-returns-its-reservation-at-once
   (with-funded-run
-    2M 1000000M
+    2M 5000M
     (fn [room run-id]
       (let [credentials (reify gateway/Credentials
                           (credential-kind [_] :test)
@@ -97,10 +107,11 @@
         (binding [gateway/*request-fn* (fn [_] (if (= 1 (swap! called inc)) {:status 401} {:status 200}))
                   resource/*dispatches* (atom [])
                   resource/*dispatch-bound* 5000M]
-          (gateway/request! (assoc request :credentials credentials))
-          (is (= 990000M (left room run-id)) "each dispatch reserves its own bound")
+          (is (= 200 (:status (gateway/request! (assoc request :credentials credentials))))
+              "a wallet that covers one bound can retry after a refusal")
+          (is (= 0M (left room run-id)))
           (resource/settle-dispatches! 300M)
-          (is (= 999700M (left room run-id))))))))
+          (is (= 4700M (left room run-id))))))))
 
 (deftest a-dispatch-without-a-bound-or-cover-does-not-leave
   (doseq [[why md bound] [["no bound" 1000000M nil] ["the wallet cannot cover it" 1000M 5000M]]]
@@ -126,6 +137,37 @@
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"settles it"
                               (gateway/request! request)))))))
 
+(deftest remote-content-has-no-bound
+  (let [model {:pricing {:input 1.0 :output 2.0}}]
+    (is (some? (resource/dispatch-bound model {:messages [{:content "hi"}]} 100 10)))
+    (is (nil? (resource/dispatch-bound model {:messages [{:content [{:type "image_url" :image_url {:url "https://example.org/a.png"}}]}]} 100 10)))
+    (is (nil? (resource/dispatch-bound model {:messages [{:content [{:type "image" :source {:type "url" :url "https://example.org/a.png"}}]}]} 100 10)))
+    (is (nil? (resource/dispatch-bound model {:input [{:type "input_file" :file_id "file-1"}]} 100 10)))
+    (is (nil? (resource/dispatch-bound model {:messages []} 100 nil)) "no output limit")
+    (is (nil? (resource/dispatch-bound {:pricing {:input 1.0}} {} 100 10)) "no output price")
+    (testing "an inline image is bounded by a per-image allowance, not its bytes"
+      (is (< (resource/dispatch-bound model {:messages [{:content "x"}]} 100 10)
+             (resource/dispatch-bound model {:messages [{:content [{:type "image_url" :image_url {:url "data:image/png;base64,AA"}}]}]} 100 10))))))
+
+(deftest a-stream-without-final-usage-keeps-its-reservation
+  (with-funded-run
+    3M 10000000M
+    (fn [room run-id]
+      (let [sse (str "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n")
+            model "gpt-5.6-luna"
+            spent (atom nil)]
+        (binding [gateway/*request-fn*
+                  (fn [_] {:status 200 :body (ByteArrayInputStream. (.getBytes sse "UTF-8"))})]
+          (with-redefs-fn {#'dvergr.model.providers/get-provider!
+                           (constantly (openai/create {:api-key "test" :base-url "https://model.test"}))
+                           #'dvergr.model.providers/ensure-initialized! (constantly nil)
+                           #'resource/settle-dispatches!
+                           (let [settle resource/settle-dispatches!]
+                             (fn [cost] (reset! spent cost) (settle cost)))}
+            #(chat/chat [{:role "user" :content "hello"}] {:model model :max-tokens 100})))
+        (is (nil? @spent) "a truncated stream reports no final usage")
+        (is (< (left room run-id) 10000000M) "its reservation is consumed whole")))))
+
 (deftest a-model-call-reserves-from-its-request-and-settles-at-the-usage-price
   (with-funded-run
     3M 10000000M
@@ -149,3 +191,21 @@
                (is (= (- 10000000M (bigdec (+ (* 100 input) (* 10 output))))
                       (left room run-id))
                    "settled at the usage's price, nothing else kept"))))))))
+
+(deftest anthropic-usage-counts-cached-input-and-is-final-with-the-stop-reason
+  (let [p (dvergr.model.api.anthropic/create {:api-key "test"})
+        state (provider/create-accumulator p nil)
+        state (provider/accumulate-event p state "message_start"
+                                         {:message {:id "m" :model "claude"
+                                                    :usage {:input_tokens 10
+                                                            :cache_read_input_tokens 1000
+                                                            :cache_creation_input_tokens 200
+                                                            :output_tokens 1}}} nil)
+        started (provider/extract-response p state)
+        state (provider/accumulate-event p state "message_delta"
+                                         {:delta {:stop_reason "end_turn"} :usage {:output_tokens 42}} nil)
+        done (provider/extract-response p state)]
+    (is (false? (:usage-final? started)) "the opening usage is not final")
+    (is (= {:input-tokens 1210 :output-tokens 42 :cache-read-tokens 1000 :cache-creation-tokens 200}
+           (:usage done)))
+    (is (true? (:usage-final? done)))))

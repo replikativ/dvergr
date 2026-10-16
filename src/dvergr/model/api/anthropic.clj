@@ -76,7 +76,15 @@
         (-> state
             (assoc :id (:id msg))
             (assoc :model (:model msg))
-            (assoc-in [:usage :input-tokens] (get-in msg [:usage :input_tokens] 0))))
+            ;; `:input-tokens` counts cached input too, apart as well
+            ;; (`dvergr.agent.spend`); Anthropic reports the parts
+            (assoc :usage (let [u (:usage msg)
+                                cached (get u :cache_read_input_tokens 0)
+                                written (get u :cache_creation_input_tokens 0)]
+                            (cond-> {:input-tokens (+ (get u :input_tokens 0) cached written)
+                                     :output-tokens (get u :output_tokens 0)}
+                              (pos? cached) (assoc :cache-read-tokens cached)
+                              (pos? written) (assoc :cache-creation-tokens written))))))
 
       "content_block_start"
       (let [idx (:index event-data)
@@ -119,7 +127,9 @@
             usage (:usage event-data)]
         (-> state
             (assoc :stop-reason (keyword (:stop_reason delta)))
-            (assoc-in [:usage :output-tokens] (get usage :output_tokens 0))))
+            (assoc-in [:usage :output-tokens] (get usage :output_tokens 0))
+            ;; the cumulative output count comes with the stop reason, last
+            (assoc :usage-final? true)))
 
       "message_stop"
       state
@@ -147,6 +157,7 @@
        :tool-calls (when (seq tool-calls) tool-calls)
        :thinking (when (seq thinking) thinking)
        :usage (:usage state)
+       :usage-final? (boolean (:usage-final? state))
        :stop-reason (:stop-reason state)
        :model (:model state)
        :id (:id state)}))

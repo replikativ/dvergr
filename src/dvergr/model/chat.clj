@@ -183,6 +183,7 @@
                            (when resource/*model-scope*
                              (resource/dispatch-bound
                               model-def
+                              body
                               (alength (.getBytes ^String (json/write-value-as-string body) "UTF-8"))
                               (some body [:max_tokens :max_completion_tokens :max_output_tokens])))]
                    (make-request (p/provider-id provider) url headers body credentials))
@@ -368,8 +369,10 @@
                 (catch Throwable e
                   (resource/settle-dispatches! nil)
                   (throw e)))]
+          ;; only usage the provider reported as final settles: a stream
+          ;; that ended without it keeps its reservation
           (resource/settle-dispatches!
-           (when-let [usage (:usage response)]
+           (when-let [usage (and (:usage-final? response) (:usage response))]
              (let [{:keys [microdollars priced?]}
                    ((requiring-resolve 'dvergr.agent.spend/of-usage) model-id usage)]
                ;; an unpriced answer settles nothing: its reservation stays spent
