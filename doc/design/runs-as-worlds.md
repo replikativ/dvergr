@@ -23,7 +23,7 @@ Handing a world to review ends the search's ownership of it: a `:review` world w
 
 **1. dvergr: best-of-n over Runs (no copying).**  A real selector, which does not exist today: `workflow/attempt!` returns N `:review` worlds for a reviewer and `forks/merge-review!` judges one fork at a time.  The search opens N Runs with `:settlement :deferred`, weighs them when they finish, selects by a policy (`:automatic` merges the highest weight, `:review` hands it to a person, `:keep-all` hands all), and discards the rest with `discard-deferred!`.  Admission blocks on the store and must run off the drain thread (spindel#110), as evaluation does.  Laws: conservation across the N Runs (each returns its remainder), one settlement into the immediate parent, refund of the unselected.
 
-**2. dvergr: the authority sees Run wallets.**  Let `LedgerAuthority/return!` and `balance` resolve a world's Run wallet through `wallet-of`, instead of only wallets it opened, so a search can read what a Run has left and a scope can split it.  Do not route Run allocation through the authority: the Run spend path (`model-scope`, `consume!`, `return-unused-resources!`, `resume!`) reads the Run-keyed allocation, and a Run world carrying `[:dvergr/wallet]` would redirect every nested fork's spend.
+**2. dvergr: Run wallets stay as they are (dropped).**  Letting the authority's `balance` resolve a Run's wallet would change what `world-scope/copy!` splits: an SMC under `:world-policy :fork` inside a Run, without a grant of its own, would split the Run's whole remainder among its particles.  A search reads what a Run has left with `dvergr.resource/wallet-microdollars` instead, and Run allocation stays off the authority: the Run spend path (`model-scope`, `consume!`, `return-unused-resources!`, `resume!`) reads the Run-keyed allocation, and a Run world carrying `[:dvergr/wallet]` would redirect every nested fork's spend.
 
 **3. spindel: a selection join for scope worlds** (`world-scope/adopt!`).  Hand one open world's handle out of the scope (as `ygg/transfer-fork!` hands authority over) so its new owner can merge it into the source.  It must settle what the scope otherwise settles at discard: return or hand over the world's wallet (the authority has no merge operation), remove it from the `:copied` bookkeeping, and settle its copy family's ancestry, which holds the split's rounding remainder.  Optional `:mode` in `:fork-opts`, which today is overwritten with `:frozen`.
 
@@ -59,7 +59,7 @@ Room forks, the fork contract, Run admission and resume, settlement policies, ad
 ## Order of work
 
 1. This plan and its decisions.
-2. The authority sees Run wallets (change 2).
+2. (Change 2 is dropped; see above.)
 3. Best-of-n search over Runs, recorded durably, with weights by `observe`/`factor` and the policies `:automatic`, `:review` and `:keep-all` (change 1, decisions 2, 3, 6).
 4. Funded nested Runs (decision 4).
 5. `world-scope/adopt!` in spindel (change 3).
