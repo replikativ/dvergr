@@ -846,10 +846,13 @@
    Tool transaction effects carry this so an unrelated protected KB does not
    refuse a write to this connection."
   [conn]
-  (when (and @trunk-write-policy-hook (ec/execution-context-bound?))
+  (when (and conn @trunk-write-policy-hook (ec/execution-context-bound?))
     (some (fn [{:system/keys [id type scope]}]
             (when-let [sid (system-name type scope)]
-              (when (identical? conn (:conn (ygg/system sid))) id)))
+              (when (identical? conn (let [system (ygg/system sid)]
+                                       (if (= :repo type)
+                                         (when system (geschichte/gy-connection system))
+                                         (:conn system)))) id)))
           (sdb/all-systems))))
 
 (defn system-write-check

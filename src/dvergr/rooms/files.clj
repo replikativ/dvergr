@@ -368,15 +368,19 @@
    :message :written [{:path :size :content-id}] :removed [path]}`;
    `:commit` is nil when the files already were as given."
   [room files {:keys [message boundary]}]
-  (binding [ec/*execution-context* (:ctx room)]
-    (when-let [reason (srooms/room-effect-write-refusal room {:effect :room/write})]
-      (effects/deny! {:effect :room/write} :trunk-write-policy reason)))
   (let [entries (plan files)
         {:keys [conn] :as ws} (workspace! room)
+        system-id (binding [ec/*execution-context* (:ctx room)]
+                    (srooms/connection-system-id conn))
+        _ (binding [ec/*execution-context* (:ctx room)]
+            (when-let [reason (srooms/room-effect-write-refusal
+                               room {:effect :room/write :resource {:system-id system-id}})]
+              (effects/deny! {:effect :room/write :resource {:system-id system-id}}
+                             :trunk-write-policy reason)))
         fs (gs/filesystem ws)
         boundary (or boundary (host-boundary room (effects/make-sink)))
         ;; `:workspace`: the gate's compare-and-write needs the repository
-        ctx {:filesystem fs :workspace ws :cwd "/" :effect-boundary boundary}
+        ctx {:filesystem fs :workspace ws :system-id system-id :cwd "/" :effect-boundary boundary}
         paths (mapv first entries)
         message (or (not-empty (some-> message str str/trim))
                     (str "Write " (if (= 1 (count paths)) (rel (first paths)) (str (count paths) " files"))))
@@ -399,7 +403,7 @@
             touched (atom [])
             removed (atom [])
             commit (effects/perform!
-                    boundary {:effect :git/commit :resource {:message message}}
+                    boundary {:effect :git/commit :resource {:message message :system-id system-id}}
                     (fn []
                       (try
                         (doseq [[p c] entries

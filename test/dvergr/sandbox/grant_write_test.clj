@@ -14,6 +14,15 @@
             [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as dh]
             [dvergr.discourse :as discourse]
+            [dvergr.agent.turn :as turn]
+            [dvergr.chat.context :as chat]
+            [dvergr.drive.core :as drive]
+            [dvergr.drive.integration :as uploads]
+            [dvergr.drive.blobs :as blobs]
+            [dvergr.rooms.repo :as room-repo]
+            [dvergr.substrate.geschichte :as gs]
+            [geschichte.repo :as grepo]
+            [muschel.fs :as mfs]
             [dvergr.effects :as effects]
             [dvergr.rooms.files :as files]
             [dvergr.rooms.forks :as forks]
@@ -464,3 +473,129 @@
         (binding [rtc/*execution-context* (:ctx room)]
           (try (governance/ungovern! (:conn (:store room))) (catch Throwable _)))
         (discourse/close-room! room)))))
+
+(defn- with-policy-room [slug f]
+  (let [room (binding [rtc/*execution-context* (:root @world)]
+               (registry/lookup (droom/create-room! {:slug slug :title slug :parent-id false})))
+        rid (:room/id (sdb/room-by-slug slug))]
+    (try
+      (binding [rtc/*execution-context* (:ctx room)] (f room rid))
+      (finally
+        (srooms/set-trunk-write-policy! nil)
+        (binding [rtc/*execution-context* (:ctx room)]
+          (try (governance/ungovern! (:conn (:store room))) (catch Throwable _)))
+        (discourse/close-room! room)))))
+
+(deftest working-context-shell-obeys-trunk-policy
+  (with-policy-room
+    "policy-shell"
+    (fn [room rid]
+      (let [working (turn/new-working-ctx {:execution-ctx (:ctx room) :room-id rid})
+            sci (chat/sci-context-in working (:ctx room))
+            conn (:conn (gs/current-workspace))
+            before (grepo/head-commit conn)]
+        (try
+          (srooms/set-trunk-write-policy! (fn [r _] (when (= r rid) :fork-only)))
+          (doseq [command ["echo refused > /shell-policy.txt" "git add ." "git commit -m refused"]]
+            (let [result (sandbox/eval-code sci (str "(require '[babashka.process :as p]) (p/shell "
+                                                     (pr-str command) ")"))]
+              (is (false? (:success result)))
+              (is (re-find #"this room's workflow writes through forks" (get-in result [:error :message])))))
+          (is (nil? (get (grepo/worktree conn) "shell-policy.txt")))
+          (is (= before (grepo/head-commit conn)))
+          (srooms/set-trunk-write-policy! nil)
+          (is (:success (sandbox/eval-code sci "(babashka.process/shell \"echo allowed > /shell-policy.txt\")")))
+          (is (some? (get (grepo/worktree conn) "shell-policy.txt")))
+          (finally (chat/release-sci-in! working (:ctx room))))))))
+
+(deftest daemon-uploads-check-the-target-drive-before-mutation
+  (with-policy-room
+    "policy-upload"
+    (fn [room rid]
+      (let [conn (drive/ensure-room-drive! rid)
+            upload {:file-name "policy.txt" :bytes (.getBytes "upload") :mime "text/plain"}
+            sid (:system/id (some #(when (= "drive" (get-in % [:system :system/name])) (:system %))
+                                  (sdb/systems-for-room rid)))
+            stored (atom 0)]
+        (is (some? sid))
+        (srooms/set-trunk-write-policy! (fn [r s] (when (and (= rid r) (= sid s)) :fork-only)))
+        (with-redefs [blobs/store! (fn [& _] (swap! stored inc) (throw (ex-info "unexpected blob write" {})))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"this room's workflow writes through forks"
+                                (uploads/store-upload! room "telegram" upload))))
+        (is (zero? @stored))
+        (is (empty? (drive/ls conn)))
+        (let [fork (discourse/fork-room room {:isolation :ctx})]
+          (try
+            (is (some? (uploads/store-upload! fork "web" upload)))
+            (is (empty? (drive/ls conn)))
+            (finally (discourse/close-room! fork))))
+        (srooms/set-trunk-write-policy! nil)
+        (is (some? (uploads/store-upload! room "web" upload)))
+        (is (some? (drive/resolve-path conn "web/policy.txt")))))))
+
+(deftest export-refuses-to-commit-a-protected-trunk
+  (with-policy-room
+    "policy-export"
+    (fn [room rid]
+      (let [workspace (gs/current-workspace)
+            conn (:conn workspace)]
+        (is (zero? (:exit (gs/execute-git workspace ["tag" room-repo/import-tag]))))
+        (mfs/write-string! (gs/filesystem workspace) "/export-policy.txt" "pending" false)
+        (let [before (grepo/head-commit conn)
+              staged (:staged (grepo/status conn))]
+          (srooms/set-trunk-write-policy! (fn [r _] (when (= rid r) :fork-only)))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"this room's workflow writes through forks"
+                                (room-repo/export room)))
+          (is (= before (grepo/head-commit conn)))
+          (is (= staged (:staged (grepo/status conn))))
+          (srooms/set-trunk-write-policy! nil)
+          (is (some #(= "export-policy.txt" (:path %)) (:files (room-repo/export room))))))))
+
+  (deftest file-and-git-gates-target-one-repository
+    (with-policy-room
+      "policy-two-repos"
+      (fn [room rid]
+        (let [other (:b @world)
+              other-id (:repo-id other)
+              workspace-fn gs/current-workspace
+              workspace (gs/current-workspace)
+              other-system (:system (some #(when (= other-id (get-in % [:system :system/id])) %)
+                                          (sdb/systems-for-room (:room-id other))))]
+          (sdb/attach! rid other-id :read-write)
+          (#'srooms/register-system-into-current! other-system)
+        ;; Select A explicitly: both repos are attached to the same world.
+          (with-redefs [gs/current-workspace (constantly workspace)]
+            (let [sci (sandbox/fork-for-session (:ctx room))]
+              (sandbox/setup-agent-namespaces! sci (:ctx room) :room-id rid)
+              (srooms/set-trunk-write-policy! (fn [r s] (when (and (= rid r) (= other-id s)) :fork-only)))
+              (is (string? (:commit (files/write! room {"repo-a.txt" {:text "allowed"}} {}))))
+              (binding [rtc/*execution-context* (:root @world)]
+                (is (string? (:commit (files/write! room {"repo-a-host.txt" {:text "allowed"}}
+                                                    {:boundary (tools/effect-boundary {:room room})})))))
+              (doseq [code ["(spit \"/repo-a-sci.txt\" \"allowed\")"
+                            "(require '[babashka.fs :as fs]) (fs/create-dir \"/repo-a-dir\")"
+                            "(require '[git :as git]) (git/add \"repo-a-sci.txt\") (git/commit \"allowed\")"]]
+                (is (:success (sandbox/eval-code sci code)) code))
+              (is (= "allowed" (:text (files/read-file room "repo-a.txt" {}))))
+              (let [other-workspace (with-redefs [gs/current-system
+                                                  (constantly (ygg/system (#'srooms/repo-system-name (:repo-path other))))]
+                                      (workspace-fn))]
+                (with-redefs [gs/current-workspace (constantly other-workspace)]
+                  (let [other-sci (sandbox/fork-for-session (:ctx room))]
+                    (sandbox/setup-agent-namespaces! other-sci (:ctx room) :room-id rid)
+                    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"this room's workflow writes through forks"
+                                          (files/write! room {"repo-b.txt" {:text "refused"}} {})))
+                    (doseq [code ["(spit \"/repo-b.txt\" \"refused\")"
+                                  "(require '[git :as git]) (git/add \".\")"
+                                  "(git/commit \"refused\")"]]
+                      (is (re-find #"this room's workflow writes through forks"
+                                   (get-in (sandbox/eval-code other-sci code) [:error :message])))))))
+              (let [own-id (srooms/connection-system-id (:conn workspace))]
+                (is (some? own-id))
+                (srooms/set-trunk-write-policy! (fn [r s] (when (and (= rid r) (= own-id s)) :fork-only))))
+              (is (thrown-with-msg? clojure.lang.ExceptionInfo #"this room's workflow writes through forks"
+                                    (files/write! room {"repo-a.txt" {:text "refused"}} {})))
+              (doseq [code ["(spit \"/repo-a-sci.txt\" \"refused\")" "(git/add \".\")" "(git/commit \"refused\")"]]
+                (is (re-find #"this room's workflow writes through forks"
+                             (get-in (sandbox/eval-code sci code) [:error :message]))))
+              (is (= "allowed" (:text (files/read-file room "repo-a.txt" {})))))))))))

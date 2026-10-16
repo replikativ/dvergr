@@ -408,7 +408,9 @@
    (let [content (if (bytes? content) content (str content))
          n (if (bytes? content) (alength ^bytes content) (alength (.getBytes ^String content "UTF-8")))]
      (effects/perform! (effect-boundary ctx)
-                       {:effect :fs/write :resource {:path (str path)}
+                       {:effect :fs/write :resource {:path (str path)
+                                                     :system-id (or (:system-id ctx)
+                                                                    (srooms/connection-system-id (get-in ctx [:workspace :conn])))}
                         ;; bytes are digested as they are (a byte array prints by identity)
                         :result-of (constantly (if (bytes? content)
                                                  (String. ^bytes content "ISO-8859-1")
@@ -432,7 +434,9 @@
   ([ctx path] (workspace-delete! ctx path {}))
   ([ctx path opts]
    (effects/perform! (effect-boundary ctx)
-                     {:effect :fs/delete :resource {:path (str path)}}
+                     {:effect :fs/delete :resource {:path (str path)
+                                                    :system-id (or (:system-id ctx)
+                                                                   (srooms/connection-system-id (get-in ctx [:workspace :conn])))}}
                      #(let [resolved (tool-path ctx path)]
                         (cond
                           (contains? opts :expect)
