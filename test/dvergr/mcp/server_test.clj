@@ -79,8 +79,8 @@
                    :principal/scopes #{:toolset/rooms}}
         host {:execution-ctx (Object.)
               :config {:auth {:authorize (fn [p request]
-                                          (swap! calls conj [p (:op request)])
-                                          false)}}}
+                                           (swap! calls conj [p (:op request)])
+                                           false)}}}
         c (init! (server/session-context (fn [_]) (surface/selection {}) principal))
         call #(json-rpc/handle-message c {:jsonrpc "2.0" :id 2 :method "tools/call"
                                           :params {:name "room_list" :arguments {}}})]
@@ -88,7 +88,7 @@
       (server/set-host! host)
       (let [result (:result (call))]
         (is (true? (:isError result)))
-        (is (re-find #"not authorized|denied" (-> result :content first :text)))
+        (is (re-find #"(?i)not authorized|denied" (-> result :content first :text)))
         (is (= [[principal :room/list]] @calls)))
       (finally (server/set-host! nil)))
     (is (true? (get-in (call) [:result :isError])) "clearing restores no-host refusal")
