@@ -243,6 +243,25 @@ a dvergr daemon calls `ops/invoke` with `{:execution-ctx ctx}` as the daemon.
 
 ## Profiles and toolsets
 
+### Embedding without the standalone daemon
+
+A host such as simmis that already owns the rooms and stores can pass the
+same host map as `dvergr.ops/invoke` to `dvergr.mcp.server/set-host!`:
+
+```clojure
+(server/set-host! {:execution-ctx application-context
+                   :config {:auth {:authorize application-authorizer}}})
+(def listener (http/start! {:bind "127.0.0.1" :port 17889
+                             :authenticate application-authenticator}))
+```
+
+MCP uses those existing rooms, not a second daemon or a second home. The
+transport authenticates each request; tool calls, resource reads and
+subscriptions retain that principal and use the host's authorizer. This is
+process-level listener configuration, not forkable room state. At shutdown,
+stop the listener before `(server/set-host! nil)`. Without a host, MCP resolves
+the standalone daemon as before.
+
 A connection sees one selection of tools, chosen by `--profile` / `--toolsets` (the relay puts
 them into `initialize` `_meta` as `dvergr/profile` and `dvergr/toolsets`). Tools outside it are
 neither listed nor callable.

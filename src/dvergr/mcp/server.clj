@@ -62,8 +62,24 @@
 (defonce server-db-conn (atom nil))
 (defn set-db-conn! [conn] (reset! server-db-conn conn))
 
+(defonce ^:private embedded-host (atom nil))
+
+(defn set-host!
+  "Use `host` for MCP operations in an embedding application without a daemon.
+   The same map `dvergr.ops/invoke` accepts: `:execution-ctx` and optional
+   `:config {:auth {:authorize …}}`. Does not start a daemon or open stores.
+   The host owns this process-level transport configuration, not a room or
+   fork. Set before starting listeners; stop them before clearing with nil.
+   Authentication remains the transport's responsibility."
+  [host]
+  (when (and host (not (and (map? host) (:execution-ctx host))))
+    (throw (ex-info "An MCP host needs :execution-ctx" {:type ::invalid-host})))
+  (reset! embedded-host host)
+  nil)
+
 (defn- current-daemon []
-  (some-> (requiring-resolve 'dvergr.orchestration.daemon/current-daemon) deref deref))
+  (or @embedded-host
+      (some-> (requiring-resolve 'dvergr.orchestration.daemon/current-daemon) deref deref)))
 
 (defn- keywordize [m]
   (reduce-kv (fn [a k v] (assoc a (keyword k) v)) {} (or m {})))
