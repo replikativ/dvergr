@@ -25,10 +25,10 @@
    discard.
 
    Members run under a speculative effect filter (`speculative-effects`):
-   they may read, write their own forked world, spend and run jailed
-   processes, but not reach the network, send, schedule or write beyond their
-   world, since discarding a member cannot undo those (doc/design/
-   speculation.md, Law 7).
+   they may read, write their own forked world, spend (model calls) and make
+   requests that change nothing, but not post to Rooms, send, schedule, run
+   processes or write beyond their world, since discarding a member cannot
+   undo those (doc/design/speculation.md, Law 7).
 
    Every member's Run records the search durably (`dvergr.agent.run/
    record-search!`): first the intended decision (`:search/status :pending`),
@@ -47,12 +47,14 @@
 (def policies #{:automatic :review :keep-all})
 
 (def speculative-effects
-  "The effect filter of a search's member worlds (`dvergr.effects`): local
-   reads and writes in the member's own forked world, charged spend, and
-   jailed processes. Network access, egress, schedules, lifecycle operations
-   and global writes are refused until they are classified finer (an HTTP GET
-   is reversible, a POST is not)."
-  {:admit #{:read :write :spend :process}})
+  "The effect filter of a search's member worlds (`dvergr.effects`): reads,
+   writes in the member's own forked substrates, charged spend (model calls),
+   and network requests that change nothing (`:speculative` refuses writes to
+   Rooms, undeclared tools, mail syncs and HTTP other than GET, HEAD and
+   OPTIONS). Egress, processes, schedules, lifecycle operations and global
+   writes are refused: processes because only the jail's listed commands run
+   without a network, so a shell could reach a remote."
+  {:admit #{:read :write :spend :network} :speculative true})
 
 (defn reward-weight
   "The default weight of a member: the log of its Attempt's reward, read as
