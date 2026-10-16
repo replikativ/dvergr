@@ -92,7 +92,9 @@ cancellable.
     `dvergr.intake.github`, `dvergr.intake.youtube` (`get-transcript`), … —
     `(sandbox/overview)` lists the live set.
   - `dvergr.room` — your room: its `*kb*`/`*room*` conns, databases, `fork!`/`merge!`,
-    posting to other rooms, `kb-search`.
+    posting to other rooms, `kb-search`. `*room*` (the messages store) is read-only, and
+    a database attached on a grant that does not permit writes reads but does not
+    transact (Safety boundaries).
   - `dvergr.agent` — rosters, environments and `hire!` (a durable Run with a result
     Spin; on the host `dvergr.agent.program/hire!`), `dvergr.tasks` (the task ledger),
     `dvergr.agents` (read-only directory), `dvergr.actors` (register/retire participants,
@@ -129,6 +131,27 @@ cancellable.
   `Thread.interrupt()` (Esc / watchdog) and cap cumulative thread-allocated memory (default 4 GiB: allocation, garbage included, not retained memory; a runaway backstop, since 256 MiB killed real feed scans). A shell command's output is bounded as it is written (four times `:max-out` bytes kept, the rest counted and dropped), and an environment can bound what an attempt writes (`:world :effects {:quota-bytes n}`, doc/effects.md).
   Timeout is enforced by a watchdog thread plus a `future`/deref outer fence, so even a
   non-interruptible blocking syscall unblocks the caller.
+- **Databases follow the room's grants.** Sandbox code holds databases as handles
+  (`dvergr.room/*kb*`, `*room*`, `db`, `kb`, the guarded `datahike.api/connect`); the
+  connection stays with the host. A handle transacts (`d/transact`, `d/transact!`, schema
+  included) only while the room's grant on the database permits `:write`
+  (`dvergr.system.rooms/grant-permits?`: `:owner` and `:read-write`, or what the host's
+  hook answers); otherwise the write throws before it is performed, and the handle is
+  asked again at every write, so a grant downgraded or detached later holds at once. A KB
+  attached `:read` from another room therefore reads but never writes. The room's messages
+  store is never written through a handle, whatever its grant: messages go through
+  `dvergr.room/post!`, which records the author. `(dvergr.room/databases)` says which is
+  which (`:writable?`). `d/delete-database` deletes only a data DB the room holds as
+  `:owner`, and `dvergr.room/gc!` collects only the systems the room may write (it starts
+  the collections and returns `{system-id :started}`); a store attached `:read`, or one
+  detached since, is its owner's to delete and collect. A fork does not carry a write
+  past a grant either: merging a fork that changed a database the room may no longer
+  write (`dvergr.system.rooms/assert-merge-permitted!`, in `dvergr.discourse/merge-room`;
+  datoms added or retracted) is refused, and the fork can be discarded. The grants that
+  decide are those of the durable room the fork descends from, recorded on the fork
+  when it is made, and a fork merges only into the room it was forked from. The handle offers nothing else:
+  no `swap!`/`reset!`, no `:store`, no field access, no `load-entities` (not mirrored).
+  `dvergr.sandbox.grant-write-test` runs each of these attacks against a provisioned room.
 - **Gated deps**: `clojure.repl.deps/add-libs` is available (`dvergr.sandbox.deps`) but
   every request waits for an operator's decision (nothing auto-approves; a `:local/root`
   source is refused, since it stays writable after approval). After a successful load the
@@ -164,7 +187,7 @@ Tool I/O is anchored to the surrounding room's workspace, not the daemon root. W
 context** (`dvergr.substrate.geschichte/current-workspace`) and serves it as the tools'
 filesystem, rooted at `/`. A forked room (`:isolation :ctx`) has its own workspace branch,
 so `read_file`/`write_file`/`shell` see the fork's files automatically. Likewise
-`dvergr.room/*room*` and `*kb*` are the **fork's** Datahike conns: nothing reaches the
+`dvergr.room/*room*` and `*kb*` are the **fork's** Datahike handles: nothing reaches the
 parent until the fork is merged. `spawn_agent` and `propose_change` construct ordinary
 AgentDefs and call the same Run-backed `hire!` exposed in SCI. Their tool I/O therefore
 resolves in the child world automatically. See `doc/worlds-and-forks.md` for the full

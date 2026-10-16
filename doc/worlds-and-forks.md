@@ -44,7 +44,14 @@ merges or discards it. A room's systems:
 
 A room may also attach another room's KB or repository (a `:grant` in the
 system DB, `:read` or `:read-write`); the live attachment is a registration in
-the room's composite.
+the room's composite. The grant's permission decides what the room may do with
+it: sandbox code transacts a database only on a grant that permits `:write`
+(`dvergr.system.rooms/grant-permits?`), the room's GC (`dvergr.room/gc!`)
+skips the stores it may not write, and a merge that would change one (a fork
+wrote it before the grant was downgraded or detached) is refused. A host that writes
+grants with its own words (simmis adds `:merge`) answers for them through
+`dvergr.system.rooms/set-grant-permits!`, a `(fn [permission action])` that
+dvergr asks with `:write`; without it `:owner` and `:read-write` write.
 
 ### Shared, durable: the system DB
 

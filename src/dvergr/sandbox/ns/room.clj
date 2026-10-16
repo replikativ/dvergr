@@ -3,15 +3,19 @@
    `dvergr.room`. Holds the room's own datahike connections (fork-aware) + a small
    library of the common queries that are otherwise fiddly to write by hand.
 
-   `*room*` — the room's OWN datahike (the messages store: conversation, schedules,
-              and a place to transact room state). `*kb*` — the room's knowledge
+   `*room*` — the room's OWN datahike (the messages store: conversation,
+              schedules), READ-ONLY: messages are written by `post!`, schedules by
+              `dvergr.scheduler`. `*kb*` — the room's default writable knowledge
               base (`:entity/*` katzen ACSet). Both are resolved per `[room,agent]`
               context, so a FORK's sandbox transparently gets the branched conns and
               everything the agent writes here forks/merges/discards with the room.
               NEITHER is system-db — sandbox data never touches the global registry.
 
-   Other databases (attached KBs, ones the agent creates) are reached through the
-   faithful `datahike.api` namespace; the agent can `(require …)`-style write its
+   Other databases (attached KBs, ones the agent creates) are reached by name
+   (`db`, or `connect` in the faithful `datahike.api` namespace). A handle
+   transacts only where the room's grant on the database permits writes
+   (`dvergr.system.rooms/grant-permits?`); a KB attached with a `:read` grant
+   reads and refuses every write. The agent can `(require …)`-style write its
    own helper namespaces over them, exactly like a normal Clojure project."
   (:require [datahike.api :as d]
             [dvergr.system.rooms :as srooms]
@@ -20,7 +24,6 @@
             [dvergr.runtime.ctx :as runtime-ctx]
             [clojure.string :as str]
             [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.yggdrasil :as ygg]
             [dvergr.sandbox.ns.doc :as doc]
             [dvergr.effects :as effects]
             [sci.core :as sci]))
@@ -138,7 +141,8 @@
    'kb              [:=> [:cat :string] :any]
    'databases       [:=> :cat [:or [:maybe [:vector [:map [:name :string]
                                                      [:type [:enum :kb :msgs :data]]
-                                                     [:permission :keyword]]]]
+                                                     [:permission :keyword]
+                                                     [:writable? :boolean]]]]
                                ErrorResult]]
    'db              [:=> [:cat [:or :string :keyword :symbol]] :any]
    'kb-find         [:=> [:cat :string] [:or [:maybe KbHit] ErrorResult]]
@@ -191,12 +195,17 @@
                                   :incarnation (:room-incarnation binding)})
                                source-room)
         acting-agent   #(some-> binding-resolver (apply []) :agent-id)
+        ;; read-only: a message written straight into the store would be one
+        ;; nobody posted (any :message/from, no bus delivery, no accounting)
         room-view      (when (or room-id room-conn)
-                         (ns-datahike/world-connection
+                         (ns-datahike/read-only-connection
                           #(if-let [room-id (current-room-id)]
                              (binding [ec/*execution-context* (selected-ctx)]
                                (srooms/room-msgs-conn room-id))
-                             room-conn)))
+                             room-conn)
+                          (str "dvergr.room/*room* is the room's messages store; post messages "
+                               "with dvergr.room/post!, keep your own data in a database you "
+                               "create (d/create-database)")))
         kb-view        (when (or room-id kb-conn)
                          (ns-datahike/world-connection
                           #(if-let [room-id (current-room-id)]
@@ -274,12 +283,12 @@
         databases      (fn [] (safe #(when-let [room-id (current-room-id)]
                                        (binding [ec/*execution-context* (selected-ctx)]
                                          (srooms/room-databases room-id)))))
+        ;; the handle writes only where the room's grant permits it
+        ;; (`ns-datahike/room-database`)
         db             (fn [db-name]
-                         (safe #(when-let [room-id (current-room-id)]
-                                  (ns-datahike/world-connection
-                                   (fn []
-                                     (binding [ec/*execution-context* (selected-ctx)]
-                                       (srooms/room-conn-by-name room-id db-name)))))))
+                         (safe #(when (current-room-id)
+                                  (ns-datahike/room-database current-room-id selected-ctx
+                                                             (name db-name)))))
         ;; Reclaim unreachable storage for THIS room/fork's workspace (datahike
         ;; index blobs + git objects). Default keeps all history (orphan garbage
         ;; only); pass {:remove-before <Date>} to collapse old history. It
@@ -287,11 +296,19 @@
         gc!            (fn gc!
                          ([] (gc! {}))
                          ([opts]
-                          (effects/perform! effects {:effect :room/gc
-                                                     :resource {:room (str (current-room-id))
-                                                                :remove-before (some? (:remove-before opts))}}
-                                            (fn [] (safe #(binding [ec/*execution-context* (selected-ctx)]
-                                                            (ygg/gc! opts)))))))
+                          ;; the collections are started here and finish in the
+                          ;; background: the result is data, no computation the
+                          ;; sandbox could run later, after a grant changed
+                          (let [opts (select-keys opts [:remove-before :grace-period-ms :dry-run?])]
+                            (effects/perform! effects {:effect :room/gc
+                                                       :resource {:room (str (current-room-id))
+                                                                  :remove-before (some? (:remove-before opts))}}
+                                              ;; only the systems the room may
+                                              ;; write: a KB attached :read is
+                                              ;; its owner's storage
+                                              (fn [] (safe #(binding [ec/*execution-context* (selected-ctx)]
+                                                              (ns-datahike/seal
+                                                               (srooms/gc-room! (current-room-id) opts)))))))))
         ;; Which KBs this room may WRITE, and which one `*kb*` is. A room's own
         ;; KB is the default, but a room whose knowledge lives in an ATTACHED KB
         ;; would otherwise write into its own empty one with nothing saying so —
@@ -320,7 +337,7 @@
                         ;; (or nil) — values with no signature to state — so
                         ;; they carry no entry and are described in ns-guide.
                         (doc/with-docs
-                          {'*room*          room-view      ; ambient messages-store handle
+                          {'*room*          room-view      ; ambient messages-store handle (read-only)
                            '*kb*            kb-view       ; ambient default-KB handle
                            'kbs             kbs             ; [{:name :permission :default?}] — writable KBs
                            'kb              kb              ; fork-aware conn to a writable KB by name
@@ -335,13 +352,13 @@
                            'gc!             gc!}
                           '{kbs             [([]) "The knowledge bases you may WRITE, as [{:name :permission :default?}]. Your own KB is usually the default, but a room whose knowledge lives in an ATTACHED KB would otherwise write into its own empty one — check here before saving if it matters where."]
                             kb              [([slug]) "Fork-aware conn to one WRITABLE knowledge base by name (see `kbs`)."]
-                            databases       [([]) "Every database available to this room, as [{:name :type :permission}] — the discovery entry point before `db`."]
-                            db              [([db-name]) "Fork-aware conn to one of your databases by name (see `databases`). Query it with the real datahike API: (d/q '[…] @conn)."]
+                            databases       [([]) "Every database available to this room, as [{:name :type :permission :writable?}] — the discovery entry point before `db`. `:writable?` false: you may read it but not transact it (a KB attached with a :read grant, or the messages store, which you write with `post!`)."]
+                            db              [([db-name]) "Fork-aware conn to one of your databases by name (see `databases`). Query it with the real datahike API: (d/q '[…] @conn). It transacts only where `databases` says :writable?."]
                             kb-find         [([title]) "The single KB entity with this exact title, or nil. Searches EVERY readable KB — your own plus whatever is granted to the room — across both title bindings, and the result carries :kb so you know where it lives."]
                             kb-by-type      [([type]) "KB entities of a given :entity/type (pass the type as a string or keyword), pulled with title/summary/type, tagged with :kb."]
                             kb-search       [([term]) "Substring search over title+summary across EVERY readable KB (max 25 hits), each tagged with :kb. Reach for this before researching something afresh."]
                             recent-messages [([] [n]) "The n most recent messages in THIS room (default 20), newest first."]
                             search-messages [([term]) "Messages in THIS room whose content contains `term` (max 50)."]
                             schedules       [([]) "The schedules registered on THIS room — what runs, and when."]
-                            gc!             [([] [opts]) "Reclaim unreachable storage for this room/fork — datahike index blobs and git objects. Default collects orphan garbage only and KEEPS all history; pass {:remove-before <Date>} to collapse history older than that."]}))]
+                            gc!             [([] [opts]) "Reclaim unreachable storage for this room/fork — datahike index blobs and git objects — of the databases and repositories the room may write. Default collects orphan garbage only and KEEPS all history; pass {:remove-before <Date>} to collapse history older than that. Starts the collections and returns {system-id :started}; they finish in the background."]}))]
     (sci/add-namespace! sci-ctx 'dvergr.room (with-schemas room-map))))

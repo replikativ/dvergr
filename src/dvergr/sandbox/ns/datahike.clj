@@ -180,7 +180,11 @@
   [x]
   (if (instance? SandboxDb x) (.-db ^SandboxDb x) x))
 
-(deftype WorldConnection [resolver]
+(deftype WorldConnection [resolver write-refusal]
+  ;; `write-refusal`: nil when the connection may be written, else a 0-arg fn
+  ;; asked at each write, in the selected world, that answers nil (write) or
+  ;; why the write is refused. Asked at each write, not once: a grant
+  ;; downgraded or detached after the handle was handed out refuses from then on.
   clojure.lang.IDeref
   (deref [_]
     (seal @(resolver)))
@@ -197,9 +201,53 @@
 (defn world-connection
   "Create an ambient Datahike connection handle. Deref returns the selected
    connection's DB, sealed; mirrored Datahike functions unwrap it to the
-   connection."
-  [resolve-conn]
-  (WorldConnection. resolve-conn))
+   connection. `write-refusal` (optional) makes the handle read-only where it
+   answers: a 0-arg fn asked before every `transact`/`transact!` through the
+   handle, nil to let it write, else the reason it may not (the write throws,
+   nothing is written). Without it the handle writes."
+  ([resolve-conn] (world-connection resolve-conn nil))
+  ([resolve-conn write-refusal]
+   (WorldConnection. resolve-conn write-refusal)))
+
+(defn read-only-connection
+  "A handle that reads like `(world-connection resolve-conn)` and refuses
+   every write with `reason`."
+  [resolve-conn reason]
+  (world-connection resolve-conn (constantly reason)))
+
+(defn refuse-write!
+  "Throws when `target` is a read-only handle (`world-connection`'s
+   `write-refusal` answers a reason). Returns nil otherwise; what is not a
+   handle Datahike itself refuses to transact (a database value), or the
+   host handed the sandbox on purpose."
+  [target]
+  (when (instance? WorldConnection target)
+    (when-let [refusal (.-write-refusal ^WorldConnection target)]
+      (when-let [reason (refusal)]
+        (throw (ex-info (str "This database is read-only here: " reason)
+                        {:type ::read-only}))))))
+
+(defn room-database
+  "The handle sandbox code gets for the database named `nm` attached to the
+   room `room-id-fn` answers, resolved in the world `ctx-fn` selects at each
+   use (`dvergr.system.rooms/room-database-by-name`). It writes only while the
+   room's grant on the database permits `:write` and it is not the room's
+   messages store; otherwise it reads and refuses every write."
+  [room-id-fn ctx-fn nm]
+  (let [lookup #(binding [ec/*execution-context* (ctx-fn)]
+                  (srooms/room-database-by-name (room-id-fn) nm))]
+    (world-connection
+     #(or (:conn (lookup))
+          (throw (ex-info (str "No database named " (pr-str (name nm)) " in this room")
+                          {:name nm})))
+     #(let [{:keys [type permission writable?] :as found} (lookup)]
+        (cond
+          (nil? found) (str "no database named " (pr-str (name nm)) " is attached to this room")
+          writable? nil
+          (= :msgs type) (str (pr-str (name nm)) " is a messages store; post messages with "
+                              "dvergr.room/post!")
+          :else (str (pr-str (name nm)) " is attached to this room with a "
+                     (pr-str permission) " grant, which does not permit writes"))))))
 
 (defn resolve-connection
   "Resolve a WorldConnection to its connection and a SandboxDb to its
@@ -642,14 +690,7 @@
                              room-id)
         in-ctx    (fn [f]
                     (binding [ec/*execution-context* (selected-ctx)] (f)))
-        managed-connection
-        (fn [nm]
-          (world-connection
-           #(binding [ec/*execution-context* (selected-ctx)]
-              (or (srooms/room-conn-by-name (current-room-id) nm)
-                  (throw (ex-info (str "No database named " (pr-str nm)
-                                       " in this room")
-                                  {:name nm}))))))
+        managed-connection #(room-database current-room-id selected-ctx %)
         no-room   (fn [op] (throw (ex-info (str op " needs a room — this sandbox isn't attached to one "
                                                 "(only :mem databases are available here).") {})))
         guard
@@ -729,9 +770,12 @@
                                  #(apply f args))))
         tx-resource (fn [[_ tx]] {:datoms (count (tx-forms tx))})
         db-resource (fn [[cfg]] {:name (str (cfg-name cfg))})
+        ;; a read-only handle refuses before the effect: nothing is
+        ;; performed, receipted or counted against a quota
+        writable (fn [f] (fn [conn tx] (refuse-write! conn) (f conn tx)))
         m (-> (merge data guard)
-              (update 'transact #(fx :db/transact tx-resource %))
-              (update 'transact! #(fx :db/transact tx-resource %))
+              (update 'transact #(writable (fx :db/transact tx-resource %)))
+              (update 'transact! #(writable (fx :db/transact tx-resource %)))
               (update 'create-database #(fx :db/create db-resource %))
               (update 'delete-database #(fx :db/delete db-resource %)))]
     ;; The real datahike.api name (the model aliases it `:as d` itself, as everyone does).
