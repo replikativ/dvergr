@@ -12,7 +12,9 @@
             [dvergr.discourse :as d]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.gateway :as gateway]
+            [dvergr.model.api.openai :as openai]
             [dvergr.model.providers :as providers]
+            [dvergr.agent.spend :as spend]
             [dvergr.resource :as resource]
             [dvergr.room.registry :as registry]
             [dvergr.rooms.forks :as forks]
@@ -2057,3 +2059,117 @@
                    (enforce! {:program-kinds #{:echo :scripted} :provider-effects? false}
                              :llm funded))))
     (is (nil? (enforce! ceiling :scripted nil)))))
+
+(deftest a-funded-model-child-pays-its-provider-calls-from-its-grant
+  ;; through the real model path: the gateway's egress is the only fake
+  (let [[room conn] (resource-test-room :program-funded-egress)
+        model "gpt-5.6-luna"
+        child {:id :child
+               :model-policy {:provider :openai :model model}
+               :program {:kind :llm :max-model-steps 2 :auto-compact? false}}
+        team (-> (roster/make-roster {:id :egress-team})
+                 (roster/make-agent {:id :parent :program {:kind :scripted :reply :unused}})
+                 (roster/make-agent child))
+        parent-runtime (promise)
+        release-parent (promise)
+        egress (atom 0)
+        sse (str "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"child answer\"}}]}\n\n"
+                 "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                 "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\n"
+                 "data: [DONE]\n\n")
+        cost (:microdollars (spend/of-usage model {:input-tokens 100 :output-tokens 10}))
+        status-key (keyword "dvergr.agent.program" "status")
+        value-key (keyword "dvergr.agent.program" "value")
+        execute @#'program/execute-program
+        execute-program
+        (fn [control-room work-room run-id chat-id agent task trigger supervisor]
+          (if (= :parent (:agent/id agent))
+            (sp/spin
+             (deliver parent-runtime [supervisor work-room])
+             (sp/await (comb/sleep 100))
+             (deref release-parent 20000 nil)
+             {status-key :completed value-key :parent-done})
+            (execute control-room work-room run-id chat-id agent task trigger supervisor)))]
+    (try
+      (resource/install-unit! room {:symbol resource/model-dispatches
+                                    :name "Native model dispatch admission" :precision 0})
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 1000000M
+                                                          resource/model-dispatches 10M}})
+      (with-redefs-fn
+        {#'program/execute-program execute-program
+         #'providers/ensure-initialized! (constantly nil)
+         #'providers/get-provider! (constantly (openai/create {:api-key "test"
+                                                               :base-url "https://model.test"}))
+         #'gateway/*request-fn* (fn [_]
+                                  (swap! egress inc)
+                                  {:status 200 :body (java.io.ByteArrayInputStream.
+                                                      (.getBytes sse "UTF-8"))})}
+        (fn []
+          (binding [ec/*execution-context* (:ctx room)]
+            (let [parent (program/hire! room team :parent
+                                        {:task :coordinate
+                                         :resources {resource/microdollars 1000000M
+                                                     resource/model-dispatches 10M}})
+                  parent-id (program/run-id parent)
+                  [supervisor parent-work] (deref parent-runtime 5000 [::timeout nil])
+                  sci-ctx (sandbox/fork-for-session (:ctx parent-work))
+                  hire (fn [resources]
+                         (binding [ec/*execution-context* (:ctx parent-work)]
+                           (:value
+                            (sandbox/eval-code
+                             sci-ctx
+                             (str "(require '[dvergr.agent :as agent]) "
+                                  "(agent/run-id (agent/hire! (agent/make-agent (agent/roster) "
+                                  (pr-str child) ") :child {:task \"answer\" :resources "
+                                  (pr-str resources) "}))")
+                             :timeout-ms 15000))))
+                  ended? (fn [id] (contains? #{:completed :failed :cancelled}
+                                             (:run/status (run/run room id))))]
+              (is (not= ::timeout supervisor))
+              (agent-ns/add-programming-ns! sci-ctx (:id parent-work) (:ctx parent-work)
+                                            (#'program/child-program-authority parent-id supervisor))
+              (testing "a grant that cannot cover a call's bound sends nothing"
+                (let [id (hire {resource/microdollars 1000M resource/model-dispatches 2M})]
+                  (is (uuid? id))
+                  (is (wait-until #(ended? id) 15000))
+                  (is (zero? @egress) "refused before egress")
+                  (is (wait-until #(= {resource/microdollars 1000000M resource/model-dispatches 10M}
+                                      (resource/run-balance room parent-id))
+                                  5000)
+                      "the whole grant, admissions included, returns")))
+              (testing "a funded child pays its call from its grant and returns the rest"
+                (let [id (hire {resource/microdollars 400000M resource/model-dispatches 2M})]
+                  (is (wait-until #(ended? id) 15000))
+                  (is (= :completed (:run/status (run/run room id))))
+                  (is (= 1 @egress))
+                  (is (wait-until #(= {resource/microdollars (- 1000000M (bigdec cost))
+                                       resource/model-dispatches 9M}
+                                      (resource/run-balance room parent-id))
+                                  5000)
+                      "the parent is left with its grant less the call's cost and admission")))
+              (deliver release-parent true)
+              (is (= :parent-done (:run/value (deref parent 10000 ::timeout))))))))
+      (finally
+        (deliver release-parent true)
+        (deliver parent-runtime [::closed nil])
+        (close-resource-test-room! room conn)))))
+
+(deftest the-delegate-tool-funds-the-child-it-hires-in-a-paid-run
+  (let [room (test-room :delegate-funding)
+        hired (atom nil)
+        ceiling (#'program/child-program-authority (random-uuid) nil)]
+    (try
+      (with-redefs-fn
+        {#'program/hire-in! (fn [_ _ _ _ opts] (reset! hired opts)
+                              (delay {:run/status :completed :run/value "ok"}))}
+        #(#'tools/delegate-agent!
+          {:task "summarize" :budget 0.25}
+          {:room room :control-room room :execution-ctx (:ctx room)
+           :run-id (:parent-run ceiling) :agent-program-ceiling (dissoc ceiling :own-child!)
+           :model-policy {:provider :openai :model "gpt-5.6-luna"}}
+          :automatic))
+      (is (= {resource/microdollars 250000M resource/model-dispatches 64M}
+             (:resources @hired))
+          "its budget in microdollars, two admissions per model step")
+      (is (resource/funded-grant? (:resources @hired)))
+      (finally (d/close-room! room)))))
