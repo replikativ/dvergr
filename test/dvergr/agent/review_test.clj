@@ -98,6 +98,9 @@
     (let [[m] (escalations parent)]
       (is (= (:review/id rv) (get-in m [:metadata :object :id])) "the message names the Review")
       (is (str/includes? (str (:content m)) "needs a person")))
+    (is (instance? dvergr.discourse.Message (last (filter #(= :review/escalated (get-in % [:metadata :kind]))
+                                                          (d/log (ops/resolve-room *daemon* (name (:id parent)))))))
+        "a room message like any other: conversation listeners see it")
     (is (nil? (get (catalog/read-tree (ops/resolve-room *daemon* (name (:id parent))) "/") "/wiki/a.md")) "nothing merged")
     (is (= 1 (count (op :review/list {:room "rv-scope" :decision "escalated"}))))))
 
@@ -218,3 +221,14 @@
         (is (not= t1 t2) "a changed content changes the token")
         (muschel.fs/chmod (dvergr.catalog.workspace/room-fs (f)) "/wiki/a.md " 0755)
         (is (not= t2 (token)) "a changed mode too")))))
+
+(deftest an-escalation-reaches-room-message-listeners
+  (let [[parent fork] (room-with-fork "rv-listen" {} {"notes.md" "x"})
+        p (ops/resolve-room *daemon* (name (:id parent)))
+        seen (promise)]
+    (d/on-each-message p (fn [m] (when (= :review/escalated (get-in m [:metadata :kind])) (deliver seen m))))
+    (let [rv (review/review! parent (fork-id fork) {:review/checks [[:diff/only-paths ["wiki/"]]]})
+          m (deref seen 10000 nil)]
+      (is (= :escalated (:review/decision rv)))
+      (is (some? m) "on-each-message sees the escalation")
+      (is (= (:review/id rv) (get-in m [:metadata :object :id]))))))
