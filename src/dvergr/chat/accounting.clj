@@ -119,6 +119,12 @@
         (cost (:cache-write pricing (:input pricing 0)))
         0)
 
+      ;; cache writes kept an hour (Anthropic), billed higher
+      :cache-write-1h-tokens
+      (if-let [pricing (get-model-pricing model)]
+        (cost (:cache-write-1h pricing (* 2 (:input pricing 0))))
+        0)
+
       ;; Static pricing for everything else
       (long (* amount (get-static-pricing resource-type))))))
 

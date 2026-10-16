@@ -123,7 +123,11 @@
   [model {:keys [used by-type]}]
   ;; a chat budget accounts uncached input under :input-tokens and cached
   ;; input apart (`dvergr.chat.agent`); a spend's input counts both
-  (let [cached (+ (get by-type :cache-read-tokens 0) (get by-type :cache-creation-tokens 0))
+  ;; and the writes kept an hour apart from the other writes, a usage counts
+  ;; them among its writes
+  (let [hour (get by-type :cache-write-1h-tokens 0)
+        by-type (cond-> by-type (pos? hour) (update :cache-creation-tokens (fnil + 0) hour))
+        cached (+ (get by-type :cache-read-tokens 0) (get by-type :cache-creation-tokens 0))
         by-type (cond-> by-type (pos? cached) (update :input-tokens (fnil + 0) cached))
         tokens (tokens-of by-type)
         worth (notional model by-type)

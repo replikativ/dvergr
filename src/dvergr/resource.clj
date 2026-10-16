@@ -336,9 +336,18 @@
   10000)
 
 (defn- content-parts
-  "Every map in a request body."
+  "The maps of a request body's content, without what is data to the model
+   rather than content the provider reads: a tool call's arguments (`:input`
+   of a `tool_use` part, `:arguments`), tool definitions (`:tools`)."
   [body]
-  (filter map? (tree-seq coll? seq body)))
+  (letfn [(kind [m] (or (:type m) (get m "type")))
+          (children [x]
+            (cond
+              (map? x) (vals (cond-> (apply dissoc x [:tools "tools" :arguments "arguments"])
+                               (#{"tool_use" "function_call"} (kind x))
+                               (dissoc :input "input")))
+              (coll? x) (seq x)))]
+    (filter map? (tree-seq coll? children body))))
 
 (def ^:private unbounded-part-types
   "Content parts whose cost their encoded size does not bound: a document's

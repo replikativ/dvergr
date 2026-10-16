@@ -12,6 +12,7 @@
             [dvergr.model.provider :as provider]
             [dvergr.model.registry :as registry]
             [dvergr.agent.spend]
+            [dvergr.chat.accounting]
             [dvergr.model.api.anthropic]
             [dvergr.resource :as resource]
             [dvergr.room.store :as store]
@@ -150,6 +151,18 @@
     (is (nil? (resource/dispatch-bound model {:messages [{:content [{:type "input_audio" :input_audio {:data "AA" :format "wav"}}]}]} 100 10)))
     (is (nil? (resource/dispatch-bound model {:messages []} 100 nil)) "no output limit")
     (is (nil? (resource/dispatch-bound {:pricing {:input 1.0}} {} 100 10)) "no output price")
+    (testing "a URL or file id in a tool call's arguments is data, not content"
+      (is (some? (resource/dispatch-bound
+                  model
+                  {:messages [{:role "assistant"
+                               :content [{:type "tool_use" :id "t" :name "fetch"
+                                          :input {:url "https://example.org" :file_id "f-1"
+                                                  :type "document"}}]}
+                              {:role "assistant"
+                               :tool_calls [{:type "function"
+                                             :function {:name "fetch" :arguments "{\"url\":\"https://example.org\"}"}}]}]
+                   :tools [{:name "fetch" :input_schema {:type "object" :properties {:url {:type "string"}}}}]}
+                  100 10))))
     (testing "an inline image is bounded by a per-image allowance, not its bytes"
       (is (< (resource/dispatch-bound model {:messages [{:content "x"}]} 100 10)
              (resource/dispatch-bound model {:messages [{:content [{:type "image_url" :image_url {:url "data:image/png;base64,AA"}}]}]} 100 10))))))
@@ -262,7 +275,13 @@
             usage (:usage (provider/extract-response p state))]
         (is (= 10000 (:cache-write-1h-tokens usage)))
         (is (= 100000 (:microdollars (dvergr.agent.spend/of-usage "claude-opus-4-7" usage)))
-            "10,000 one-hour writes at $10 per million")))))
+            "10,000 one-hour writes at $10 per million")
+        (is (= 100000 (dvergr.chat.accounting/calculate-cost :cache-write-1h-tokens 10000
+                                                             {:model "claude-opus-4-7"}))
+            "chat accounting prices them as settlement does")
+        (is (= 100000 (:microdollars (dvergr.agent.spend/of-budget
+                                      "claude-opus-4-7"
+                                      {:used 100000 :by-type {:cache-write-1h-tokens 10000}}))))))))
 
 (deftest the-hold-is-on-the-ledger-and-a-failed-draw-keeps-it
   (with-funded-run
