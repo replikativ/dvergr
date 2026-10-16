@@ -281,9 +281,11 @@
 (def speculative-refused-ops
   "Operations a speculative world refuses although their classes are
    admitted: they act outside the world's own forked substrates (another
-   Room's messages or membership), or reach out in ways discarding the world
-   cannot undo (an undeclared tool, a mail sync)."
-  #{:room/post :room/write :room/join :room/merge :room/gc :tool/call :mail/sync})
+   Room's messages or membership, a shared mail store and its account row),
+   or reach out in ways discarding the world cannot undo (an undeclared tool,
+   a mail sync)."
+  #{:room/post :room/write :room/join :room/merge :room/gc :tool/call
+    :mail/open :mail/sync})
 
 (def speculative-http-methods
   "HTTP methods a speculative world may use: those that change nothing."

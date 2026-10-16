@@ -488,23 +488,26 @@
   (when-not (keyword? status)
     (throw (ex-info "Run settlement status must be a keyword"
                     {:type ::invalid-settlement-status :status status})))
-  (when-let [room-store (:store room)]
-    (let [room-id (store/conversation-id room)
-          existing (store/-load-run room-store room-id run-id)]
-      (when-not existing
-        (throw (ex-info "Run settlement owner is not durable in this Room"
-                        {:type ::run-not-found
-                         :run/id run-id
-                         :run/room (:id room)})))
-      (let [updated (cond-> (assoc existing
-                                   :run/settlement-status status
-                                   :run/updated-at (java.util.Date.))
-                      reason (assoc :run/settlement-reason reason))]
-        (or (store/-store-run! room-store room-id updated)
-            (throw (ex-info "Run settlement update was not durable"
-                            {:type ::settlement-not-durable
-                             :run/id run-id
-                             :run/settlement-status status})))))))
+  ;; read and write under the Room's exclusive lock, as the resume claim and
+  ;; a search's record do, so none loses another's write
+  (with-room-exclusive (:id room)
+    (when-let [room-store (:store room)]
+      (let [room-id (store/conversation-id room)
+            existing (store/-load-run room-store room-id run-id)]
+        (when-not existing
+          (throw (ex-info "Run settlement owner is not durable in this Room"
+                          {:type ::run-not-found
+                           :run/id run-id
+                           :run/room (:id room)})))
+        (let [updated (cond-> (assoc existing
+                                     :run/settlement-status status
+                                     :run/updated-at (java.util.Date.))
+                        reason (assoc :run/settlement-reason reason))]
+          (or (store/-store-run! room-store room-id updated)
+              (throw (ex-info "Run settlement update was not durable"
+                              {:type ::settlement-not-durable
+                               :run/id run-id
+                               :run/settlement-status status}))))))))
 
 (defn record-savepoint!
   "Keep `data` (a portable savepoint, `savepoint.portable/persist`) as the live
@@ -539,6 +542,12 @@
         (when-not existing
           (throw (ex-info "A search member is not a durable Run in this Room"
                           {:type ::run-not-found :run/id run-id :run/room (:id room)})))
+        ;; a Run is a member of one search: the first record claims it
+        (when-let [other (some-> (:run/search existing) clojure.edn/read-string :search/id)]
+          (when (not= other (:search/id search))
+            (throw (ex-info "This Run is a member of another search"
+                            {:type ::claimed-by-another-search :run/id run-id
+                             :search/id (:search/id search) :claimed-by other}))))
         (or (store/-store-run! room-store room-id
                                (assoc existing
                                       :run/search (pr-str search)

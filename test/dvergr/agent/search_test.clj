@@ -144,3 +144,46 @@
     (store/-store-run! s room-id (assoc run :run/search "{:search/id 1}"))
     (store/-store-run! s room-id (assoc run :run/updated-at (java.util.Date.)))
     (is (= "{:search/id 1}" (:run/search (store/-load-run s room-id (:run/id run)))))))
+
+(deftest effects-can-only-narrow-the-speculative-filter
+  (is (= search/speculative-effects (search/speculative nil)))
+  (is (= search/speculative-effects (search/speculative {})))
+  (is (= {:admit #{:read} :speculative true} (search/speculative {:admit #{:read :egress}})))
+  (is (= {:admit #{:read :write :spend :network} :speculative true :record true}
+         (search/speculative {:record true}))))
+
+(defn- held [room n effects]
+  (workflow/attempt! room (cond-> {:task "t" :attempts n :models ["claude-haiku-4-5"] :hold? true}
+                            effects (assoc :effects effects))))
+
+(deftest members-must-be-held-under-the-speculative-filter-and-match-their-runs
+  (with-room :search-preflight-test
+    (fn [room]
+      (testing "a member held without the speculative filter is refused"
+        (let [members (held room 2 nil)]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"speculative effect filter"
+                                (search/select! room members {:policy :review})))))
+      (testing "swapped worlds are refused"
+        (let [[a b] (held room 2 search/speculative-effects)]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not its Run's world"
+                                (search/select! room [(assoc a :world (:world b)) (assoc b :world (:world a))]
+                                                {:policy :review}))))))))
+
+(deftest a-retry-keeps-the-recorded-decisions-and-a-run-joins-one-search
+  (with-room :search-retry2-test
+    (fn [room]
+      (let [members (held room 2 search/speculative-effects)
+            first-run (search/select! room members {:policy :review :weigh (fn [_] -1.0)})
+            id (:search/id first-run)]
+        (testing "a retry with another judge keeps what was decided"
+          (is (= (mapv (juxt :search/weight :search/decision) (:search/members first-run))
+                 (mapv (juxt :search/weight :search/decision)
+                       (:search/members (search/select! room members {:policy :review :search-id id
+                                                                      :weigh (fn [_] 5.0)}))))))
+        (testing "a retry with another policy is refused"
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"same members and policy"
+                                (search/select! room members {:policy :automatic :search-id id}))))
+        (testing "a Run claimed by one search is refused by another"
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"member of another search"
+                                (run/record-search! room (:run/id (first (:search/members first-run)))
+                                                    {:search/id (random-uuid)}))))))))
