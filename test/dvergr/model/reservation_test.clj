@@ -14,6 +14,7 @@
             [dvergr.model.api.anthropic]
             [dvergr.resource :as resource]
             [dvergr.room.store :as store]
+            [kontor.resource]
             [dvergr.room.store.datahike :as datahike-store])
   (:import [java.io ByteArrayInputStream IOException]))
 
@@ -247,3 +248,27 @@
     (is (= {:input-tokens 1210 :output-tokens 42 :cache-read-tokens 1000 :cache-creation-tokens 200}
            (:usage done)))
     (is (true? (:usage-final? done)))))
+
+(deftest the-hold-is-on-the-ledger-and-a-failed-draw-keeps-it
+  (with-funded-run
+    2M 1000000M
+    (fn [room run-id]
+      (let [hold (kontor.resource/account-ref (resource/hold-wallet-id (resource/run-wallet-id run-id)))
+            held #(get (resource/balance room hold) resource/microdollars 0M)]
+        (settled-dispatch! 100M)
+        (is (= 100M (held)) "the settled cost is a ledger balance, not process state")
+        (testing "a draw the ledger refuses leaves the hold as it was"
+          (let [move @#'resource/move!]
+            (with-redefs-fn {#'resource/move!
+                             (fn [& [_ _ kind :as args]]
+                               (if (= :consume kind)
+                                 (throw (ex-info "ledger unavailable" {}))
+                                 (apply move args)))}
+              #(is (thrown? Exception (resource/charge-spend! 100M)))))
+          (is (= 100M (held))))
+        (testing "the charge made again draws on it"
+          (binding [resource/*spend-wallet* (resource/spending (resource/spend-wallet room run-id)
+                                                               [:test run-id])]
+            (is (= 100M (:charged (resource/charge-spend! 100M)))))
+          (is (= 0M (held)))
+          (is (= 999900M (left room run-id))))))))

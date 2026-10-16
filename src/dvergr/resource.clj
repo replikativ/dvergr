@@ -297,15 +297,16 @@
 ;; - a definitive refusal (an HTTP error status, or refused before it left)
 ;;   is returned whole at once, so the next attempt can reserve;
 ;; - the answer, when the provider reported its final usage, returns what
-;;   exceeds that usage's cost and holds the cost, which the charges that
-;;   follow from the same usage (`charge-spend!`) consume under their own
-;;   debit ids;
+;;   exceeds that usage's cost to the wallet and moves the cost to the
+;;   wallet's hold (`hold-wallet-id`), a durable account the charges that
+;;   follow from the same usage (`charge-spend!`) consume first, under their
+;;   own debit ids;
 ;; - every other outcome (a broken or truncated stream, an exception, a
 ;;   crash) is consumed whole.
 ;;
-;; What a reservation holds is never spendable again: a charge that does not
-;; claim it (a crash before the charge) leaves it held, so a dispatch costs
-;; its wallet at least its usage and at most its bound.
+;; What a hold has is never spendable again, and it survives a restart: a
+;; charge made, or replayed, after one draws on it, so a dispatch costs its
+;; wallet its usage, or its bound when the outcome is unknown.
 ;; ---------------------------------------------------------------------------
 
 (def ^:dynamic *dispatch-bound*
@@ -318,10 +319,11 @@
    :payer :status :settled?}]`), bound by the caller that settles them."
   nil)
 
-(defonce ^:private held
-  ;; payer wallet uuid -> [{:reservation uuid :left microdollars}]: the cost
-  ;; settled answers hold for the charges that follow
-  (atom {}))
+(defn hold-wallet-id
+  "The account that holds, for the charges that follow, the settled cost of
+   the answers `wallet` paid for."
+  [wallet]
+  (stable-id [:dvergr/hold wallet]))
 
 (def dispatch-overhead-tokens
   "Input tokens a provider may add to a request on its own (a tool-use system
@@ -425,11 +427,14 @@
   (move! payer wallet :consume (stable-id [:dvergr/forfeit id]) kontor/sink-account amount))
 
 (defn- hold! [{:keys [id wallet amount payer]} cost]
-  (let [cost (min amount (max 0M (bigdec cost)))]
-    (move! payer wallet :return (stable-id [:dvergr/release id])
-           (kontor/account-ref (:wallet payer)) (- amount cost))
+  (let [cost (min amount (max 0M (bigdec cost)))
+        hold (hold-wallet-id (:wallet payer))]
     (when (pos? cost)
-      (swap! held update (:wallet payer) (fnil conj []) {:reservation wallet :left cost :payer payer}))))
+      (store/-open-resource-wallet! (resource-store! (:room payer))
+                                    {:id hold :name (str "hold " (:wallet payer))})
+      (move! payer wallet :grant (stable-id [:dvergr/hold id]) (kontor/account-ref hold) cost))
+    (move! payer wallet :return (stable-id [:dvergr/release id])
+           (kontor/account-ref (:wallet payer)) (- amount cost))))
 
 (defn- refused? [status]
   (or (= :refused status) (and (number? status) (>= status 400))))
@@ -458,42 +463,17 @@
       (doseq [r records]
         (if (= r final) (hold! r cost) (forfeit! r))))))
 
-(defn- held-draw-id
-  "The debit id of the `n`th draw (from 0) a charge with debit id `id` makes
-   on what settled answers hold."
-  [id n]
-  (stable-id [:dvergr/held id n]))
-
 (defn- draw-held!
-  "Consume up to `cost` of what settled answers hold for `payer`'s wallet,
-   one draw per reservation, numbered from `n` (`held-draw-id`); returns the
-   amount drawn."
-  [payer id n cost]
-  (loop [n n cost cost drawn 0M]
-    (let [claim (volatile! nil)]
-      (when (pos? cost)
-        (swap! held (fn [m]
-                      (let [[h & more] (get m (:wallet payer))]
-                        (if-not h
-                          (do (vreset! claim nil) m)
-                          (let [k (min cost (:left h))
-                                left (- (:left h) k)]
-                            (vreset! claim (assoc h :n k))
-                            (assoc m (:wallet payer)
-                                   (vec (if (pos? left) (cons (assoc h :left left) more) more)))))))))
-      (if-let [{:keys [reservation] k :n} @claim]
-        (do (move! payer reservation :consume (held-draw-id id n) kontor/sink-account k)
-            (recur (inc n) (- cost k) (+ drawn k)))
-        drawn))))
-
-(defn- drawn-before
-  "What a charge with debit id `id` already drew on held reservations, and
-   the number of its draws, from their receipts."
-  [room id]
-  (loop [n 0 drawn 0M]
-    (if-let [r (store/-resource-receipt (resource-store! room) (held-draw-id id n))]
-      (recur (inc n) (+ drawn (get-in r [:resources microdollars] 0M)))
-      [drawn n])))
+  "Consume up to `cost` of what `payer`'s hold has (`hold-wallet-id`), under
+   debit `id`; returns the amount drawn. Its caller holds the wallet's lock."
+  [{:keys [room wallet] :as payer} id cost]
+  (let [hold (hold-wallet-id wallet)
+        has (get (try (balance room (kontor/account-ref hold))
+                      (catch clojure.lang.ExceptionInfo _ {}))
+                 microdollars 0M)
+        n (min cost has)]
+    (move! payer hold :consume id kontor/sink-account n)
+    (max n 0M)))
 
 (defn charge-spend!
   "Consume `cost` microdollars of model spend from the bound spend wallet.
@@ -506,12 +486,12 @@
    `{:charged n :exhausted? bool}`, or nil when no wallet is bound or there is
    nothing to charge.
 
-   What settled dispatch reservations hold for the wallet is consumed first
-   (one debit per reservation, derived from the charge's id), the rest from
-   the wallet under the charge's id, last: a charge whose wallet debit exists
-   is complete, and a replayed charge resumes from the draws it already made.
-   Which charge of a wallet draws on which reservation does not change what
-   the wallet pays in all.
+   What the wallet's hold has (settled dispatch reservations,
+   `hold-wallet-id`) is consumed first, a debit of its own derived from the
+   charge's id, the rest from the wallet under the charge's id: a charge
+   whose wallet debit exists is complete, and a replayed charge finds its
+   draw. Which charge of a wallet draws on the hold does not change what the
+   wallet pays in all.
 
    Spend follows the world (doc/design/speculation.md, Law 4): when the
    current world was granted a wallet of its own by the ledger authority
@@ -521,11 +501,11 @@
     (when-let [{:keys [payer id]} (world-charge)]
       (let [{:keys [room wallet]} payer]
         (locking (wallet-lock wallet)
-          (let [[before n] (drawn-before room id)
-                done (store/-resource-receipt (resource-store! room) id)
-                drawn (if (or done (>= before (bigdec cost)))
-                        before
-                        (+ before (draw-held! payer id n (- (bigdec cost) before))))
+          (let [done (store/-resource-receipt (resource-store! room) id)
+                draw-id (stable-id [:dvergr/held id])
+                drawn (if-let [d (store/-resource-receipt (resource-store! room) draw-id)]
+                        (get-in d [:resources microdollars] 0M)
+                        (if done 0M (draw-held! payer draw-id (bigdec cost))))
                 cost (- (bigdec cost) drawn)]
             (if (or done (not (pos? cost)))
               {:charged (+ drawn (get-in done [:resources microdollars] 0M))
