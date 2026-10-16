@@ -560,16 +560,40 @@
               (throw (ex-info "A search record was not durable"
                               {:type ::search-not-durable :run/id run-id}))))))))
 
+(defonce ^:private search-reservations
+  ;; run id -> the search that reserved it in this process: made before a
+  ;; claim's durable writes, so a claim a failed write left partial is still
+  ;; this search's to resume (settling a member needs its live world, which
+  ;; is this process's too)
+  (atom {}))
+
+(defn- store-claim!
+  "The durable write of one member's claim (`claim-search!`)."
+  [room-store room-id existing search]
+  (or (store/-store-run! room-store room-id
+                         (assoc existing :run/search (pr-str search)
+                                :run/updated-at (java.util.Date.)))
+      (throw (ex-info "A search claim was not durable"
+                      {:type ::search-not-durable :run/id (:run/id existing)}))))
+
 (defn claim-search!
   "Claim the Runs of `records` ({run-id search-record}) in `room` for one
    search, all or none: under the Room's exclusive lock, refuse when any is
-   a member of another search, then record each not yet claimed by this one.
-   A claim interrupted part way is resumed by claiming again."
+   a member or reservation of another search, reserve them all in this
+   process, then record each not yet claimed by this one. A claim a failed
+   write left part way is resumed by claiming again, and no other search
+   can take its members meanwhile."
   [room records]
   (when-let [room-store (:store room)]
     (with-room-exclusive (:id room)
       (let [room-id (store/conversation-id room)
             loaded (into {} (map (fn [[run-id _]] [run-id (store/-load-run room-store room-id run-id)])) records)]
+        (doseq [[run-id search] records
+                :let [reserved (get @search-reservations run-id)]]
+          (when (and reserved (not= reserved (:search/id search)))
+            (throw (ex-info "This Run is reserved by another search"
+                            {:type ::claimed-by-another-search :run/id run-id
+                             :search/id (:search/id search) :claimed-by reserved}))))
         (doseq [[run-id search] records
                 :let [existing (get loaded run-id)
                       prior (some-> (:run/search existing) clojure.edn/read-string)]]
@@ -580,14 +604,11 @@
             (throw (ex-info "This Run is a member of another search"
                             {:type ::claimed-by-another-search :run/id run-id
                              :search/id (:search/id search) :claimed-by (:search/id prior)}))))
+        (swap! search-reservations into (map (fn [[run-id search]] [run-id (:search/id search)])) records)
         (doseq [[run-id search] records
                 :let [existing (get loaded run-id)]
                 :when (nil? (:run/search existing))]
-          (or (store/-store-run! room-store room-id
-                                 (assoc existing :run/search (pr-str search)
-                                        :run/updated-at (java.util.Date.)))
-              (throw (ex-info "A search claim was not durable"
-                              {:type ::search-not-durable :run/id run-id}))))))))
+          (store-claim! room-store room-id existing search))))))
 
 (defn search-record
   "The search record of durable `run` (`record-search!`), as data, or nil."

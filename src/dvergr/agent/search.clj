@@ -157,6 +157,16 @@
       (and (= :merge (nth decisions i)) (nil? (get-in member [:review :state])))
       (refuse "a member to merge needs its review token"))))
 
+(defn- project-merged!
+  "Record durably that `member`'s world merged, when its substrate merged but
+   the Run's settlement was not written: true once its Run reads `:merged`."
+  [room member]
+  (let [run-id (run-id-of member)]
+    (try (when-not (= :merged (:run/settlement-status (durable-run room run-id)))
+           (run/update-durable-settlement! room run-id :merged :search-selected))
+         (catch Throwable _ nil))
+    (= :merged (:run/settlement-status (durable-run room run-id)))))
+
 (defn- settle!
   "Settle a held member's world by `decision`. Returns `{:outcome :merged |
    :review | :discarded | nil, :status :settled | :failed | :incomplete,
@@ -183,27 +193,38 @@
                        durable (:run/settlement-status (durable-run room (run-id-of member)))]
                    (cond
                      (and (:ok? merged) (= :merged durable)) {:outcome :merged :status :settled}
-                     ;; the substrate merged, its cleanup or projection did not
+                     ;; the substrate merged, its cleanup or projection did
+                     ;; not: project the settlement again, never merge again
                      (= :merged (:op substrate))
-                     {:outcome :merged :status :incomplete :error (:error merged)}
+                     (if (project-merged! room member)
+                       {:outcome :merged :status :settled :error (:error merged)}
+                       {:outcome :merged :status :incomplete :error (:error merged)})
                      ;; refused before merging: it waits in review for a person
                      :else {:outcome :review :status :settled :error (:error merged)})))))))
 
 (defn- reconciled
   "The outcome of a member whose world was settled but not recorded (a failed
-   write, a crash), or whose merge was incomplete and has since completed:
-   read from its Run's durable settlement and its world. nil while it is
-   still held or incomplete."
-  [room member]
+   write, a crash), or whose merge was incomplete: read from its Run's
+   durable settlement and its world; an incomplete merge (its recorded
+   outcome is the evidence that its substrate merged) has its settlement
+   projected again. nil while it is still held or incomplete."
+  [room member prior]
   (let [status (:run/settlement-status (durable-run room (run-id-of member)))
         fork (rreg/lookup (:world member))]
     (cond
       (and (= :merged status) (nil? fork)) :merged
+      (and (= :merged (:search/outcome prior)) (= :incomplete (:search/status prior)))
+      (when (project-merged! room member) :merged)
       (= :discarded status) :discarded
       (and (= :review status) fork (not (forks/deferred? fork))) :review
       :else nil)))
 
 (defonce ^:private search-locks (atom {}))
+
+(defonce ^:private search-members
+  ;; search id -> the Runs of its members, in this process: a search id names
+  ;; one set of members, so another set under it is refused
+  (atom {}))
 
 (defn- search-lock [search-id]
   (or (get @search-locks search-id)
@@ -235,6 +256,10 @@
     (locking (search-lock search-id)
       (binding [ec/*execution-context* (:ctx room)]
         (let [run-ids (mapv run-id-of members)
+              _ (let [known (get (swap! search-members update search-id #(or % (set run-ids))) search-id)]
+                  (when (not= known (set run-ids))
+                    (throw (ex-info "A search id names one set of members"
+                                    {:type ::incompatible-retry :search/id search-id}))))
               records #(mapv (fn [m] (some-> (durable-run room (run-id-of m)) run/search-record)) members)
               prior (records)
               manifest (some #(when (= search-id (:search/id %)) (:search/manifest %)) prior)
@@ -263,7 +288,7 @@
           (doseq [i (range (count members))
                   :let [p (nth prior i)]
                   :when (and (= search-id (:search/id p)) (#{:pending :incomplete} (:search/status p)))
-                  :let [outcome (reconciled room (nth members i))]
+                  :let [outcome (reconciled room (nth members i) p)]
                   :when outcome]
             (record! i {:search/outcome outcome :search/status :settled}))
           (let [now (records)

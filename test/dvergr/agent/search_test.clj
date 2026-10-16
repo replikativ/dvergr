@@ -205,7 +205,7 @@
           (is (apply = (map :search/selected outcomes)) "both report the one winner")
           (is (= 1 (count (filter #(= :merged (:search/outcome %)) (:search/members (first outcomes)))))))))))
 
-(deftest a-merge-whose-cleanup-failed-is-merged-and-incomplete-until-reconciled
+(deftest a-merge-whose-cleanup-failed-is-recorded-as-merged
   (with-room :search-incomplete-test
     (fn [room]
       (let [members (held room 2 search/speculative-effects)
@@ -215,7 +215,9 @@
                                                  {:ok? false :error "cleanup failed"})]
                       (search/select! room members {:policy :automatic}))
             winner (some #(when (= :merge (:search/decision %)) %) (:search/members outcome))]
-        (is (= [:merged :incomplete] ((juxt :search/outcome :search/status) winner)))
+        (is (= [:merged :settled "cleanup failed"]
+               ((juxt :search/outcome :search/status :search/error) winner))
+            "its Run's settlement was written, so it is settled, with the error kept")
         (is (= (:run/id winner) (:search/selected outcome)) "the parent has its changes")
         (let [again (search/select! room members {:policy :automatic :search-id (:search/id outcome)})
               winner (some #(when (= :merge (:search/decision %)) %) (:search/members again))]
@@ -227,6 +229,59 @@
       (let [[a b c] (map #(get-in % [:attempt :attempt/receipt :attempt/run-id])
                          (held room 3 search/speculative-effects))]
         (run/claim-search! room {a {:search/id 1} b {:search/id 1}})
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"member of another search"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"another search"
                               (run/claim-search! room {b {:search/id 2} c {:search/id 2}})))
         (is (nil? (durable-search room c)) "nothing of the losing claim was written")))))
+
+(deftest when-every-member-is-impossible-nothing-merges
+  (with-room :search-impossible-auto-test
+    (fn [room]
+      (let [outcome (search/select! room (held room 2 search/speculative-effects)
+                                    {:policy :automatic :retain 1 :weigh (constantly ##-Inf)})]
+        (is (nil? (:search/selected outcome)))
+        (is (every? #(= :discarded (:search/outcome %)) (:search/members outcome)))))))
+
+(deftest a-claim-left-partial-by-a-failed-write-stays-the-search-s
+  (with-room :search-partial-claim-test
+    (fn [room]
+      (let [[a b c] (map #(get-in % [:attempt :attempt/receipt :attempt/run-id])
+                         (held room 3 search/speculative-effects))
+            store-claim! @#'run/store-claim!]
+        (with-redefs-fn {#'run/store-claim! (fn [s rid existing search]
+                                              (if (= b (:run/id existing))
+                                                (throw (ex-info "storage failed" {}))
+                                                (store-claim! s rid existing search)))}
+          #(is (thrown? Exception (run/claim-search! room {a {:search/id 10} b {:search/id 10}}))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reserved by another search"
+                              (run/claim-search! room {b {:search/id 11} c {:search/id 11}})))
+        (run/claim-search! room {a {:search/id 10} b {:search/id 10}})
+        (is (= 10 (:search/id (durable-search room b))) "the first search resumes its claim")))))
+
+(deftest a-search-id-names-one-set-of-members
+  (with-room :search-disjoint-test
+    (fn [room]
+      (let [[a b c d] (held room 4 search/speculative-effects)
+            id (random-uuid)]
+        (search/select! room [a b] {:policy :review :search-id id})
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"one set of members"
+                              (search/select! room [c d] {:policy :review :search-id id})))))))
+
+(deftest a-failed-settlement-write-after-a-merge-is-projected-again
+  (with-room :search-projection-test
+    (fn [room]
+      (let [members (held room 2 search/speculative-effects)
+            update! run/update-durable-settlement!
+            failures (atom 2)
+            outcome (with-redefs [run/update-durable-settlement!
+                                  (fn [r rid status & more]
+                                    (if (and (= :merged status) (pos? (swap! failures dec)))
+                                      (throw (ex-info "settlement write failed" {}))
+                                      (apply update! r rid status more)))]
+                      (search/select! room members {:policy :automatic}))
+            winner (some #(when (= :merge (:search/decision %)) %) (:search/members outcome))]
+        (is (= :merged (:search/outcome winner)))
+        (let [again (search/select! room members {:policy :automatic :search-id (:search/id outcome)})
+              winner (some #(when (= :merge (:search/decision %)) %) (:search/members again))]
+          (is (= [:merged :settled] ((juxt :search/outcome :search/status) winner)))
+          (is (= :merged (:run/settlement-status
+                          (store/-load-run (:store room) (store/conversation-id room) (:run/id winner))))))))))
