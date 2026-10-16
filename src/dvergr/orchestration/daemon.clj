@@ -1158,6 +1158,7 @@
   (tel/log! {:id :daemon/stopping} "Stopping daemon")
   (reset! (:status daemon) :stopping)
   (stop-gc-loop!)
+  (srooms/enable-storage-gc! false)
 
   ;; Leave all registered participants from the discourse room and
   ;; unregister them (`d/leave` cancels their spins and pumps). Reserved `_`-prefixed ids (e.g. the
@@ -1224,6 +1225,7 @@
    host that retries in the same process (`runner/open-home!`)."
   []
   (stop-gc-loop!)
+  (srooms/enable-storage-gc! false)
   (try (mail/stop-sync!) (catch Throwable _ nil))
   (try (sdist/unregister-context! :default) (catch Throwable _ nil))
   (when-let [room @starting-room]

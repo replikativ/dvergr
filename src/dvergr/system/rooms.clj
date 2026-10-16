@@ -608,7 +608,9 @@
            0 (room-repos id)))))
    0 (sdb/all-rooms)))
 
-(defonce ^:private storage-gc-enabled (atom false))
+(defonce ^:private storage-gc-homes
+  ;; the homes (state roots) whose daemon enabled deleting GC
+  (atom #{}))
 
 (defn enable-storage-gc!
   "Allow storage GC that deletes (`gc-stores!`, `gc-room!` without
@@ -617,14 +619,19 @@
    `#{:branches}`, and the sweep deleted every other key of a system DB:
    dev.simm.is, 2026-09-29). Turn it on only with a datahike that fails closed
    (datahike#1117) and a backup. The daemon turns it on for `:gc {:enabled?
-   true}`."
+   true}`, for its home only, and revokes it when it stops."
   [on?]
-  (reset! storage-gc-enabled (boolean on?)))
+  (let [home (str (paths/home))]
+    (swap! storage-gc-homes (if on? #(conj % home) #(disj % home)))
+    (boolean on?)))
 
-(defn storage-gc-enabled? [] @storage-gc-enabled)
+(defn storage-gc-enabled?
+  "Whether deleting GC is enabled for the current home."
+  []
+  (contains? @storage-gc-homes (str (paths/home))))
 
 (defn- refuse-gc-unless-enabled! [opts]
-  (when-not (or (:dry-run? opts) @storage-gc-enabled)
+  (when-not (or (:dry-run? opts) (storage-gc-enabled?))
     (throw (ex-info (str "Storage GC is off: datahike's gc-storage can delete a whole store when its "
                          "mark is incomplete (datahike#1117). A dry run ({:dry-run? true}) is allowed; "
                          "enable deleting GC with the daemon's :gc {:enabled? true}.")
@@ -662,8 +669,11 @@
          ;; system-db is a plain root datahike (the registry itself), not in any
          ;; ctx workspace — GC it directly. BOUNDARY deref with timeout (the api
          ;; returns datahike's async throwable-promise), mirroring the ygg adapter.
-         sysdb (try (gc-report (deref (d/gc-storage (sdb/get-conn) rb) 600000 ::timeout))
-                    (catch Throwable e {:error (.getMessage e)}))
+         ;; datahike's gc-storage has no dry run: a dry run leaves the system DB
+         sysdb (if (:dry-run? opts)
+                 {:dry-run true :skipped "the system DB's GC has no dry run"}
+                 (try (gc-report (deref (d/gc-storage (sdb/get-conn) rb) 600000 ::timeout))
+                      (catch Throwable e {:error (.getMessage e)})))
          _ (when (:error sysdb)
              (tel/log! {:level :warn :id :rooms/gc-failed :data {:system :system-db :error (:error sysdb)}}
                        "System DB storage GC failed"))

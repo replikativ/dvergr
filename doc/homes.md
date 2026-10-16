@@ -150,8 +150,11 @@ incomplete (a branch walk that dies on an Error), the keep-set shrinks to `#{:br
 and the sweep deletes every other key of the store; that wiped a system DB on 2026-09-29.
 Until a datahike that fails closed (datahike#1117) is released and dvergr depends on it,
 deleting GC (`gc-stores!`, `dvergr.room/gc!` without `:dry-run?`) is refused unless the
-daemon enables it; keep a backup when you do. A dry run is always allowed. A GC that
-returns nothing is logged as a failure (`:rooms/gc-failed`), not as `:reclaimed 0`.
+daemon enables it, for that daemon's home and while it runs; keep a backup when you do.
+A dry run is always allowed; it skips the system DB, whose GC has no dry run. A system-DB
+GC that returns nothing or times out is logged as a failure (`:rooms/gc-failed`), not as
+`:reclaimed 0`; a room's reports come from the yggdrasil adapters, which still report a
+dead collection as zero reclaimed.
 
 With `:retention-days` nil, the sweep keeps every snapshot and reclaims only what no snapshot
 or branch head reaches. With a number, snapshots older than that are collapsed:
