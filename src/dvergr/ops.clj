@@ -1904,11 +1904,19 @@
   (when-not (principal/local? principal)
     (fail-closed
      op
-     #(do (check! daemon principal (authz-request daemon op args))
-          (when-let [also (:also (authz-decl op))]
-            (doseq [[action resource] (also daemon args)]
-              (check! daemon principal {:op op :action action :resource resource
-                                        :resolved (resolve-resource daemon resource) :args args})))))))
+     #(let [request (authz-request daemon op args)]
+        (check! daemon principal request)
+        (when-let [also (:also (authz-decl op))]
+          (doseq [[action resource] (also daemon args)]
+            (check! daemon principal
+                    {:op op :action action :resource resource
+                       ;; A fork-pinned reviewer merges through its fork; the
+                       ;; host still checks :merge on the actual parent.
+                     :resolved (cond-> (resolve-resource daemon resource)
+                                 (and (principal/pinned? principal)
+                                      (= :room/merge op) (= :merge action))
+                                 (assoc :via-room (get-in request [:resolved :room])))
+                     :args args})))))))
 
 (defn visible?
   "Whether `principal` may read `resource` (a listing's row) for `op`. A

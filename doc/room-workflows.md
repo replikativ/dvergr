@@ -294,7 +294,8 @@ bundle):
 
 ```clojure
 {:review/checks     [:fork/review-tier [:diff/only-paths ["wiki/"]] [:diff/max-files 40] :wiki/v4]
- :review/reviewer   {:instructions "Approve faithful updates; escalate anything that contradicts a source."}
+ :review/reviewer   {:model "claude-haiku-4-5"
+                     :instructions "Approve faithful updates; escalate anything that contradicts a source."}
  :review/on-pass    :merge        ; or :propose: approved, the merge left to a person
  :review/on-fail    :escalate     ; or :discard
  :review/spot-check {:rate 0.1 :seed 7}}
@@ -328,7 +329,41 @@ input, and `:diff/only-kb-pages` restricts review to wiki datoms in one named KB
 See [the KB wiki contract](kb-wiki.md) for the projection and composing it with
 `only-paths`.
 
-Next: the model-backed reviewer as a hired Run under its own principal (#316's
-`:authorize`), the review started by the workflow's settlement, and the reviewer
-benchmark (generated good and damaged updates: does it approve the good and escalate the
-bad?).
+For a model reviewer, the host constructs a callback for one review:
+
+```clojure
+(review/review! room world spec
+  :reviewer (review/model-reviewer daemon room world spec caller-principal))
+```
+
+`model-reviewer` takes `[daemon room world spec caller]`. The spec's
+`:review/reviewer` requires `:model` (a registry model id or alias) and `:instructions`.
+It hires a separate `:llm` Run in `room`, with `:settlement :discard`, a four-step
+limit and a $0.50 budget. The model has no callable tools: its read access is an EDN
+snapshot in the task containing the usual review input, plus `:review/fork-diff`,
+`:review/fork-review` and `:review/files`. The last maps changed paths to `room_read`
+file data (including text or base64), or `{:deleted? true}`. Declared paths come from
+`[:diff/only-paths prefixes]`; unreadable or oversized files fail closed. Instructions
+and checks' evidence are included. File contents are identified as untrusted data.
+The reviewer cannot edit the retained fork, and its Run's world is discarded,
+including when it exhausts its limit and stops at `:waiting`.
+
+The final answer must be exactly one EDN map, without fences or trailing text:
+`{:review/verdict :approve|:escalate :review/reasons ["…"] :review/concerns ["…"]}`.
+Both lists are vectors of strings. Malformed answers and failed Runs escalate.
+
+The callback carries an ops invocation in its metadata, which `review!` uses for
+settlement even if `:invoke` is supplied. Its principal is an agent run token with
+actor `:reviewer`, pinned to the retained fork id, with tools
+`#{"room_diff" "room_review" "room_merge"}` and the caller's
+`:principal/delegation` claim unchanged. Diff/review reads and the state-pinned merge
+pass through `ops/invoke` and the host authorizer as that principal. The parent's
+`:merge` authorization request keeps the parent in `:resolved :room` and adds
+`:resolved :via-room` naming the already authorized fork, so the fork pin permits
+this parent check. Other room operations remain pinned. The model never
+receives the token or the merge capability. `review!` revokes the token after the
+decision, also when checks fail; the callback is for one `review!` invocation.
+The principal has no discard permission in its tool pins.
+
+Next: starting the review from workflow settlement, and the reviewer benchmark
+(generated good and damaged updates: does it approve the good and escalate the bad?).

@@ -348,6 +348,23 @@
         (is (= [[:read [:room "authz-fork"] {:room "authz-fork"}]
                 [:merge [:room "authz-open"] {:room "authz-open"}]]
                @seen)))
+      (testing "a fork-pinned reviewer still needs the host's merge permission on its parent"
+        (let [token (principal/mint-run-token! {:actor :reviewer :room "authz-fork"
+                                                :tools #{"room_diff" "room_review" "room_merge"}})
+              p (principal/run-token-principal token)
+              [seen authz] (recorder (constantly true))]
+          (try
+            (is (nil? (ops/authorize! (daemon authz) p :room/merge {:room "authz-fork"})))
+            (is (= [[:read [:room "authz-fork"] {:room "authz-fork"}]
+                    [:merge [:room "authz-open"] {:room "authz-open" :via-room "authz-fork"}]] @seen))
+            (let [[_ deny-parent] (recorder #(not= :merge (:action %)))]
+              (is (thrown? clojure.lang.ExceptionInfo
+                           (ops/authorize! (daemon deny-parent) p :room/merge {:room "authz-fork"}))))
+            (doseq [[op args] [[:room/merge {:room "authz-open"}]
+                               [:room/write {:room "authz-open"}]
+                               [:room/review {:room "authz-closed"}]]]
+              (is (thrown? clojure.lang.ExceptionInfo (ops/authorize! (daemon authz) p op args))))
+            (finally (principal/revoke-run-token! token)))))
       (testing "writing the fork is not enough: the merge lands on the parent"
         (let [[_ authz] (recorder #(not= :merge (:action %)))]
           (is (thrown? clojure.lang.ExceptionInfo

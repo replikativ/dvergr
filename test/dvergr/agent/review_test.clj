@@ -5,10 +5,15 @@
   (:require [datahike.api :as dh]
             [dvergr.catalog.kb-pages-test :as kb-pages]
             [dvergr.system.rooms :as rooms]
-            [org.replikativ.spindel.engine.core :as ec]
+            [clojure.edn :as edn]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.agent.review :as review]
+            [dvergr.agent.run :as run]
+            [dvergr.chat.agent :as chat-agent]
+            [dvergr.model.chat :as model-chat]
+            [dvergr.model.providers :as providers]
+            [org.replikativ.spindel.engine.core :as ec]
             [dvergr.catalog :as catalog]
             [dvergr.catalog.wiki-gen :as gen]
             [dvergr.catalog.wiki-v4 :as v4]
@@ -17,6 +22,7 @@
             [muschel.fs]
             [dvergr.ops :as ops]
             [dvergr.rooms.forks]
+            [dvergr.room.registry :as rreg]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.principal :as principal]
             [dvergr.substrate.paths :as paths]
@@ -290,3 +296,121 @@
              (get-in rv [:review/checks 1 :evidence :offenders]))))
     (is (not (:pass? (review/run-check (second (:review/checks spec))
                                        {:fork fork :other-systems ["another-kb"]}))))))
+(defn- model-review! [slug answer & {:keys [propose? attack? deny-merge? exhaust?]}]
+  (let [[parent world] (room-with-fork slug {"docs/a.md" "A."} {"wiki/a.md" "# A\n"})
+        fork (ops/resolve-room *daemon* world)
+        spec (cond-> (assoc-in wiki-only [:review/reviewer :model] "claude-haiku-4-5")
+               propose? (assoc :review/on-pass :propose))
+        calls (atom [])
+        authorized (atom [])
+        dmn (assoc-in *daemon* [:config :auth :authorize]
+                      (fn [p request]
+                        (swap! authorized conj [p request])
+                        (not (and deny-merge? (= :room/merge (:op request))))))
+        state #(binding [ec/*execution-context* (:ctx fork)] (dvergr.rooms.forks/state-token fork))
+        before (state)
+        reviewer (review/model-reviewer dmn parent (:id fork) spec {:principal/delegation {:id "delegation-1"}})]
+    (with-redefs [providers/ensure-initialized! (constantly nil)
+                  chat-agent/messages->api-format (fn [messages _ _] messages)
+                  model-chat/chat
+                  (fn [messages opts]
+                    (swap! calls conj {:messages messages :opts opts})
+                    (if (or exhaust? (and attack? (= 1 (count @calls))))
+                      {:content "" :tool-calls [{:id (str "write-" (count @calls)) :name "write_file"
+                                                 :input {:path "/wiki/a.md" :content "corrupted"}}]
+                       :usage (if exhaust? {:input-tokens 1000000 :output-tokens 1000000}
+                                  {:input-tokens 100 :output-tokens 20})
+                       :stop-reason :tool-use}
+                      {:content answer :tool-calls nil :usage {:input-tokens 100 :output-tokens 20}
+                       :stop-reason :end-turn}))]
+      (let [rv (review/review! parent (:id fork) spec :reviewer reviewer)
+            runs (run/runs parent)
+            [r] runs]
+        (is (= 1 (count runs)) "the reviewer is its own durable Run")
+        (is (= (if exhaust? :waiting :completed) (:run/status r)))
+        (is (= :discard (:run/settlement-policy r)))
+        (is (= :discarded (:run/settlement-status r)))
+        (is (nil? (binding [ec/*execution-context* (:ctx parent)] (rreg/lookup (:run/world r))))
+            "the reviewer world is released")
+        (when exhaust? (is (= 1 (count @calls)) "the reviewer stops at its budget limit"))
+        (is (every? #(empty? (get-in % [:opts :tools])) @calls) "the model has no callable world tools")
+        (let [messages (:messages (first @calls))
+              task (some #(when (= :user (or (:role %) (:message/role %)))
+                            (or (:content %) (:message/content %))) messages)
+              evidence (edn/read-string {:default (fn [_ value] value)} task)]
+          (is (= "# A\n" (get-in evidence [:review/files "wiki/a.md" :text])))
+          (is (every? :pass? (:review/checks evidence)))
+          (is (map? (:review/fork-diff evidence)))
+          (is (= "Approve faithful wiki updates." (:review/instructions evidence))))
+        (when attack? (is (= 2 (count @calls)) "the unavailable write tool is refused"))
+        (when propose?
+          (is (= before (state)) "the reviewer leaves the retained fork's state token unchanged")
+          (is (= {"/wiki/a.md" "# A\n"} (catalog/read-tree fork "/wiki"))))
+        (is (= (if (or propose? (not= :approve (get-in rv [:review/verdict :review/verdict])))
+                 #{:room/diff :room/review}
+                 #{:room/diff :room/review :room/merge})
+               (set (map (comp :op second) @authorized))))
+        (doseq [[p _] @authorized]
+          (is (= (name (:id fork)) (:principal/room p)))
+          (is (= #{"room_diff" "room_review" "room_merge"} (:principal/tools p)))
+          (is (= {:id "delegation-1"} (:principal/delegation p))))
+        (when (and (not propose?) (= :approve (get-in rv [:review/verdict :review/verdict])) (not deny-merge?))
+          (is (= (:id parent)
+                 (some (fn [[_ request]]
+                         (when (= :merge (:action request))
+                           (keyword (get-in request [:resolved :room])))) @authorized)))
+          (is (= (name (:id fork))
+                 (some (fn [[_ request]]
+                         (when (= :merge (:action request)) (get-in request [:resolved :via-room]))) @authorized))))
+        (when-let [[p request] (first @authorized)]
+          (is (false? (:allow? (principal/decide dmn p request))) "the reviewer token is revoked"))
+        rv))))
+
+(deftest model-approval-merges
+  (let [rv (model-review! "rv-model-approve"
+                          (pr-str {:review/verdict :approve :review/reasons ["faithful"] :review/concerns []}))]
+    (is (= :merged (:review/decision rv)) (pr-str rv))))
+
+(deftest model-escalation-keeps-its-reasons
+  (let [rv (model-review! "rv-model-escalate"
+                          (pr-str {:review/verdict :escalate :review/reasons ["contradicts the source"]
+                                   :review/concerns ["unsupported claim"]}))]
+    (is (= :escalated (:review/decision rv)))
+    (is (some #{"contradicts the source"} (:review/reasons rv)))
+    (is (= ["unsupported claim"] (get-in rv [:review/verdict :review/concerns])))))
+
+(deftest model-garbage-escalates
+  (doseq [[suffix answer] [["garbage" "looks good"]
+                           ["trailing" "{:review/verdict :approve :review/reasons [] :review/concerns []} garbage"]
+                           ["shape" "{:review/verdict :approve :review/reasons \"yes\" :review/concerns []}"]]]
+    (is (= :escalated (:review/decision (model-review! (str "rv-model-" suffix) answer))))))
+
+(deftest model-cannot-write-the-reviewed-world
+  (is (= :escalated (:review/decision
+                     (model-review! "rv-model-readonly"
+                                    (pr-str {:review/verdict :approve :review/reasons [] :review/concerns []})
+                                    :propose? true :attack? true)))))
+
+(deftest model-merge-respects-the-host-authorizer
+  (is (= :escalated (:review/decision
+                     (model-review! "rv-model-denied"
+                                    (pr-str {:review/verdict :approve :review/reasons [] :review/concerns []})
+                                    :deny-merge? true)))))
+
+(deftest failed-checks-never-call-the-model-and-revoke-the-token
+  (let [[parent world] (room-with-fork "rv-model-check-fails" {} {"schedules.edn" "{}"})
+        spec (assoc-in wiki-only [:review/reviewer :model] "claude-haiku-4-5")
+        mint principal/mint-run-token!
+        token (atom nil)]
+    (with-redefs [principal/mint-run-token! (fn [opts] (reset! token (mint opts)))
+                  model-chat/chat (fn [& _] (throw (AssertionError. "model must not be called")))]
+      (let [reviewer (review/model-reviewer *daemon* parent (fork-id world) spec {})
+            rv (review/review! parent (fork-id world) spec :reviewer reviewer)]
+        (is (= :escalated (:review/decision rv)))
+        (is (empty? (run/runs parent)))
+        (is (nil? (principal/run-token-principal @token)))))))
+
+(deftest an-exhausted-model-reviewer-discards-its-world
+  (let [rv (model-review! "rv-model-exhausted" "" :exhaust? true :propose? true)]
+    (is (= :escalated (:review/decision rv)))
+    (is (some #(str/includes? % "Reviewer Run did not complete") (:review/reasons rv)))))
