@@ -384,3 +384,26 @@
         (is (nil? (durable-search room c-run)) "nothing was written for the mismatched member")
         (binding [ec/*execution-context* (:ctx room)]
           (is (some? (rreg/lookup (:world c))) "its own world is still held"))))))
+
+(deftest a-winner-settled-by-another-caller-is-recorded-as-it-ended
+  (with-room :search-competing-test
+    (fn [room]
+      (testing "a competing discard between release and merge"
+        (let [members (held room 2 search/speculative-effects)
+              outcome (with-redefs [forks/merge! (fn [fork & _]
+                                                   (forks/discard! fork)
+                                                   {:ok? false :error "lost the race"})]
+                        (search/select! room members {:policy :automatic}))
+              winner (some #(when (= :merge (:search/decision %)) %) (:search/members outcome))]
+          (is (= [:discarded :settled] ((juxt :search/outcome :search/status) winner)))
+          (is (nil? (:search/selected outcome)))))
+      (testing "a competing settlement still in progress stays pending"
+        (let [members (held room 2 search/speculative-effects)
+              outcome (with-redefs [forks/merge! (fn [fork & _]
+                                                   (swap! (:meta fork) assoc :dvergr.discourse/settlement-claim
+                                                          {:settlement {:op :merged} :active? true})
+                                                   {:ok? false :error "busy"})]
+                        (search/select! room members {:policy :automatic}))
+              winner (some #(when (= :merge (:search/decision %)) %) (:search/members outcome))]
+          (is (= :pending (:search/status winner)))
+          (is (nil? (:search/outcome winner))))))))

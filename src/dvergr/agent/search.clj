@@ -222,8 +222,16 @@
                            ;; its cleanup did not finish (the world is still
                            ;; registered): kept incomplete for the host
                            {:outcome :merged :status :incomplete :error (:error merged)}))
-                     ;; refused before merging: it waits in review for a person
-                     :else {:outcome :review :status :settled :error (:error merged)})))))))
+                     ;; another caller discarded it between release and merge
+                     (= :discarded (:op (d/settlement fork)))
+                     {:outcome :discarded :status :settled :error (:error merged)}
+                     ;; refused before merging, still there and unclaimed: it
+                     ;; waits in review for a person
+                     (and (rreg/lookup (:world member))
+                          (not (:active? (:dvergr.discourse/settlement-claim @(:meta fork)))))
+                     {:outcome :review :status :settled :error (:error merged)}
+                     ;; another settlement is in progress: reconciled on retry
+                     :else {:status :pending :error (:error merged)})))))))
 
 (defn- reconciled
   "The outcome of a member whose world was settled but not recorded (a failed
