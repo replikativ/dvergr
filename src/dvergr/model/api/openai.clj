@@ -205,6 +205,10 @@
         (-> state
             (assoc-in [:usage :input-tokens] (:prompt_tokens usage))
             (assoc-in [:usage :output-tokens] (:completion_tokens usage))
+            (cond-> (get-in usage [:prompt_tokens_details :cached_tokens])
+              (assoc-in [:usage :cache-read-tokens] (get-in usage [:prompt_tokens_details :cached_tokens])))
+            ;; with `include_usage` the usage comes once, after the last choice
+            (assoc :usage-final? true)
             (cond-> (:model event-data) (assoc :model (:model event-data)))
             (cond-> (:id event-data) (assoc :id (:id event-data))))
         state)))
@@ -250,6 +254,7 @@
        :reasoning (:reasoning state)
        :tool-calls (when tool-calls (vec tool-calls))
        :usage (:usage state)
+       :usage-final? (boolean (:usage-final? state))
        :stop-reason (:stop-reason state)
        :model (:model state)
        :id (:id state)}))

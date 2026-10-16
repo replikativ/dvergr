@@ -138,7 +138,14 @@ cancellable.
   (`dvergr.system.rooms/grant-permits?`: `:owner` and `:read-write`, or what the host's
   hook answers); otherwise the write throws before it is performed, and the handle is
   asked again at every write, so a grant downgraded or detached later holds at once. A KB
-  attached `:read` from another room therefore reads but never writes. The room's messages
+  attached `:read` from another room therefore reads but never writes. Hosts may set
+  `(dvergr.system.rooms/set-trunk-write-policy! (fn [room-id system-id] ...))`,
+  with registry room and system IDs. Returning `:fork-only` makes that system's trunk
+  handles read-only: writes fail with "this room's workflow writes through forks".
+  `nil` allows the usual grant checks; passing `nil` to the setter removes the hook.
+  There is no default policy. The check applies to held database handles, database
+  discovery, `room_write` file batches and sandbox/tool effect gates. Fork Rooms
+  (`dvergr.rooms.forks/fork?`) still write and merge under the room's grants. The room's messages
   store is never written through a handle, whatever its grant: messages go through
   `dvergr.room/post!`, which records the author. `(dvergr.room/databases)` says which is
   which (`:writable?`). `d/delete-database` deletes only a data DB the room holds as

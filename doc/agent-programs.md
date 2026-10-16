@@ -324,12 +324,16 @@ rather than trunk. `hire-in!` is the host boundary carrying those two Rooms;
 the SCI `hire!` closure and model-tool adapters resolve them automatically.
 
 An LLM-created sandbox can still build and revise arbitrary immutable rosters,
-but its `hire!` authority currently accepts only provider-free `:echo` and
-`:scripted` children. Generic resource vectors can already split recursively,
-and model spend is debited from the wallet once per charge (ids derived from
-the Run and model step); paid recursive LLM work stays closed until per-role
-attempt wallets bound it, since the provider's answer and its debit are still
-two writes. A top-level Room REPL has no such program-kind ceiling.
+but its `hire!` authority accepts provider-free `:echo` and `:scripted`
+children, and `:llm` children only when their `:resources` fund their provider
+calls: microdollars and model dispatch admissions
+(`dvergr.resource/funded-grant?`), split from the hiring Run's wallet. Such a
+child's calls are admitted from its own grant and each dispatch reserves a bound
+of its cost before it leaves (`dvergr.resource/reserve-dispatch!`), so the
+parent's grant bounds what the child can spend; what it leaves returns to the
+parent. Provider calls made from the Run's own sandbox (`llm/call`), and model
+candidates of an experiment it runs, stay closed. A top-level Room REPL has no
+such program-kind ceiling.
 
 The `spawn_agent` and `propose_change` model tools are convenience adapters over
 this same boundary. They construct a portable one-agent Roster, call `hire!`,

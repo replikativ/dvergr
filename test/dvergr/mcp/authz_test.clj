@@ -244,11 +244,14 @@
 (deftest a-run-token-pins-its-connection-server-side
   ;; the agent's credential decides its room and tools, not what its relay asks
   (reset! authorize (constantly true)) ; the pins alone decide here
-  (let [t (principal/mint-run-token! {:actor :worker :room "mcp-authz-open" :tools ["room_detail"]})
+  (let [t (principal/mint-run-token! {:actor :worker :room "mcp-authz-open" :tools ["room_detail"]
+                                      :claims {:principal/delegation "delegation/1" :principal/run "run/1"}})
         p (principal/run-token-principal t)
         c (session p {:dvergr/profile "admin" :dvergr/room "mcp-authz-closed"})]
     (try
       (is (= #{"room_detail"} (tool-names c)) "exactly its tools, whatever the profile")
+      (is (= -32602 (get-in (call-tool c "room_post" {:text "outside the pins"}) [:error :code]))
+          "claims do not allow calling a tool outside the pins")
       (let [r (call-tool c "room_detail" {})]
         (is (false? (get-in r [:result :isError])) (pr-str r))
         (is (= "mcp-authz-open" (get-in r [:result :structuredContent "id"])) "its room, not the one asked for"))

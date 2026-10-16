@@ -82,12 +82,13 @@
    cannot bypass delegation attenuation by choosing a different interface."
   [run-id supervisor]
   {:program-kinds #{:echo :scripted}
-   ;; Conserved vectors split recursively, and model calls are debited from the
-   ;; Run wallet (`resource/*spend-wallet*`, `charge-spend!`) under ids of
-   ;; their charge scope, so a retried step debits once. Provider usage and
-   ;; the Kontor receipt are still two writes (a crash between the provider's
-   ;; answer and the debit loses the debit), so paid recursive effects stay
-   ;; closed until per-role attempt wallets bound them.
+   ;; A child that calls providers is admitted only when its grant funds
+   ;; them (`resource/funded-grant?`): money and dispatch admissions split
+   ;; from this Run's wallet, which bound what it can spend, each dispatch's
+   ;; cost reserved before it leaves (doc/design/runs-as-worlds.md, Budgets
+   ;; as a tree). An unfunded child, an experiment's candidates, and provider
+   ;; calls made from this Run's own sandbox stay closed.
+   :funded-program-kinds #{:llm}
    :provider-effects? false
    :parent-run run-id
    ;; Process-local structured ownership. The sandbox may construct immutable
@@ -740,10 +741,8 @@
                    :room-id system-id
                    :room-runtime-id (:id work-room)
                    :room-incarnation (:incarnation work-room)
-                   ;; Paid model usage is debited once per charge, but the
-                   ;; provider's answer and its debit are two writes (see
-                   ;; `child-program-authority`). Permit only provider-free
-                   ;; child programs until attempt wallets bound them.
+                   ;; provider-free children, or children whose grant funds
+                   ;; their provider calls (`child-program-authority`)
                    :agent-program-ceiling (child-program-authority run-id supervisor)})]
     {:chat-ctx chat-ctx
      :owned-db? (nil? trace-db)}))

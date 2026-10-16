@@ -123,9 +123,13 @@
     :capabilities #{:tools :vision :streaming :system-prompt :cache-control}
     :context 200000
     :max-output 64000
-    ;; prompts up to 100,000 tokens; over that $0.50 / $2.50 (not modelled,
-    ;; as the other long-context rates are not)
+    ;; prompts up to 100,000 tokens; over that $0.50 / $2.50. The cache
+    ;; rates of the long band are not listed with it: they stand at the long
+    ;; input rate for reads and twice it for writes, which bounds them
     :pricing {:input 0.10 :output 0.50 :cache-read 0.01 :cache-write 0.125 :cache-write-1h 0.20}
+    :long-context {:above 100000
+                   :pricing {:input 0.50 :output 2.50 :cache-read 0.50
+                             :cache-write 1.0 :cache-write-1h 1.0}}
     :quirks {}}
 
    "claude-sonnet-5-5"
@@ -562,6 +566,19 @@
   "Get pricing info for a model."
   [model-id]
   (:pricing (get-model model-id)))
+
+(defn long-context-pricing
+  "The rates a request with `prompt-tokens` of input (cached ones included)
+   is billed at when that is above the model's `:long-context` threshold: the
+   long band applies to the whole request. nil otherwise."
+  [model-id prompt-tokens]
+  (when-let [{:keys [above pricing]} (and model-id prompt-tokens (:long-context (get-model model-id)))]
+    (when (> prompt-tokens above) pricing)))
+
+(defn highest-pricing
+  "The highest rate of each kind a model may bill at, over its bands."
+  [model-def]
+  (merge-with max (:pricing model-def) (get-in model-def [:long-context :pricing])))
 
 (defn context-window
   "Get the context window size for a model."

@@ -108,6 +108,7 @@
    Returns:
      {:cost-microdollars N :threshold-crossed? bool :threshold-level kw}"
   [chat-ctx resource-type amount & {:keys [model provider tool] :as opts}]
+  ;; `opts` may carry :prompt-tokens, for the pricing band (`acct/calculate-cost`)
   (let [cost (acct/calculate-cost resource-type amount opts)
         ;; Atomic threshold detection: the crossed threshold is computed INSIDE
         ;; the swap (pure) and read back from the resulting state — never via a
@@ -146,7 +147,8 @@
     ;; only reached the simmis billing path, never the room-turn rows.
     (when-let [conn (:db-conn chat-ctx)]
       (acct/record-usage! conn (:chat-id chat-ctx) resource-type amount
-                          :model model :provider provider :tool tool))
+                          :model model :provider provider :tool tool
+                          :prompt-tokens (:prompt-tokens opts)))
 
     ;; Return cost info
     (cond-> {:cost-microdollars cost}
@@ -164,8 +166,8 @@
      opts - {:model model-id} for cost calculation"
   ([chat-ctx type amount]
    (account-tokens! chat-ctx type amount {}))
-  ([chat-ctx type amount {:keys [model] :as opts}]
-   (account-usage! chat-ctx type amount :model model)))
+  ([chat-ctx type amount {:keys [model prompt-tokens]}]
+   (account-usage! chat-ctx type amount :model model :prompt-tokens prompt-tokens)))
 
 (defn add-message!
   "Add a message to the chat.

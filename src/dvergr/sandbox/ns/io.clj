@@ -595,16 +595,28 @@
                                      (mfs/write-string! filesystem path (str content) append?)
                                      (relative path))))}}}))))
 
+(defn- workspace-boundary [boundary workspace-resolver]
+  (if-not workspace-resolver
+    boundary
+    (fn []
+      (update (when boundary (boundary)) :handlers
+              #(into [(fn [effect next]
+                        (let [workspace (workspace-resolver)
+                              id ((requiring-resolve 'dvergr.system.rooms/connection-system-id)
+                                  (:conn workspace))]
+                          (next (cond-> effect id (assoc-in [:resource :system-id] id)))))]
+                     %)))))
+
 (defn add-fs-ns!
   "Expose a filesystem namespace backed by Muschel when `:filesystem` is
   supplied; otherwise retain the transitional physical adapter."
-  [sci-ctx & {:keys [filesystem filesystem-resolver] :as options}]
+  [sci-ctx & {:keys [filesystem filesystem-resolver workspace-resolver] :as options}]
   (if (or filesystem filesystem-resolver)
     (add-virtual-fs-ns! sci-ctx
                         (if filesystem-resolver
                           (world-filesystem filesystem-resolver)
                           filesystem)
-                        (:effects options))
+                        (workspace-boundary (:effects options) workspace-resolver))
     (apply add-physical-fs-ns! sci-ctx (mapcat identity options))))
 
 (defn- git-arg-refused! [msg data]
@@ -688,7 +700,8 @@
      (git/commit \"Add feature\")
      ;; => \"[main abc1234] Add feature\""
   [sci-ctx & {:keys [effects workspace workspace-resolver]}]
-  (let [run!      (if (or workspace workspace-resolver)
+  (let [effects (workspace-boundary effects (or workspace-resolver (when workspace (constantly workspace))))
+        run!      (if (or workspace workspace-resolver)
                     (fn [& args]
                       (let [workspace (if workspace-resolver
                                         (workspace-resolver)

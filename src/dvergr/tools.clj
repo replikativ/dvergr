@@ -7,6 +7,7 @@
             [datahike.api :as d]
             [dvergr.sandbox :as sandbox]
             [dvergr.effects :as effects]
+            [dvergr.system.rooms :as srooms]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.io.acquisition :as acquisition]
             [dvergr.agent.process :as proc]
@@ -407,7 +408,9 @@
    (let [content (if (bytes? content) content (str content))
          n (if (bytes? content) (alength ^bytes content) (alength (.getBytes ^String content "UTF-8")))]
      (effects/perform! (effect-boundary ctx)
-                       {:effect :fs/write :resource {:path (str path)}
+                       {:effect :fs/write :resource {:path (str path)
+                                                     :system-id (or (:system-id ctx)
+                                                                    (srooms/connection-system-id (get-in ctx [:workspace :conn])))}
                         ;; bytes are digested as they are (a byte array prints by identity)
                         :result-of (constantly (if (bytes? content)
                                                  (String. ^bytes content "ISO-8859-1")
@@ -431,7 +434,9 @@
   ([ctx path] (workspace-delete! ctx path {}))
   ([ctx path opts]
    (effects/perform! (effect-boundary ctx)
-                     {:effect :fs/delete :resource {:path (str path)}}
+                     {:effect :fs/delete :resource {:path (str path)
+                                                    :system-id (or (:system-id ctx)
+                                                                   (srooms/connection-system-id (get-in ctx [:workspace :conn])))}}
                      #(let [resolved (tool-path ctx path)]
                         (cond
                           (contains? opts :expect)
@@ -458,8 +463,10 @@
   "Transact `tx-data` into `conn` for a tool, through the effect boundary (a
    `:db/transact`, as a sandbox `datahike.api/transact` is)."
   [ctx conn tx-data]
-  (effects/perform! (effect-boundary ctx) (effects/transact-effect tx-data)
-                    #(d/transact conn tx-data)))
+  (let [system-id (srooms/connection-system-id conn)
+        effect (cond-> (effects/transact-effect tx-data)
+                 system-id (assoc-in [:resource :system-id] system-id))]
+    (effects/perform! (effect-boundary ctx) effect #(d/transact conn tx-data))))
 
 (defn- virtual-walk [filesystem root]
   (letfn [(walk [path]
@@ -557,7 +564,22 @@
   "The boundary for effects performed on behalf of the tool context `ctx`:
    its `:effect-boundary` when the caller set one, else its chat's."
   [ctx]
-  (or (:effect-boundary ctx) (tool-boundary ctx)))
+  (let [boundary (or (:effect-boundary ctx) (tool-boundary ctx))]
+    (fn []
+      (let [b (when boundary (boundary))
+            room (or (:room ctx) (:control-room ctx) (:authz-room ctx))
+            world (or (:ctx room) (:execution-ctx ctx) (get-in ctx [:chat-ctx :spindel-ctx]))]
+        (update b :handlers (fnil conj [])
+                (fn [effect next]
+                  (let [reason (when world
+                                 (binding [rtc/*execution-context* (runtime-ctx/selected-context world)]
+                                   (if room
+                                     (srooms/room-effect-write-refusal room effect)
+                                     (srooms/effect-write-refusal
+                                      (or (:room-id ctx) (get-in ctx [:chat-ctx :room-id])) effect))))]
+                    (if reason
+                      (effects/deny! effect :trunk-write-policy reason)
+                      (next effect)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Principal authorization (dvergr.principal): who runs a tool, on which room
@@ -2099,17 +2121,34 @@ Note: changes take effect on the next agent restart or reload."
     minimal-coding-tools
     minimal-readonly-tools))
 
-(defn- enforce-delegation-authority! [ceiling program-kind]
-  (when-let [allowed (:program-kinds ceiling)]
-    (when-not (contains? allowed program-kind)
-      (throw (ex-info "Child program exceeds this execution's delegation authority"
-                      {:type ::program-ceiling-exceeded
-                       :program-kind program-kind
-                       :allowed-program-kinds allowed}))))
-  (when (and (= :llm program-kind)
-             (false? (:provider-effects? ceiling)))
-    (throw (ex-info "Child model spend requires delegated provider-effect authority"
-                    {:type ::provider-effects-disallowed}))))
+(defn- enforce-delegation-authority!
+  "A child of `program-kind` granted `resources` is within `ceiling`: a kind
+   it allows, or one it allows when the grant funds provider calls
+   (`:funded-program-kinds`, `resource/funded-grant?`)."
+  [ceiling program-kind resources]
+  (let [funded? (and (contains? (:funded-program-kinds ceiling) program-kind)
+                     ((requiring-resolve 'dvergr.resource/funded-grant?) resources))]
+    (when-let [allowed (:program-kinds ceiling)]
+      (when-not (or (contains? allowed program-kind) funded?)
+        (throw (ex-info "Child program exceeds this execution's delegation authority"
+                        {:type ::program-ceiling-exceeded
+                         :program-kind program-kind
+                         :allowed-program-kinds allowed
+                         :funded-program-kinds (:funded-program-kinds ceiling)}))))
+    (when (and (= :llm program-kind)
+               (false? (:provider-effects? ceiling))
+               (not funded?))
+      (throw (ex-info "Child model spend requires a grant that funds it: microdollars and model dispatches"
+                      {:type ::provider-effects-disallowed})))))
+
+(def ^:private default-delegate-model-steps
+  "Model steps a delegated child may take."
+  32)
+
+(def ^:private delegate-dispatches-per-step
+  "Dispatch admissions a delegated child is granted per model step: a step
+   may be asked again when its stream breaks."
+  2)
 
 (defn- delegate-agent!
   [{:keys [task profile budget]}
@@ -2122,14 +2161,21 @@ Note: changes take effect on the next agent restart or reload."
         profile-name (or profile "worker")
         prompt-text  (or (load-agent-profile profile-name)
                          "You are a capable AI worker. Complete the given task thoroughly.")
-        program-kind :llm]
+        program-kind :llm
+        ;; inside a paid Run the child is funded from its wallet: its budget
+        ;; and admissions for its model steps (`child-program-authority`)
+        resources    (when (:funded-program-kinds agent-program-ceiling)
+                       {@(requiring-resolve 'dvergr.resource/microdollars)
+                        (bigdec (Math/round (* 1e6 (double (or budget 0.50)))))
+                        @(requiring-resolve 'dvergr.resource/model-dispatches)
+                        (bigdec (* delegate-dispatches-per-step default-delegate-model-steps))})]
     (when-not (and room control-room)
       (throw (ex-info "Agent delegation requires a current discourse Room"
                       {:type ::no-delegation-room})))
     (when-not ctx
       (throw (ex-info "Agent delegation requires a Spindel execution context"
                       {:type ::no-delegation-context})))
-    (enforce-delegation-authority! agent-program-ceiling program-kind)
+    (enforce-delegation-authority! agent-program-ceiling program-kind resources)
     (let [model-policy (or model-policy
                            ((requiring-resolve 'dvergr.model.providers/default-spec))
                            (throw (ex-info "No LLM provider is available for delegated work"
@@ -2150,14 +2196,16 @@ Note: changes take effect on the next agent restart or reload."
                          :model-policy model-policy
                          :metadata {:profile profile-name :adapter :model-tool}
                          :program {:kind :llm
-                                   :budget-dollars (or budget 0.50)}})
+                                   :budget-dollars (or budget 0.50)
+                                   :max-model-steps default-delegate-model-steps}})
           handle       (binding [rtc/*execution-context* ctx]
                          (let [admit-child!
                                #(hire-in! control-room room roster agent-id
                                           (cond-> {:task task
                                                    :from (or actor :spawn-agent)
                                                    :settlement settlement}
-                                            run-id (assoc :parent-run run-id)))]
+                                            run-id (assoc :parent-run run-id)
+                                            resources (assoc :resources resources)))]
                            (if-let [own-child! (:own-child! agent-program-ceiling)]
                              (own-child! admit-child!)
                              (admit-child!))))]

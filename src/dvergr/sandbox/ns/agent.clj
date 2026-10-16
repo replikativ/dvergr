@@ -554,14 +554,20 @@
                              (throw (ex-info
                                      "Deferred settlement is reserved for trusted host policies"
                                      {:type ::deferred-settlement-forbidden})))
+                           ;; a kind the ceiling allows, or one it allows when
+                           ;; the grant funds provider calls (`resource/funded-grant?`)
                            (when (and allowed-kinds
-                                      (not (contains? allowed-kinds kind)))
+                                      (not (contains? allowed-kinds kind))
+                                      (not (and (contains? (:funded-program-kinds agent-program-ceiling) kind)
+                                                ((requiring-resolve 'dvergr.resource/funded-grant?)
+                                                 (:resources opts)))))
                              (throw (ex-info
                                      "Child program exceeds this sandbox's delegation ceiling"
                                      {:type ::program-ceiling-exceeded
                                       :agent-ref agent-ref
                                       :program-kind kind
-                                      :allowed-program-kinds allowed-kinds})))
+                                      :allowed-program-kinds allowed-kinds
+                                      :funded-program-kinds (:funded-program-kinds agent-program-ceiling)})))
                            (when (and ambient-parent
                                       (contains? opts :parent-run)
                                       (not= ambient-parent (:parent-run opts)))
@@ -860,15 +866,22 @@
         ;; its size is what a quota counts: the frontmatter and the body (an
         ;; upper bound of the rendered file)
         utf8        (fn [x] (alength (.getBytes (str x) "UTF-8")))
+        skill-resource (fn [skill-name]
+                         (let [workspace (when (ec/execution-context-bound?)
+                                           ((requiring-resolve 'dvergr.substrate.geschichte/current-workspace)))
+                               id ((requiring-resolve 'dvergr.system.rooms/connection-system-id)
+                                   (:conn workspace))]
+                           (cond-> {:path (str "skills/" skill-name ".md")}
+                             id (assoc :system-id id))))
         skill-write (fn [skill-name frontmatter body]
-                      {:effect :fs/write :resource {:path (str "skills/" skill-name ".md")}
+                      {:effect :fs/write :resource (skill-resource skill-name)
                        :bytes (+ (utf8 (pr-str frontmatter)) (utf8 body))})
         ;; promoting rewrites the room skill's file: its size, read here
         ;; (reads are free); unknown when there is no such skill, which then
         ;; fails before writing
         promote-write (fn [skill-name by date]
                         (let [d (try (get (load-all* (room-repo)) (str skill-name)) (catch Throwable _ nil))]
-                          (cond-> {:effect :fs/write :resource {:path (str "skills/" skill-name ".md")}}
+                          (cond-> {:effect :fs/write :resource (skill-resource skill-name)}
                             d (assoc :bytes (+ (:bytes (skill-write skill-name (dissoc d :body) (:body d)))
                                                (utf8 (str "vetted_by: " by "\nvetted_at: " date "\n")))))))]
     (sci/add-namespace! sci-ctx 'dvergr.skills

@@ -695,9 +695,10 @@
    the world's handler configuration (outside the binding's), `:world-sink`,
    returning the world's receipt sink (receipts go there too), and
    `:relations`, returning the room relations for the authority filter the
-   runtime adds for every agent. Any may be nil."
+   runtime adds for every agent, and `:write-refusal`, a host function from
+   effect to a refusal reason or nil. Any may be nil."
   ([binding-resolver sink] (boundary-resolver binding-resolver sink {}))
-  ([binding-resolver sink {:keys [relations world world-sink]}]
+  ([binding-resolver sink {:keys [relations world world-sink write-refusal]}]
    (fn []
      (let [b (when binding-resolver (binding-resolver))
            agent-id (:agent-id b)
@@ -707,4 +708,8 @@
        {:sink sink
         :subject subject
         :handlers (into [(receipts [sink (when world-sink (world-sink))] subject)]
-                        (handlers specs {:subject subject :relations relations}))}))))
+                        (cond-> (handlers specs {:subject subject :relations relations})
+                          write-refusal (conj (fn [effect next]
+                                                (if-let [reason (write-refusal effect)]
+                                                  (deny! effect :trunk-write-policy reason)
+                                                  (next effect))))))}))))

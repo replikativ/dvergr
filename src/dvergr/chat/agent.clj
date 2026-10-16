@@ -324,20 +324,24 @@
           ;; report it) is billed at its own rate, apart
           cache-read (long (or (:cache-read-tokens usage) 0))
           cache-write (long (or (:cache-creation-tokens usage) (:cache-write-tokens usage) 0))
+          ;; the part of the writes kept an hour, at its own rate
+          hour (min cache-write (long (or (:cache-write-1h-tokens usage) 0)))
           _ (when (pos? cache-read)
-              (chat-ctx/account-tokens! chat-ctx :cache-read-tokens cache-read {:model model}))
-          _ (when (pos? cache-write)
-              (chat-ctx/account-tokens! chat-ctx :cache-creation-tokens cache-write {:model model}))
+              (chat-ctx/account-tokens! chat-ctx :cache-read-tokens cache-read {:model model :prompt-tokens (:input-tokens usage)}))
+          _ (when (pos? (- cache-write hour))
+              (chat-ctx/account-tokens! chat-ctx :cache-creation-tokens (- cache-write hour) {:model model :prompt-tokens (:input-tokens usage)}))
+          _ (when (pos? hour)
+              (chat-ctx/account-tokens! chat-ctx :cache-write-1h-tokens hour {:model model :prompt-tokens (:input-tokens usage)}))
           input-result (when (:input-tokens usage)
                          (chat-ctx/account-tokens! chat-ctx
                                                    :input-tokens
                                                    (max 0 (- (long (:input-tokens usage)) cache-read cache-write))
-                                                   {:model model}))
+                                                   {:model model :prompt-tokens (:input-tokens usage)}))
           output-result (when (:output-tokens usage)
                           (chat-ctx/account-tokens! chat-ctx
                                                     :output-tokens
                                                     (:output-tokens usage)
-                                                    {:model model}))
+                                                    {:model model :prompt-tokens (:input-tokens usage)}))
 
           ;; Inject threshold warnings as system messages
           _ (doseq [result [input-result output-result]
