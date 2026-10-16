@@ -1377,6 +1377,10 @@
                                   (atom (assoc (dissoc @(:meta room) :dvergr/owned-listeners
                                                        ::settlement-claim ::settled)
                                                :forked-from (:id room)
+                                               ;; the durable room whose grants
+                                               ;; govern every fork below it
+                                               :origin-slug (or (:origin-slug @(:meta room))
+                                                                (:slug room))
                                                :conversation-id conv-id))
                                   (when fork-handle (atom fork-handle))
                                   (random-uuid))
@@ -2294,11 +2298,13 @@
   ([parent fork] (merge-room parent fork {}))
   ([parent fork {:keys [merge-opts]}]
    (assert-settlement-released! fork :merge)
-   ;; a merge writes the parent's systems: only those the parent room's grants
+   ;; a merge writes the parent's systems: only those the grants of the
+   ;; durable room (the parent, or the room a parent fork descends from)
    ;; permit it to write, checked now (a grant may have been downgraded or
    ;; detached since the fork wrote), before the fork is claimed
    (when (fork-handle fork)
-     (srooms/assert-merge-permitted! (:slug parent) (:ctx fork)))
+     (srooms/assert-merge-permitted! (or (some-> parent :meta deref :origin-slug) (:slug parent))
+                                     (:ctx fork)))
    (let [claim (claim-settlement! fork {:op :merged :parent (:id parent)})]
      (when (map? claim)
        (let [{:keys [settlement in-progress?]} (lost-to fork claim)]

@@ -135,10 +135,11 @@
   (testing "and A still reads it"
     (in-room :b #(dh/transact (srooms/room-kb-conn (get-in @world [:b :room-id]))
                               [{:entity/title "b-note"}]))
-    (is (= {:ok #{"b-note"}}
-           (ev "(set (d/q '[:find [?t ...] :where [_ :entity/title ?t]] @(room/db \"room-b-kb\")))")))
-    (is (= {:ok #{"b-note"}}
-           (ev "(set (d/q '[:find [?t ...] :where [_ :entity/title ?t]] @(d/connect {:store {:id \"room-b-kb\"}})))")))
+    ;; B's KB is shared by the tests of this namespace: ask for this test's note
+    (is (= {:ok true}
+           (ev "(contains? (set (d/q '[:find [?t ...] :where [_ :entity/title ?t]] @(room/db \"room-b-kb\"))) \"b-note\")")))
+    (is (= {:ok true}
+           (ev "(contains? (set (d/q '[:find [?t ...] :where [_ :entity/title ?t]] @(d/connect {:store {:id \"room-b-kb\"}}))) \"b-note\")")))
     (is (= {:ok [false :read]}
            (ev "((juxt :writable? :permission) (first (filter #(= \"room-b-kb\" (:name %)) (room/databases))))")))))
 
@@ -226,24 +227,46 @@
     (sdb/attach! room-uuid (:kb-id c) :read-write)
     (binding [rtc/*execution-context* (:ctx room)]
       (#'srooms/register-system-into-current! {:system/type :kb :system/scope (:kb-path c)}))
+    (in-room :c #(dh/transact (srooms/room-kb-conn (get-in @world [:c :room-id]))
+                              [{:entity/title "c-victim"}]))
     (try
-      (let [fork (fork-of)
-            in-fork (sandbox-in (:ctx fork))
-            in-room (sandbox-in (:ctx room))]
-        (is (= {:ok 2} (in-fork "(count (:tx-data (d/transact (room/db \"room-c-kb\") [{:entity/title \"c-from-fork\"}])))")))
-        (sdb/attach! room-uuid (:kb-id c) :read)
-        (let [r (in-room (str "(room/merge! \"merger\" " (pr-str (:slug fork)) ")"))]
-          (is (re-find #"may not write" (str (:err r))) (pr-str r)))
-        (is (not (contains? (titles :c) "c-from-fork")) "C's KB is unchanged")
-        (testing "the refused fork can still be discarded"
-          (is (= {:ok (:slug fork)} (in-room (str "(:slug (room/discard! " (pr-str (:slug fork)) "))")))))
+      (let [in-room (sandbox-in (:ctx room))
+            refused-merge (fn [code]
+                            (sdb/attach! room-uuid (:kb-id c) :read-write)
+                            (let [fork (fork-of)
+                                  in-fork (sandbox-in (:ctx fork))]
+                              (is (:ok (in-fork code)) code)
+                              (sdb/attach! room-uuid (:kb-id c) :read)
+                              (let [r (in-room (str "(room/merge! \"merger\" " (pr-str (:slug fork)) ")"))]
+                                (is (re-find #"may not write" (str (:err r))) (pr-str r)))
+                              (testing "the refused fork can still be discarded"
+                                (is (= {:ok (:slug fork)}
+                                       (in-room (str "(:slug (room/discard! " (pr-str (:slug fork)) "))")))))))]
+        (testing "a fork that added to C's KB"
+          (refused-merge "(d/transact (room/db \"room-c-kb\") [{:entity/title \"c-from-fork\"}])")
+          (is (not (contains? (titles :c) "c-from-fork")) "C's KB is unchanged"))
+        (testing "a fork that only retracted from C's KB"
+          (refused-merge "(d/transact (room/db \"room-c-kb\") [[:db/retractEntity [:entity/title \"c-victim\"]]])")
+          (is (contains? (titles :c) "c-victim") "C's KB is unchanged"))
         (testing "a fork that writes only what the room may write merges"
           (let [fork (fork-of)
                 in-fork (sandbox-in (:ctx fork))]
             (is (= {:ok 2} (in-fork "(count (:tx-data (d/transact room/*kb* [{:entity/title \"own-from-fork\"}])))")))
             (is (= {:ok :merger} (in-room (str "(:id (room/merge! \"merger\" " (pr-str (:slug fork)) "))"))))
             (is (= {:ok #{"own-from-fork"}}
-                   (in-room "(set (d/q '[:find [?t ...] :where [_ :entity/title ?t]] @room/*kb*))"))))))
+                   (in-room "(set (d/q '[:find [?t ...] :where [_ :entity/title ?t]] @room/*kb*))")))))
+        (testing "and so does a fork of a fork, into it: the durable room's grants govern"
+          (let [fork (fork-of)
+                in-fork (sandbox-in (:ctx fork))
+                nested (binding [rtc/*execution-context* (:ctx fork)]
+                         (discourse/fork-room fork {:isolation :ctx}))
+                in-nested (sandbox-in (:ctx nested))]
+            (is (= {:ok 2} (in-nested "(count (:tx-data (d/transact room/*kb* [{:entity/title \"own-from-nested\"}])))")))
+            (is (= {:ok (:id fork)}
+                   (in-fork (str "(:id (room/merge! " (pr-str (:slug fork)) " " (pr-str (:slug nested)) "))"))))
+            (is (= {:ok true}
+                   (in-fork "(contains? (set (d/q '[:find [?t ...] :where [_ :entity/title ?t]] @room/*kb*)) \"own-from-nested\")")))
+            (in-room (str "(room/discard! " (pr-str (:slug fork)) ")")))))
       (finally
         (binding [rtc/*execution-context* (:ctx room)]
           (try (governance/ungovern! (:conn (:store room))) (catch Throwable _))

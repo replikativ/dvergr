@@ -756,15 +756,31 @@
                        (when room-id (sdb/systems-for-room room-id)))]
     (fn [sid] (or (contains? writable sid) (not (contains? registry sid))))))
 
+(defn- delta-changed?
+  "Whether a fork's merge-base delta of one system (`ygg/context-diff`)
+   changes it: datoms added or retracted, files changed, intents to settle.
+   A delta that is an error, or of a shape not known here, counts as a
+   change."
+  [delta]
+  (cond
+    (nil? delta) false
+    (:error delta) true
+    (contains? delta :intents) (boolean (seq (:intents delta)))
+    (contains? delta :files) (boolean (seq (:files delta)))
+    (contains? delta :summary) (let [{:keys [added-datoms removed-datoms]} (:summary delta)]
+                                 (or (pos? (long (or added-datoms 0)))
+                                     (pos? (long (or removed-datoms 0)))))
+    :else true))
+
 (defn assert-merge-permitted!
   "Throws when merging the `:ctx` fork whose context is `fork-ctx` into the
    room `room-id` would change a system the room may not write
    (`system-write-check`): a fork may have written a KB while the room's grant
    permitted it, and the grant was downgraded or detached since. Only a
-   system the fork changed counts (its fork-vs-parent delta is not trivial,
-   `dvergr.rooms.forks/classify`); a delta that cannot be computed counts as
-   a change. Nothing is diffed when every system in the fork may be written.
-   The room is named by its `slug`, as the live Room carries it."
+   system the fork changed counts (`delta-changed?` on its merge-base delta,
+   retractions included); a delta that cannot be computed counts as a
+   change. Nothing is diffed when every system in the fork may be written.
+   The room is named by its `slug`: the durable room's, for a fork of a fork."
   [slug fork-ctx]
   (let [room-id (some-> slug sdb/room-by-slug :room/id)
         may-write? (system-write-check room-id)
@@ -772,8 +788,7 @@
                   (into #{} (remove may-write?) (keys (ygg/registered-systems))))]
     (when (seq blocked)
       (let [diff (ygg/context-diff fork-ctx)
-            classify (requiring-resolve 'dvergr.rooms.forks/classify)
-            changed (filterv #(not= :trivial (classify {% (get diff %)} nil)) (sort blocked))]
+            changed (filterv #(delta-changed? (get diff %)) (sort blocked))]
         (when (seq changed)
           (throw (ex-info (str "The fork changed databases this room may not write (its grant does "
                                "not permit writes, or they were detached): " (pr-str changed)

@@ -290,6 +290,9 @@
         room-wallet (kontor/account-ref (resource/room-wallet-id (:id room)))
         smc-infer @(requiring-resolve 'org.replikativ.foerster.core/smc-infer)
         spin* (requiring-resolve 'org.replikativ.spindel.core/spin)
+        ;; the model below is `eval`ed: the namespaces it names must be
+        ;; loaded, whichever test namespaces ran before in this JVM
+        _ (require 'org.replikativ.foerster.effects 'org.replikativ.foerster.dist)
         payer (do (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 100M}})
                   (resource/room-spend-wallet room))
         model (fn []
