@@ -409,7 +409,9 @@
     :run/interpreter-version :run/agent-def-hash :run/chat-id
     ;; resuming (doc/runs.md, Resuming a Run): the latest portable savepoint, as EDN,
     ;; and the Run that continued from it
-    :run/savepoint :run/resumed-by})
+    :run/savepoint :run/resumed-by
+    ;; a search's record on each member (dvergr.agent.search), as EDN
+    :run/search})
 
 (def immutable-run-keys
   [:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
