@@ -370,3 +370,17 @@
         (let [again (search/select! room members {:policy :automatic :search-id id})]
           (is (some #(= [:merged :settled] ((juxt :search/outcome :search/status) %)) (:search/members again))
               "the merged world is settled from the evidence kept before the store failed"))))))
+
+(deftest a-world-is-checked-against-its-run-before-anything-is-written
+  (with-room :search-evidence-mismatch-test
+    (fn [room]
+      (let [[a b] (held room 2 search/speculative-effects)
+            settled (search/select! room [a b] {:policy :automatic})
+            merged-world (:world (some #(when (= :merged (:search/outcome %)) %) (:search/members settled)))
+            [c] (held room 1 search/speculative-effects)
+            c-run (get-in c [:attempt :attempt/receipt :attempt/run-id])]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not its Run's world"
+                              (search/select! room [(assoc c :world merged-world)] {:policy :automatic})))
+        (is (nil? (durable-search room c-run)) "nothing was written for the mismatched member")
+        (binding [ec/*execution-context* (:ctx room)]
+          (is (some? (rreg/lookup (:world c))) "its own world is still held"))))))

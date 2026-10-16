@@ -286,6 +286,13 @@
                   (when (not= known (set run-ids))
                     (throw (ex-info "A search id names one set of members"
                                     {:type ::incompatible-retry :search/id search-id}))))
+              ;; a member's world is its Run's, checked before anything is
+              ;; written (reconciliation reads evidence by world)
+              _ (doseq [[m rid] (map vector members run-ids)
+                        :let [durable (durable-run room rid)]]
+                  (when-not (and durable (= (:world m) (:run/world durable)))
+                    (throw (ex-info (str "Search member " rid ": the world is not its Run's world")
+                                    {:type ::not-held :run/id rid :world (:world m)}))))
               records #(mapv (fn [m] (some-> (durable-run room (run-id-of m)) run/search-record)) members)
               prior (records)
               manifest (some #(when (= search-id (:search/id %)) (:search/manifest %)) prior)
