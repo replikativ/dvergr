@@ -97,7 +97,7 @@
         ;; 0.1.113: SCI code gets an opaque name for its world, not the
         ;; ExecutionContext; clojure.lang.Var/Namespace are closed classes;
         ;; bound-fn runs in the fork it is called in (#121).
-        org.replikativ/spindel     {:mvn/version "0.1.122"}
+        org.replikativ/spindel     {:mvn/version "0.1.126"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,
@@ -140,7 +140,7 @@
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.3.46 merges a diverged Geschichte overlay three-way (#24): a fork
         ;; whose parent gained a commit meanwhile merges instead of fencing.
-        org.replikativ/yggdrasil   {:mvn/version "0.3.48"
+        org.replikativ/yggdrasil   {:mvn/version "0.3.49"
                                     :exclusions  [org.babashka/sci]}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
