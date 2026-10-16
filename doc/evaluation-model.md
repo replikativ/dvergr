@@ -321,6 +321,8 @@ the receipt's `:resources` reports spend per role.
 - The environment's own cost is visible separately.
 - The total is bounded by the caller's grant, so recursion cannot overspend.
 
+Attempt wallets are one instance of the general budget tree in [design/runs-as-worlds.md](design/runs-as-worlds.md#budgets-as-a-tree): funded child Runs with a role and a split declared by the parent, which is also how searches, experiments and optimizers divide a budget.
+
 (tau2 today budgets only the candidate's chat; with a Run wallet, the
 customer's calls come out of that same wallet and the judge's out of the
 caller's.)
