@@ -16,6 +16,7 @@
             [geschichte.repo :as repo]
             [clojure.string :as str]
             [hasch.core :as hasch]
+            [muschel.fs :as mfs]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [yggdrasil.protocols :as yp]))
@@ -219,7 +220,7 @@
   (when (ctx-fork? fork)
     (ygg/context-conflicts (:ctx fork))))
 
-(defn delta-trivial?
+(defn- delta-trivial?
   "Did the FORK contribute nothing meaningful in this system? Duck-typed over
    the yggdrasil diff records (GitDiff :files, DatahikeDiff :summary, DiffError).
 
@@ -325,33 +326,69 @@
               (some-> (repo/commit! conn {:message message :author (configured-author conn)})
                       :geschichte.commit/id str))))))))
 
+(defn- refuse-dirty-parent! [parent]
+  (when-let [dirty (workspace-changes parent)]
+    (throw (ex-info (str "The parent " (name (:id parent)) " has uncommitted changes ("
+                         (str/join ", " (take 5 dirty)) (when (< 5 (count dirty)) ", …")
+                         "); commit or discard them before merging a fork into it")
+                    {:type ::parent-dirty :parent (:id parent) :uncommitted dirty}))))
+
 (defn- prepare-workspaces!
   "Make `fork` mergeable into `parent`: commit the fork's work (a merge adopts
    commits only), and refuse a parent with uncommitted changes here, before
    the merge fences the fork (geschichte refuses a merge into a dirty
    workspace, and that refusal left the fork fenced, unmergeable)."
   [parent fork]
-  (when-let [dirty (workspace-changes parent)]
-    (throw (ex-info (str "The parent " (name (:id parent)) " has uncommitted changes ("
-                         (str/join ", " (take 5 dirty)) (when (< 5 (count dirty)) ", …")
-                         "); commit or discard them before merging a fork into it")
-                    {:type ::parent-dirty :parent (:id parent) :uncommitted dirty})))
+  (refuse-dirty-parent! parent)
   (commit-workspace! fork (str "Work of fork " (name (:id fork)))))
+
+(defn porcelain-paths
+  "The paths of `git status --porcelain` lines (a rename names both)."
+  [lines]
+  (mapcat (fn [line]
+            (let [line (str line)]
+              (map str/trim (str/split (subs line (min 3 (count line))) #" -> "))))
+          lines))
+
+(defn- sha256 [^bytes bs]
+  (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256") bs)]
+    (apply str (map #(format "%02x" (bit-and (int %) 0xff)) d))))
+
+(defn- dirty-digest
+  "What the uncommitted paths of `room`'s workspace hold: `[path digest]`
+   sorted, a directory by everything under it, a removed path `:absent`. nil
+   when the workspace is clean."
+  [room]
+  (when-let [changes (workspace-changes room)]
+    (binding [ec/*execution-context* (:ctx room)]
+      (let [fs (git/filesystem)
+            digest (fn digest [p]
+                     (try
+                       (cond (not (mfs/exists? fs p)) [[p :absent]]
+                             (= :directory (:type (mfs/stat fs p)))
+                             (mapcat #(digest (str (str/replace p #"/+$" "") "/" (if (map? %) (:name %) %)))
+                                     (sort-by #(if (map? %) (:name %) (str %)) (mfs/list-dir fs p)))
+                             :else [[p (sha256 (mfs/read-bytes fs p))]])
+                       (catch Throwable _ [[p :unreadable]])))]
+        (vec (sort-by first (mapcat #(digest (str "/" (str/replace % #"/+$" ""))) (porcelain-paths changes))))))))
 
 (defn state-token
   "A content hash of `fork`'s state: its mergeable systems' snapshot ids
-   (workspace commit, datahike commit, …). It changes whenever the fork does,
-   so a merge can be pinned to the state that was reviewed (the `room_merge`
-   op's `expect-state`, `dvergr.ops` `:room/merge`). nil for
-   non-`:ctx` forks."
+   (workspace commit, datahike commit, …) and what its uncommitted files hold
+   (a merge commits them). It changes whenever the fork does, so a merge can
+   be pinned to the state that was reviewed (the `room_merge` op's
+   `expect-state`, `dvergr.ops` `:room/merge`; `merge!` checks it inside the
+   merge). nil for non-`:ctx` forks."
   [fork]
   (when (ctx-fork? fork)
-    (binding [ec/*execution-context* (:ctx fork)]
-      (str (hasch/uuid
-            (into (sorted-map)
-                  (for [[sid sys] (ygg/registered-systems)
-                        :when (satisfies? yp/Mergeable sys)]
-                    [(str sid) (str (yp/snapshot-id sys))])))))))
+    (let [dirty (dirty-digest fork)]
+      (binding [ec/*execution-context* (:ctx fork)]
+        (str (hasch/uuid
+              (cond-> (into (sorted-map)
+                            (for [[sid sys] (ygg/registered-systems)
+                                  :when (satisfies? yp/Mergeable sys)]
+                              [(str sid) (str (yp/snapshot-id sys))]))
+                dirty (assoc "workspace/uncommitted" dirty))))))))
 
 (defn review
   "Everything a reviewer (agent or human) needs to decide a merge:
@@ -369,16 +406,42 @@
       {:tier (if (and (= :trivial tier) (seq uncommitted)) :reviewable tier)
        :diff diff :conflicts conf :uncommitted (vec uncommitted) :state state})))
 
+(defn- pinned
+  "A `discourse/merge-room` guard: inside the merge (the fork's work closed
+   and drained), under the fork's workspace lock (no write between the check
+   and the merge), the fork must still be in `expect-state`; then its
+   uncommitted files are committed and the substrate merged."
+  [fork expect-state]
+  (fn [merge-substrate!]
+    (binding [ec/*execution-context* (:ctx fork)]
+      (let [check-and-merge
+            (fn []
+              (let [now (state-token fork)]
+                (when (not= expect-state now)
+                  (throw (ex-info (str "Fork " (name (:id fork)) " changed since it was reviewed"
+                                       " (reviewed " expect-state ", now " now "); review it again")
+                                  {:type ::fork-changed :expected expect-state :actual now}))))
+              (commit-workspace! fork (str "Work of fork " (name (:id fork))))
+              (merge-substrate!))]
+        (if-let [ws (git/current-workspace)]
+          (locking (git/workspace-lock (:conn ws)) (check-and-merge))
+          (check-and-merge))))))
+
 (defn merge!
-  "Merge a fork into its parent (`discourse/merge-room`). Returns
-   {:ok? true :parent-slug ...} or {:ok? false :error ...}."
-  [fork]
+  "Merge a fork into its parent (`discourse/merge-room`). With
+   `:expect-state` (a `state-token`), only if the fork is still in that state,
+   checked inside the merge. Returns {:ok? true :parent-slug ...} or {:ok?
+   false :error ...}."
+  [fork & {:keys [expect-state]}]
   (try
     (require-settleable! fork :merge)
     (if-let [parent (rreg/lookup (:parent-id fork))]
       (let [run-id (some-> fork :meta deref :run-id)]
-        (prepare-workspaces! parent fork)
-        (d/merge-room parent fork)
+        (if expect-state
+          (do (refuse-dirty-parent! parent)
+              (d/merge-room parent fork {:guard (pinned fork expect-state)}))
+          (do (prepare-workspaces! parent fork)
+              (d/merge-room parent fork)))
         (when run-id
           (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :merged :review-approved))
         {:ok? true :parent-slug (:slug parent) :parent-id (:id parent)})
@@ -500,8 +563,9 @@
    No conflicts → a clean identity-keyed union (`merge!`). Conflicts → the agent
    picks OURS/THEIRS per field; we force past the conflict guard, then override
    the chosen fields in the parent. Returns
-   {:ok? true :reconciled N :resolutions [...] :rationale …} or {:ok? false :error}."
-  [fork]
+   {:ok? true :reconciled N :resolutions [...] :rationale …} or {:ok? false :error}.
+   `:expect-state` pins it as in `merge!`."
+  [fork & {:keys [expect-state]}]
   (let [conflicts (vec (fork-conflicts fork))
         ;; a book settling by replay conflicts on CLAIMS (a bank line, an
         ;; invoice both sides booked): no field to pick a side of, and forcing
@@ -516,16 +580,17 @@
        :book-conflicts claims}
 
       (empty? conflicts)
-      (merge! fork)
+      (merge! fork :expect-state expect-state)
 
       :else
       (if-let [parent (rreg/lookup (:parent-id fork))]
         (try
-          (prepare-workspaces! parent fork)
+          (if expect-state (refuse-dirty-parent! parent) (prepare-workspaces! parent fork))
           (let [call        (requiring-resolve 'dvergr.tools.llm-call/cheap-llm-call)
                 resp        (call reconcile-instruction (reconcile-prompt conflicts) {})
                 resolutions (parse-resolutions (:text resp) conflicts)]
-            (d/merge-room parent fork {:merge-opts {:force true}})
+            (d/merge-room parent fork (cond-> {:merge-opts {:force true}}
+                                        expect-state (assoc :guard (pinned fork expect-state))))
             (apply-resolutions! fork resolutions)
             (try ((requiring-resolve 'dvergr.rooms.messages/refresh!) parent)
                  (catch Throwable _ nil))

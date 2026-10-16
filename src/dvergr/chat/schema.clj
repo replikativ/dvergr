@@ -1038,7 +1038,9 @@
    for listing."
   [{:db/ident :review/id
     :db/valueType :db.type/uuid
-    :db/unique :db.unique/identity
+    ;; a value, not an identity: a second write of an id adds no entity and
+    ;; upserts none (it fails), so a Review cannot be overwritten
+    :db/unique :db.unique/value
     :db/cardinality :db.cardinality/one}
 
    {:db/ident :review/chat

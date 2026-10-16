@@ -624,4 +624,9 @@
       (is (= [b a] (store/-list-reviews st room-id {})) "newest first")
       (is (= [b] (store/-list-reviews st room-id {:decision :escalated})))
       (is (= [a] (store/-list-reviews st room-id {:run-id run-id})))
-      (is (= [b] (store/-list-reviews st room-id {:limit 1}))))))
+      (is (= [b] (store/-list-reviews st room-id {:limit 1})))
+      (let [other (keyword (str (name room-id) "-other"))]
+        (store/-store-room! st other {:slug (name other) :title "Other"})
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"immutable" (store/-store-review! st other a))
+            "a Review belongs to one room")
+        (is (empty? (store/-list-reviews st other {})))))))

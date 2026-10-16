@@ -4,7 +4,7 @@
    optional reviewer, then a decision: merge (pinned to the state that was
    reviewed), escalate to a person, or discard. Every review leaves one
    immutable Review record in the room's store (`store/PReviewStore`) and an
-   escalation posts a `:review/escalated` message to the room.
+   escalation posts a message of kind `:review/escalated` to the room.
 
    A spec (portable data, e.g. on a workflow bundle):
 
@@ -74,11 +74,18 @@
 (defmethod run-check :diff/max-files [[_ n] {:keys [files]}]
   {:pass? (<= (count files) n) :evidence {:files (count files) :max n}})
 
-(defn- porcelain-paths
-  "Paths of `git status --porcelain` lines (a rename names both)."
-  [lines]
-  (mapcat (fn [line] (map str/trim (str/split (subs (str line) (min 3 (count (str line)))) #" -> ")))
-          lines))
+(defn- system-changed?
+  "Whether a system other than files changed, conservatively: a database delta
+   with any datom added or retracted (or any count at all), a book with
+   intents, a failed diff. Anything unclear counts as a change: it goes to a
+   person."
+  [delta]
+  (cond
+    (nil? delta) false
+    (:error delta) true
+    (contains? delta :intents) (boolean (seq (:intents delta)))
+    (contains? delta :summary) (boolean (some #(and (number? %) (pos? %)) (vals (:summary delta))))
+    :else true))
 
 (defn- changed-files
   "Every path the fork changed, committed (a workspace diff's files; a rename
@@ -86,13 +93,13 @@
   [{:keys [diff uncommitted]}]
   (let [file-deltas (filter (fn [[_ delta]] (contains? delta :files)) diff)
         others (for [[sid delta] diff
-                     :when (and (not (contains? delta :files)) (not (forks/delta-trivial? delta)))]
+                     :when (and (not (contains? delta :files)) (system-changed? delta))]
                  (str sid))]
     {:files (vec (distinct (concat (for [[_ delta] file-deltas
                                          {:keys [path]} (:files delta)
                                          p (str/split (str path) #"\t")]
                                      p)
-                                   (porcelain-paths uncommitted))))
+                                   (forks/porcelain-paths uncommitted))))
      :other-systems (vec (sort others))}))
 
 ;; ============================================================================
@@ -125,9 +132,7 @@
            {:ok? true}
            {:ok? false :error "the merge did not happen"})
          (catch Throwable t {:ok? false :error (.getMessage t)}))
-    (if (not= state (forks/state-token fork))
-      {:ok? false :error "the world changed since it was reviewed"}
-      (forks/merge! fork))))
+    (forks/merge! fork :expect-state state)))
 
 (defn- decide-discard! [fork invoke]
   (if invoke
@@ -145,12 +150,13 @@
 
 (defn- escalate! [room review]
   (try
-    (d/post! room {:type :review/escalated
-                   :from :reviewer
-                   :body (str "Review of " (:review/world review) " needs a person: "
-                              (str/join "; " (:review/reasons review)))
-                   :review (select-keys review [:review/id :review/run-id :review/world
-                                                :review/state-token :review/reasons])})
+    (d/post! room {:from :reviewer
+                   :content (str "Review of " (:review/world review) " needs a person: "
+                                 (str/join "; " (:review/reasons review))
+                                 " (review_list, decision escalated)")
+                   :metadata (cond-> {:kind :review/escalated
+                                      :object {:kind :review :id (:review/id review)}}
+                               (:review/run-id review) (assoc :run-id (:review/run-id review)))})
     (catch Throwable _ nil))
   review)
 
@@ -177,20 +183,30 @@
                                                (catch Throwable t {:pass? false :evidence {:error (.getMessage t)}})))))
           failed (remove :pass? checks)
           id (random-uuid)
-          verdict (when (and (empty? failed) reviewer (:review/reviewer spec))
-                    (reviewer {:review/world (room-arg world) :review/state-token state
-                               :review/diff (select-keys ctx [:files :other-systems])
-                               :review/checks checks
-                               :review/instructions (get-in spec [:review/reviewer :instructions])}))
+          asked? (and (empty? failed) (:review/reviewer spec))
+          verdict (when asked?
+                    (try
+                      (let [v (reviewer {:review/world (room-arg world) :review/state-token state
+                                         :review/diff (select-keys ctx [:files :other-systems])
+                                         :review/checks checks
+                                         :review/instructions (get-in spec [:review/reviewer :instructions])})]
+                        (if (and (map? v) (#{:approve :escalate} (:review/verdict v)))
+                          v
+                          {:review/verdict :escalate :review/reasons ["the reviewer gave no verdict"]}))
+                      (catch Throwable t
+                        {:review/verdict :escalate :review/reasons [(str "the reviewer failed: " (.getMessage t))]})))
+          ;; with a reviewer, only its explicit approval approves
           approved? (and (empty? failed)
-                         (or (nil? verdict) (= :approve (:review/verdict verdict))))
+                         (if asked? (= :approve (:review/verdict verdict)) true))
           spot? (and approved? (spot-checked? id (:review/spot-check spec)))
           base {:review/id id :review/world (room-arg world) :review/state-token state
                 :review/checks checks :review/policy (policy-id spec)
                 :review/reviewed-at (or now (java.util.Date.))}
           base (cond-> base
                  run-id (assoc :review/run-id run-id)
-                 verdict (assoc :review/verdict (select-keys verdict [:review/verdict :review/reasons :review/concerns]))
+                 verdict (assoc :review/verdict (-> (select-keys verdict [:review/verdict :review/reasons :review/concerns])
+                                                    (update :review/reasons #(vec (map str %)))
+                                                    (update :review/concerns #(vec (map str %)))))
                  spot? (assoc :review/spot-check? true))
           escalated (fn [reasons] (escalate! room (record! room (assoc base :review/decision :escalated
                                                                        :review/reasons (vec reasons)))))]

@@ -1559,13 +1559,15 @@
     :impl (fn [daemon {:keys [room expect-state]}]
             (when-let [r (resolve-room daemon room)]
               (in-ctx daemon
+                      ;; checked early for a clear error, and again inside the merge
+                      ;; (`forks/merge!`): nothing changes between the check and the merge
                       (when expect-state
                         (let [now (forks/state-token r)]
                           (when (not= expect-state now)
                             (throw (ex-info (str "Fork " (id->str (:id r)) " changed since it was reviewed"
                                                  " (reviewed " expect-state ", now " now "); review it again")
                                             {:type ::fork-changed :expected expect-state :actual now})))))
-                      (let [{:keys [ok? error] :as res} (forks/reconcile-merge! r)]
+                      (let [{:keys [ok? error] :as res} (forks/reconcile-merge! r :expect-state expect-state)]
                         (when-not ok?
                           (throw (ex-info (str "Merge of " (id->str (:id r)) " failed: " error)
                                           {:type ::merge-failed :error error})))

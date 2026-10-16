@@ -8,7 +8,9 @@
             [dvergr.catalog :as catalog]
             [dvergr.catalog.wiki-gen :as gen]
             [dvergr.catalog.wiki-v4 :as v4]
+            [dvergr.catalog.workspace]
             [dvergr.discourse :as d]
+            [muschel.fs]
             [dvergr.ops :as ops]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.principal :as principal]
@@ -55,8 +57,16 @@
   {:review/checks [:fork/review-tier [:diff/only-paths ["wiki/"]]]
    :review/reviewer {:instructions "Approve faithful wiki updates."}})
 
-(defn- escalations [room]
-  (filter #(= :review/escalated (:type %)) (d/log room)))
+(defn- escalations
+  "The room's durable escalation messages."
+  [room]
+  (filter #(= :review/escalated (get-in % [:metadata :kind]))
+          (d/messages (ops/resolve-room *daemon* (name (:id room))))))
+
+(defn- raw-write!
+  "Write a file into a room's workspace without committing it, as a tool does."
+  [room path text]
+  (muschel.fs/write-string! (dvergr.catalog.workspace/room-fs (ops/resolve-room *daemon* room)) path text false))
 
 (deftest an-approved-world-is-merged-and-recorded
   (let [[parent fork] (room-with-fork "rv-approve" {"docs/a.md" "A."} {"wiki/a.md" "# A\n"})
@@ -84,7 +94,9 @@
     (is (empty? @calls) "the reviewer is never asked")
     (is (= ["schedules.edn"] (get-in (second (:review/checks rv)) [:evidence :outside])))
     (is (some? (ops/resolve-room *daemon* fork)) "the world is kept for a person")
-    (is (= [(:review/id rv)] (map #(get-in % [:review :review/id]) (escalations parent))))
+    (let [[m] (escalations parent)]
+      (is (= (:review/id rv) (get-in m [:metadata :object :id])) "the message names the Review")
+      (is (str/includes? (str (:content m)) "needs a person")))
     (is (nil? (get (catalog/read-tree (ops/resolve-room *daemon* (name (:id parent))) "/") "/wiki/a.md")) "nothing merged")
     (is (= 1 (count (op :review/list {:room "rv-scope" :decision "escalated"}))))))
 
@@ -154,3 +166,41 @@
             rv (review/review! parent (fork-id fork) spec)]
         (is (= :escalated (:review/decision rv)))
         (is (some #{:every-claim-quoted?} (get-in rv [:review/checks 2 :evidence :failed])))))))
+
+(deftest a-reviewer-must-approve-explicitly
+  (doseq [[slug reviewer why] [["rv-nil" (fn [_] nil) "no verdict"]
+                               ["rv-odd" (fn [_] {:review/verdict :sure}) "no verdict"]
+                               ["rv-throw" (fn [_] (throw (ex-info "provider down" {}))) "failed: provider down"]]]
+    (let [[parent fork] (room-with-fork slug {} {"wiki/a.md" "# A\n"})
+          rv (review/review! parent (fork-id fork) wiki-only :reviewer reviewer)]
+      (is (= :escalated (:review/decision rv)) slug)
+      (is (some #(str/includes? % why) (:review/reasons rv)) (pr-str (:review/reasons rv)))
+      (is (= [rv] (review/reviews parent)) "recorded")
+      (is (nil? (get (catalog/read-tree (ops/resolve-room *daemon* (name (:id parent))) "/") "/wiki/a.md"))))))
+
+(deftest uncommitted-files-are-reviewed-and-pinned
+  (testing "an uncommitted file under the declared paths is reviewed and merged"
+    (let [[parent fork] (room-with-fork "rv-dirty" {} {})]
+      (raw-write! fork "/wiki/a.md" "# A\n")
+      (let [calls (atom [])
+            rv (review/review! parent (fork-id fork) wiki-only :reviewer (scripted calls {:review/verdict :approve}) :invoke op)]
+        (is (= :merged (:review/decision rv)) (pr-str rv))
+        (is (= ["wiki/a.md"] (get-in (first @calls) [:review/diff :files])))
+        (is (= "# A\n" (get (catalog/read-tree (ops/resolve-room *daemon* (name (:id parent))) "/wiki") "/wiki/a.md"))))))
+  (testing "an uncommitted write while the reviewer reads is not merged"
+    (doseq [[slug invoke] [["rv-dirty-race" op] ["rv-dirty-race-direct" nil]]]
+      (let [[parent fork] (room-with-fork slug {} {"wiki/a.md" "# A\n"})
+            sneaky (fn [_] (raw-write! fork "/schedules.edn" "{:every 1}") {:review/verdict :approve})
+            rv (review/review! parent (fork-id fork) wiki-only :reviewer sneaky :invoke invoke)]
+        (is (= :escalated (:review/decision rv)) slug)
+        (is (some #(str/includes? % "changed since") (:review/reasons rv)) (pr-str (:review/reasons rv)))
+        (is (nil? (get (catalog/read-tree (ops/resolve-room *daemon* (name (:id parent))) "/") "/schedules.edn")))))))
+
+(deftest a-database-change-is-outside-the-declared-paths
+  (let [changed? #'review/system-changed?]
+    (is (changed? {:summary {:added-datoms 0 :removed-datoms 3}}) "retractions count")
+    (is (changed? {:summary {:added-datoms 2}}))
+    (is (not (changed? {:summary {:added-datoms 0 :removed-datoms 0}})))
+    (is (changed? {:error "diff failed"}))
+    (is (changed? {:intents [{:op :book}]}))
+    (is (changed? {:something :unknown}) "unclear goes to a person")))

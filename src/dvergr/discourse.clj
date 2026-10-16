@@ -2290,9 +2290,14 @@
    field clash (same entity+attr changed differently on both sides) is a 3-way
    CONFLICT that `merge-fork!` refuses by default. Pass `{:merge-opts
    {:force true}}` (the agent reconciler does, after resolving) to force past it.
-   (See `dvergr.rooms.forks/reconcile-merge!`.)"
+   (See `dvergr.rooms.forks/reconcile-merge!`.)
+
+   `:guard`, a function of the substrate merge (a thunk), runs it inside the
+   merge, once the fork's work is closed and drained: a check that must hold
+   at the moment of merging (`forks/merge!`'s `:expect-state`) throws there,
+   and the fork is left as it was."
   ([parent fork] (merge-room parent fork {}))
-  ([parent fork {:keys [merge-opts]}]
+  ([parent fork {:keys [merge-opts guard]}]
    (assert-settlement-released! fork :merge)
    (let [claim (claim-settlement! fork {:op :merged :parent (:id parent)})]
      (when (map? claim)
@@ -2322,25 +2327,27 @@
    ;; branch also collapses here (bringing its messages into the parent's
    ;; conversation under the shared :chat/id); its deferred data-DB grants commit on
    ;; accept via :on-merge (store forks only).
-             (when-let [handle (fork-handle fork)]
-               (try
-                 (let [pending (when (:store fork)
-                                 (binding [ec/*execution-context* (:ctx fork)]
-                                   (ec/get-state [:dvergr/pending-grants])))]
-                   (ygg/merge-fork! handle (or merge-opts {}))
+             ((or guard (fn [substrate!] (substrate!)))
+              (fn []
+                (when-let [handle (fork-handle fork)]
+                  (try
+                    (let [pending (when (:store fork)
+                                    (binding [ec/*execution-context* (:ctx fork)]
+                                      (ec/get-state [:dvergr/pending-grants])))]
+                      (ygg/merge-fork! handle (or merge-opts {}))
          ;; Grant integration is deliberately outside substrate settlement. A
          ;; failure leaves the handle truthfully :merged and a retry replays the
          ;; cached merge before retrying this idempotent commit.
-                   (when (:store fork)
-                     (srooms/commit-fork-grants! pending)))
-                 (catch Throwable e
-                   (tel/log! {:level :error :id :dvergr/merge-failed
-                              :data {:fork (:id fork) :parent (:id parent) :error (str e)}}
-                             "merge-room: affine yggdrasil settlement failed")
-                   (binding [ec/*execution-context* (fork-home-ctx fork)]
-                     (peer-bus/post! {:type :dvergr/merge-failed :dvergr/origin (:id fork)
-                                      :dvergr/parent (:id parent) :error (str e)}))
-                   (throw e))))
+                      (when (:store fork)
+                        (srooms/commit-fork-grants! pending)))
+                    (catch Throwable e
+                      (tel/log! {:level :error :id :dvergr/merge-failed
+                                 :data {:fork (:id fork) :parent (:id parent) :error (str e)}}
+                                "merge-room: affine yggdrasil settlement failed")
+                      (binding [ec/*execution-context* (fork-home-ctx fork)]
+                        (peer-bus/post! {:type :dvergr/merge-failed :dvergr/origin (:id fork)
+                                         :dvergr/parent (:id parent) :error (str e)}))
+                      (throw e))))))
    ;; (2) CONVERSATION merge — for STORE-LESS forks (`:isolation :none`, or a `:ctx`
    ;; fork without a message store), absorb the fork's post-fork bus entries into the
    ;; parent's log (merge-as-history; no re-firing of live handlers, separate buses).

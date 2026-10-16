@@ -1612,18 +1612,27 @@
           ent (room-by-slug conn (store/room-id->slug room-id))
           _ (when-not ent
               (throw (ex-info "No room to store a Review in" {:type :room-store/unknown-room :room-id room-id})))
-          existing (dh/q '[:find ?p . :in $ ?id :where [?r :review/id ?id] [?r :review/payload-edn ?p]] @conn id)]
-      (cond
-        (= existing payload) review
-        existing (throw (ex-info "A Review is immutable" {:type :room-store/review-identity-collision :review/id id}))
-        :else (do (dh/transact conn [(cond-> {:review/id id
-                                              :review/chat [:chat/id (:chat/id ent)]
-                                              :review/world (:review/world review)
-                                              :review/decision (:review/decision review)
-                                              :review/reviewed-at (:review/reviewed-at review)
-                                              :review/payload-edn payload}
-                                       (:review/run-id review) (assoc :review/run-id (:review/run-id review)))])
-                  review))))
+          existing (fn [] (dh/q '[:find [?cid ?p] :in $ ?id
+                                  :where [?r :review/id ?id] [?r :review/payload-edn ?p]
+                                  [?r :review/chat ?c] [?c :chat/id ?cid]]
+                                @conn id))
+          same? (fn [[cid p]] (and (= cid (:chat/id ent)) (= p payload)))
+          collision #(ex-info "A Review is immutable" {:type :room-store/review-identity-collision :review/id id})]
+      (if-let [e (existing)]
+        (if (same? e) review (throw (collision)))
+        (do (try (dh/transact conn [(cond-> {:db/id "review"
+                                             :review/id id
+                                             :review/chat [:chat/id (:chat/id ent)]
+                                             :review/world (:review/world review)
+                                             :review/decision (:review/decision review)
+                                             :review/reviewed-at (:review/reviewed-at review)
+                                             :review/payload-edn payload}
+                                      (:review/run-id review) (assoc :review/run-id (:review/run-id review)))])
+                 ;; a concurrent writer of the same id won (unique value): identical is fine
+                 (catch Throwable t
+                   (let [e (existing)]
+                     (when-not (and e (same? e)) (throw (if e (collision) t))))))
+            review))))
 
   (-load-review [{:keys [conn]} room-id review-id]
     (when-let [ent (room-by-slug conn (store/room-id->slug room-id))]
