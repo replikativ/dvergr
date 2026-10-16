@@ -145,6 +145,17 @@
      (->Message id from to content (System/currentTimeMillis)
                 in-reply-to (or thread-root-id id) metadata))))
 
+(defn with-recipients
+  "Address one immutable Message to several participant keywords. Post ONCE:
+   the bus routes the same durable envelope to each selected inbox, not the
+   broadcast inbox. Retries retain the ordinary message-id deduplication.
+   Recipients form a set, not an ordering or separate messages."
+  [msg actor-ids]
+  (let [msg (-> msg (assoc :to nil)
+                (assoc-in [:metadata :dvergr/recipients] (set actor-ids)))]
+    (bus/recipients msg)
+    msg))
+
 (defn thread-root-id
   "Return the stable topical root of `msg`, tolerating legacy envelopes.
 
@@ -956,8 +967,9 @@
    Each participant subscribes to TWO topics:
      [:to (:id p)] — directly-addressed messages
      [:to nil]     — broadcast messages (no specific recipient)
-   Because every Message has exactly one `:to` value, no message
-   reaches a participant twice. The chat-room semantic — \"every
+   An explicit `with-recipients` selection routes only to those direct
+   inboxes, not the broadcast inbox. No message reaches a participant twice.
+   The chat-room semantic — \"every
    participant sees every broadcast post; targeted posts only the
    addressed one\" — falls out naturally."
   [room p]

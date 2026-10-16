@@ -161,6 +161,9 @@
    ;; clients can query/sync them independently and never need to parse an
    ;; opaque EDN string. Actor ids remain keyword values for the same reason as
    ;; :message/from/:message/to: room stores do not depend on system-db refs.
+   {:db/ident :message/recipients
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/many}
    {:db/ident :message/audience
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/many
