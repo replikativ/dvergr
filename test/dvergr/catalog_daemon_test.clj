@@ -117,6 +117,20 @@
       (is (= {"/notes.md" "A note."} (select-keys (catalog/read-tree (ops/resolve-room *daemon* room) "/")
                                                   ["/notes.md"]))))))
 
+(deftest a-fork-that-merged-a-nested-fork-lands-everything
+  ;; spindel#136: merging B into A replaced A's overlays with plain systems, and
+  ;; A's merge into the room then landed nothing (A's own writes included)
+  (let [op #(ops/invoke *daemon* dvergr.principal/local-principal %1 %2)
+        room (:id (op :room/create {:title "nested merge" :slug "nested-merge"}))
+        a (:id (op :room/fork {:room room}))
+        _ (op :room/write {:room a :files {"a.md" {:text "from A"}}})
+        b (:id (op :room/fork {:room a}))
+        _ (op :room/write {:room b :files {"b.md" {:text "from B"}}})]
+    (op :room/merge {:room b})
+    (op :room/merge {:room a})
+    (is (= {"/a.md" "from A" "/b.md" "from B"}
+           (select-keys (catalog/read-tree (ops/resolve-room *daemon* room) "/") ["/a.md" "/b.md"])))))
+
 (deftest a-dirty-parent-refuses-a-merge-without-fencing-the-fork
   ;; geschichte refuses a merge into a dirty workspace; refused inside the merge
   ;; that left the fork fenced ("Room is already fenced for lifecycle work").
