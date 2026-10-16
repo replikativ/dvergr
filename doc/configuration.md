@@ -83,7 +83,8 @@ and storage GC. The `.nrepl-port` of a REPL is written at the project root, not 
                  :on-created   my.host/grant-creator} ; (fn [principal resource]) after a create
                                                 ; default: local access only, everything allowed;
                                                 ; a hosted daemon sets both (doc/mcp.md, principals)
- :gc            {:interval-ms 21600000          ; storage GC every 6 h (default)
+ :gc            {:enabled? true                 ; storage GC; default OFF (doc/homes.md: datahike#1117)
+                 :interval-ms 21600000          ; every 6 h (default)
                  :retention-days 30}            ; default nil: keep all history, reclaim only fork garbage
  :blob-store    {:backend :s3 :bucket "…" :region "…"}  ; /drive blobs; default a filestore under .dvergr/blobs
  :shell         {:jail {:commands ["python3"]}}}  ; real programs in the room shell; doc/tools-and-sandbox.md

@@ -207,6 +207,37 @@
         (is (read-only? (ev "(d/transact (room/db \"room-c-kb\") [{:entity/title \"c-detached\"}])")))
         (finally (sdb/attach! (:room-id a) (:kb-id c) :read-write))))))
 
+(deftest deleting-gc-is-off-until-enabled
+  ;; datahike's gc-storage fails open (datahike#1117): off unless the daemon
+  ;; enables it; a dry run deletes nothing and stays allowed
+  (let [prev (srooms/storage-gc-enabled?)]
+    (try
+      (srooms/enable-storage-gc! false)
+      (is (re-find #"Storage GC is off" (str (get-in (ev "(room/gc!)") [:ok :error]))))
+      (is (re-find #"Storage GC is off" (str (get-in (ev "(room/gc! {:remove-before (java.util.Date.)})") [:ok :error]))))
+      (is (map? (:ok (ev "(room/gc! {:dry-run? true})"))) "a dry run runs")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Storage GC is off" (srooms/gc-stores!)))
+      (testing "a dry run never runs the system DB's GC (it has no dry run)"
+        (with-redefs [datahike.api/gc-storage (fn [& _] (throw (ex-info "deleting GC ran" {})))]
+          (is (:dry-run (:system-db (srooms/gc-stores! {:dry-run? true}))))))
+      (testing "enabling is for the current home only"
+        (srooms/enable-storage-gc! true)
+        (is (srooms/storage-gc-enabled?))
+        (let [home (dvergr.substrate.paths/home)]
+          (try (dvergr.substrate.paths/set-home! (str home "-elsewhere"))
+               (is (not (srooms/storage-gc-enabled?)) "another home is not enabled")
+               (finally (dvergr.substrate.paths/set-home! home))))
+        (srooms/enable-storage-gc! false)
+        (is (not (srooms/storage-gc-enabled?))))
+      (finally (srooms/enable-storage-gc! prev)))))
+
+(deftest a-dead-gc-is-a-failure-not-zero
+  (let [report #'srooms/gc-report]
+    (is (:error (report nil)))
+    (is (:error (report :dvergr.system.rooms/timeout)))
+    (is (= {:reclaimed 3} (report 3)))
+    (is (= {:reclaimed 2} (report #{:a :b})))))
+
 (deftest a-fork-does-not-merge-into-a-database-the-room-may-no-longer-write
   ;; The fork writes C's KB while A's grant is :read-write, the grant is then
   ;; downgraded, and A's sandbox merges the fork: the merge would land the

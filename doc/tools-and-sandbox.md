@@ -143,7 +143,8 @@ cancellable.
   `dvergr.room/post!`, which records the author. `(dvergr.room/databases)` says which is
   which (`:writable?`). `d/delete-database` deletes only a data DB the room holds as
   `:owner`, and `dvergr.room/gc!` collects only the systems the room may write (it starts
-  the collections and returns `{system-id :started}`); a store attached `:read`, or one
+  the collections and returns `{system-id :started}`; while storage GC is off, the default,
+  only `{:dry-run? true}`, doc/homes.md); a store attached `:read`, or one
   detached since, is its owner's to delete and collect. A fork does not carry a write
   past a grant either: merging a fork that changed a database the room may no longer
   write (`dvergr.system.rooms/assert-merge-permitted!`, in `dvergr.discourse/merge-room`;

@@ -179,7 +179,7 @@
                     config/sandbox-env (constantly {})]
         (let [d (daemon/start! {:agents {}
                                 :db-path (str contract-home "/daemon-db")
-                                :gc {:interval-ms 3600000}})]
+                                :gc {:enabled? true :interval-ms 3600000}})]
           (reset! instance d)
           (assoc (run-against-daemon!
                   d {:child-slug "nested-room-contract"
