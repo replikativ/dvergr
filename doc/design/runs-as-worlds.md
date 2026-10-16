@@ -56,12 +56,28 @@ Room forks, the fork contract, Run admission and resume, settlement policies, ad
 5. **Simulation is one object with kinds.**  A simulation is a search whose join discards and records: assumptions, samples, results, provenance, behind the epistemic boundary of simmis's roadmap (simulated is not observed).  Kinds: *projection* (what will happen), *counterfactual* (what would have happened), *estimation* (what is true now but unobserved), *hypothetical* (how would an actor respond).  Simmis's Futures view becomes a Simulations view with projection as one kind; `:budget` and `:goal` intents are plans, not simulations, and are routed apart from it.
 6. **Searches are recorded durably; settlement after a restart waits for the shared capability store.**  A search's members, weights, policy and outcome are facts in the store (each member records the intended decision before its world is settled, then the outcome), so a search is visible and auditable after a restart.  The live fork handles that allow a merge or discard stay process-local, as for Proposals.  After a restart, an unsettled member is recorded as *unavailable*, a durable state, not discarded: its physical cleanup waits until settlement authority can be recovered.  An idempotent reconciliation refunds the wallets of Runs the restart stranded (today orphaned Runs are failed without a refund, `dvergr.agent.run`), bottom-up: a descendant's refund before its ancestor's, also when a reconciliation is retried, since an ancestor's return is made once (its transfer id is stable) and a child's later refund would stay in the ancestor's wallet.  Settlement that survives a restart is the same problem simmis has for Proposals and is solved once, for both.
 
+## Budgets as a tree
+
+The recursive harness is a programming model: a task breaks into sub-tasks, an evaluation into roles, a benchmark into cells, a search into members, an optimization of a workflow into evaluations of candidate workflows.  Its budget breaks down the same way, as a **wallet tree that mirrors the call tree**: every activation (a Run, an attempt, a search member, a particle) receives a grant from its parent, sub-grants to its children, and returns what it did not spend.
+
+Three laws make it compose:
+
+1. **Conservation.**  What the children are granted is at most what the parent holds, and what they leave returns to it (the ledger, `dvergr.resource`).
+2. **Attenuation.**  A child never holds more authority than its parent: money, provider admissions, its effect filter (a fork can only narrow it), and whether it may call providers at all.
+3. **Accountability.**  Every node records its spend under a *role*, so spend sums by role over any subtree: what judging cost in a benchmark, what a candidate cost per attempt.
+
+**Roles and splits.**  A role is a label on a child (`:candidate`, `:driver`, `:judge`, `:member`, `:particle`, or any keyword), and a *split* is what a parent declares for its children: an amount per role, or shares of its grant.  The attempt wallets of [evaluation-model.md](../evaluation-model.md) are one instance (an attempt node, split into candidate, driver and judge by the EnvironmentDef, so every candidate gets the same budget), an experiment another (cells), a search another (members, re-split as members are dropped, which is what SMC's resampling does), and an optimizer a fourth: how much budget each candidate workflow gets is the optimizer's own decision, allocation as the policy over the moves.
+
+**Funded children.**  A child Run may make provider calls only when its grant carries money and provider admissions (`dvergr.resource/model-dispatches`): each call consumes one admission before it reaches the provider (`dvergr.resource/admit-model-dispatch!`), so the number of calls is bounded in advance, and a debit lost to a crash between a provider's answer and its charge is at most one call's cost.  An unfunded child keeps the refusal it has today (`:provider-effects? false`).  `hire!` already allocates a child's `:resources` from its parent Run's wallet (`dvergr.resource/allocate-run!`), which refuses a grant the parent cannot cover, and a Run whose allocation carries admissions has every provider call admitted (`dvergr.resource/model-scope`).
+
+**What exists and what is missing.**  Run wallets split from the parent and return their remainder; world wallets (particles, speculative worlds) are granted by the ledger authority.  Missing are the delegation rule for funded children (above), roles on Runs and in receipts, declared splits, and aggregation of spend by role.  Run wallets (keyed by the Run) and world wallets (keyed by the fork) remain two kinds of node; making them one kind is a later step, once roles and splits exist to test it against, since the Run spend path reads the Run-keyed allocation (change 2 above).
+
 ## Order of work
 
 1. This plan and its decisions.
 2. (Change 2 is dropped; see above.)
 3. The speculative effect filter (`dvergr.effects`, `:speculative` with the class filter above), tested, before any search runs; then best-of-n search over Runs, recorded durably, with weights by `observe`/`factor` and the policies `:automatic`, `:review` and `:keep-all` (change 1, decisions 2, 3, 6).
-4. Funded nested Runs (decision 4).
+4. Funded child Runs, roles, declared splits and spend by role (Budgets as a tree), with the attempt wallets of evaluation-model.md as their first user; then nested Runs in speculative worlds (decision 4), settled bottom-up.  Unifying Run and world wallets follows.
 5. `world-scope/adopt!` in spindel (change 3).
 6. Simmis: the Simulations view (decision 5) and the search's siblings in the Run detail.
 7. Effect classes, then copying Runs at savepoints and steer over Runs with `factor` at savepoints (changes 4 to 6).
