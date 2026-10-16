@@ -83,11 +83,7 @@
       ;; These capabilities close over the ChatContext itself, so a projected
       ;; child facade must replace them as well. They perform their effects
       ;; through the same boundary as the rest of the sandbox.
-        (let [boundary (effects/boundary-resolver
-                        (runtime-ctx/sandbox-binding-resolver execution-ctx capability-id)
-                        (:receipts cctx)
-                        {:world #(effects/world-handlers (runtime-ctx/selected-context execution-ctx))
-                         :world-sink #(effects/world-sink (runtime-ctx/selected-context execution-ctx))})]
+        (let [boundary (sandbox/agent-effect-boundary execution-ctx capability-id room-id (:receipts cctx))]
           (ns-io/add-bash-ns!    sci cctx boundary)
           (ns-io/add-media-ns!   sci cctx boundary)
           ;; model calls from code are the agent's spend, charged to this chat

@@ -12,6 +12,7 @@
    Drives hold raw documents; the KB holds derived knowledge."
   (:require [datahike.api :as d]
             [dvergr.drive.blobs :as blobs]
+            [dvergr.effects :as effects]
             [dvergr.system.rooms :as srooms]
             [clojure.string :as str]
             [taoensso.telemere :as log]))
@@ -224,5 +225,10 @@
    room's ctx bound."
   [room-id dir-segs name bytes & {:keys [mime source] :or {source :upload}}]
   (let [conn (ensure-room-drive! room-id)
+        system-id (srooms/connection-system-id conn)
+        _ (when-let [reason (srooms/trunk-write-refusal room-id system-id)]
+            (effects/deny! {:effect :db/transact
+                            :resource {:system-id system-id}}
+                           :trunk-write-policy reason))
         dir  (ensure-path! conn (vec dir-segs))]
     (put-file! conn dir name bytes :mime mime :source source)))

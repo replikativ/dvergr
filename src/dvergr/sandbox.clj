@@ -1134,6 +1134,25 @@
   (swap! (:env sci-ctx) update :class->opts dissoc :allow)
   sci-ctx)
 
+(defn agent-effect-boundary
+  "The shared effect boundary for agent namespaces and working-context remounts."
+  [execution-ctx capability-id room-id receipts]
+  (let [binding-resolver (when capability-id
+                           (runtime-ctx/sandbox-binding-resolver execution-ctx capability-id))
+        relations #(binding [rtc/*execution-context* (runtime-ctx/selected-context execution-ctx)]
+                     (authority/relations ((requiring-resolve 'dvergr.room.registry/list-rooms))))]
+    (effects/boundary-resolver
+     binding-resolver receipts
+     {:relations relations
+      :write-refusal (fn [effect]
+                       ;; Database handles check their exact target themselves.
+                       (when-not (= :db/transact (:effect effect))
+                         (binding [rtc/*execution-context* (runtime-ctx/selected-context execution-ctx)]
+                           ((requiring-resolve 'dvergr.system.rooms/effect-write-refusal)
+                            (or (some-> binding-resolver (apply []) :room-id) room-id) effect))))
+      :world #(effects/world-handlers (runtime-ctx/selected-context execution-ctx))
+      :world-sink #(effects/world-sink (runtime-ctx/selected-context execution-ctx))})))
+
 (defn setup-agent-namespaces!
   "Wire execution-context-aware namespaces into a SCI context.
 
@@ -1176,15 +1195,7 @@
   (let [audit-log  (or receipts (make-audit-log))
         binding-resolver (when capability-id
                            (runtime-ctx/sandbox-binding-resolver spindel-ctx capability-id))
-        ;; the room relations the authority filter decides over, read in
-        ;; the world the call runs in
-        relations  #(binding [rtc/*execution-context* (runtime-ctx/selected-context spindel-ctx)]
-                      (authority/relations ((requiring-resolve 'dvergr.room.registry/list-rooms))))
-        boundary   (effects/boundary-resolver
-                    binding-resolver audit-log
-                    {:relations relations
-                     :world #(effects/world-handlers (runtime-ctx/selected-context spindel-ctx))
-                     :world-sink #(effects/world-sink (runtime-ctx/selected-context spindel-ctx))})
+        boundary (agent-effect-boundary spindel-ctx capability-id room-id audit-log)
         binding-swap! (when capability-id
                         (fn [f & args]
                           (apply runtime-ctx/update-sandbox-binding!
@@ -1256,6 +1267,7 @@
     (ns-codec/add-codec-namespaces! sci-ctx)   ; cheshire.core / clojure.data.xml / dvergr.codec
     (ns-intake/add-intake-namespaces! sci-ctx boundary)
     (ns-io/add-fs-ns!   sci-ctx :base-path cwd :filesystem filesystem
+                        :workspace-resolver (when workspace workspace-resolver)
                         :filesystem-resolver
                         (when workspace
                           #(when-let [workspace (workspace-resolver)]

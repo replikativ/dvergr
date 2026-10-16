@@ -19,7 +19,7 @@
    channel-specific. `room` is a discourse Room. Binds the room's ctx."
   [room subdir {:keys [bytes file-name mime photo? source]}]
   (when (and room (seq bytes))
-    (when-let [rid (some-> (sdb/room-by-slug (:slug room)) :room/id)]
+    (when-let [rid (some-> (sdb/room-by-slug (or (some-> room :meta deref :origin-slug) (:slug room))) :room/id)]
       (binding [ec/*execution-context* (:ctx room)]
         (let [name (or file-name
                        (str (if photo? "photo-" "file-") (subs (blobs/sha256-hex bytes) 0 8)))

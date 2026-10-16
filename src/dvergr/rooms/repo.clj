@@ -16,6 +16,8 @@
             [dvergr.room.store :as rstore]
             [dvergr.rooms :as rooms]
             [dvergr.rooms.forks :as forks]
+            [dvergr.effects :as effects]
+            [dvergr.system.rooms :as srooms]
             [dvergr.substrate.geschichte :as gs]
             [geschichte.git.command :as command]
             [geschichte.git.local :as glocal]
@@ -132,7 +134,13 @@
     (when-not (zero? base)
       (throw (ex-info "The room was not imported from a repository (no import tag)"
                       {:type ::not-imported :room (:id room)}))))
-  (forks/commit-workspace! room "Changes for export")
+  (binding [ec/*execution-context* (:ctx room)]
+    (let [effect {:effect :git/commit
+                  :resource {:system-id (srooms/connection-system-id (:conn (gs/current-workspace)))
+                             :message "Changes for export"}}]
+      (when-let [reason (srooms/room-effect-write-refusal room effect)]
+        (effects/deny! effect :trunk-write-policy reason))
+      (forks/commit-workspace! room "Changes for export")))
   (let [patch (:stdout (git! room ["diff" import-tag "HEAD"]))
         names (->> (str/split-lines (:stdout (git! room ["diff" "--name-status" import-tag "HEAD"])))
                    (remove str/blank?)

@@ -7,6 +7,7 @@
             [datahike.api :as d]
             [dvergr.sandbox :as sandbox]
             [dvergr.effects :as effects]
+            [dvergr.system.rooms :as srooms]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.io.acquisition :as acquisition]
             [dvergr.agent.process :as proc]
@@ -407,7 +408,9 @@
    (let [content (if (bytes? content) content (str content))
          n (if (bytes? content) (alength ^bytes content) (alength (.getBytes ^String content "UTF-8")))]
      (effects/perform! (effect-boundary ctx)
-                       {:effect :fs/write :resource {:path (str path)}
+                       {:effect :fs/write :resource {:path (str path)
+                                                     :system-id (or (:system-id ctx)
+                                                                    (srooms/connection-system-id (get-in ctx [:workspace :conn])))}
                         ;; bytes are digested as they are (a byte array prints by identity)
                         :result-of (constantly (if (bytes? content)
                                                  (String. ^bytes content "ISO-8859-1")
@@ -431,7 +434,9 @@
   ([ctx path] (workspace-delete! ctx path {}))
   ([ctx path opts]
    (effects/perform! (effect-boundary ctx)
-                     {:effect :fs/delete :resource {:path (str path)}}
+                     {:effect :fs/delete :resource {:path (str path)
+                                                    :system-id (or (:system-id ctx)
+                                                                   (srooms/connection-system-id (get-in ctx [:workspace :conn])))}}
                      #(let [resolved (tool-path ctx path)]
                         (cond
                           (contains? opts :expect)
@@ -458,8 +463,10 @@
   "Transact `tx-data` into `conn` for a tool, through the effect boundary (a
    `:db/transact`, as a sandbox `datahike.api/transact` is)."
   [ctx conn tx-data]
-  (effects/perform! (effect-boundary ctx) (effects/transact-effect tx-data)
-                    #(d/transact conn tx-data)))
+  (let [system-id (srooms/connection-system-id conn)
+        effect (cond-> (effects/transact-effect tx-data)
+                 system-id (assoc-in [:resource :system-id] system-id))]
+    (effects/perform! (effect-boundary ctx) effect #(d/transact conn tx-data))))
 
 (defn- virtual-walk [filesystem root]
   (letfn [(walk [path]
@@ -557,7 +564,22 @@
   "The boundary for effects performed on behalf of the tool context `ctx`:
    its `:effect-boundary` when the caller set one, else its chat's."
   [ctx]
-  (or (:effect-boundary ctx) (tool-boundary ctx)))
+  (let [boundary (or (:effect-boundary ctx) (tool-boundary ctx))]
+    (fn []
+      (let [b (when boundary (boundary))
+            room (or (:room ctx) (:control-room ctx) (:authz-room ctx))
+            world (or (:ctx room) (:execution-ctx ctx) (get-in ctx [:chat-ctx :spindel-ctx]))]
+        (update b :handlers (fnil conj [])
+                (fn [effect next]
+                  (let [reason (when world
+                                 (binding [rtc/*execution-context* (runtime-ctx/selected-context world)]
+                                   (if room
+                                     (srooms/room-effect-write-refusal room effect)
+                                     (srooms/effect-write-refusal
+                                      (or (:room-id ctx) (get-in ctx [:chat-ctx :room-id])) effect))))]
+                    (if reason
+                      (effects/deny! effect :trunk-write-policy reason)
+                      (next effect)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Principal authorization (dvergr.principal): who runs a tool, on which room
