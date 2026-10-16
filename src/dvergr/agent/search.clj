@@ -162,6 +162,17 @@
   ;; evidence a retry reconciles from when the writes after the merge failed
   (atom #{}))
 
+(defn- confirmed-merged?
+  "Has `fork`'s substrate been merged into its parent, by this search or
+   anyone: its settlement recorded as merged, or a merge claim that has ended
+   with its substrate settled. A claim still in progress is not evidence: it
+   may abort."
+  [fork]
+  (boolean
+   (or (= :merged (:op (d/settlement fork)))
+       (let [claim (:dvergr.discourse/settlement-claim @(:meta fork))]
+         (and (= :merged (get-in claim [:settlement :op])) (false? (:active? claim)))))))
+
 (defn- project-merged!
   "Record durably that `member`'s world merged, when its substrate merged but
    the Run's settlement was not written: true once its Run reads `:merged`."
@@ -194,15 +205,17 @@
                (if-not (:ok? released)
                  {:status :failed :error (:error released)}
                  (let [merged (attempt #(forks/merge! fork :expect-state (get-in member [:review :state])))
-                       substrate (or (d/settlement fork) (d/settlement-claim fork))
-                       durable (:run/settlement-status (durable-run room (run-id-of member)))]
-                   (when (= :merged (:op substrate)) (swap! merged-worlds conj (:world member)))
+                       ;; the evidence first, before any store access can fail
+                       substrate-merged? (confirmed-merged? fork)
+                       _ (when substrate-merged? (swap! merged-worlds conj (:world member)))
+                       durable (try (:run/settlement-status (durable-run room (run-id-of member)))
+                                    (catch Throwable _ nil))]
                    (cond
                      (and (:ok? merged) (= :merged durable) (nil? (rreg/lookup (:world member))))
                      {:outcome :merged :status :settled}
                      ;; the substrate merged, its cleanup or projection did
                      ;; not: project the settlement again, never merge again
-                     (= :merged (:op substrate))
+                     substrate-merged?
                      (do (swap! merged-worlds conj (:world member))
                          (if (and (project-merged! room member) (nil? (rreg/lookup (:world member))))
                            {:outcome :merged :status :settled :error (:error merged)}

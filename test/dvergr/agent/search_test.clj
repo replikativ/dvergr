@@ -338,3 +338,35 @@
         (let [again (search/select! room members {:policy :automatic :search-id id})]
           (is (some #(= [:merged :settled] ((juxt :search/outcome :search/status) %)) (:search/members again))
               "the merged world is settled from this process's evidence"))))))
+
+(deftest only-a-landed-merge-is-evidence
+  (let [confirmed? @#'search/confirmed-merged?
+        fork (fn [meta] {:meta (atom meta)})]
+    (is (false? (confirmed? (fork {:dvergr.discourse/settlement-claim
+                                   {:settlement {:op :merged} :active? true}})))
+        "a claim in progress may abort")
+    (is (true? (confirmed? (fork {:dvergr.discourse/settlement-claim
+                                  {:settlement {:op :merged} :active? false}})))
+        "a claim that ended with its substrate settled")
+    (is (true? (confirmed? (fork {:dvergr.discourse/settled {:op :merged}}))))
+    (is (false? (confirmed? (fork {:dvergr.discourse/settled {:op :discarded}}))))))
+
+(deftest a-merge-whose-reads-and-writes-failed-is-reconciled-from-the-evidence
+  (with-room :search-read-failure-test
+    (fn [room]
+      (let [members (held room 2 search/speculative-effects)
+            durable-run @#'search/durable-run
+            record! run/record-search!
+            update! run/update-durable-settlement!
+            down? (atom false)
+            id (random-uuid)]
+        (with-redefs-fn {#'search/durable-run (fn [r rid] (if @down? (throw (ex-info "storage down" {})) (durable-run r rid)))
+                         #'run/record-search! (fn [r rid s] (if @down? (throw (ex-info "storage down" {})) (record! r rid s)))
+                         #'run/update-durable-settlement! (fn [r rid status & more]
+                                                            (when (= :merged status) (reset! down? true))
+                                                            (if @down? (throw (ex-info "storage down" {}))
+                                                                (apply update! r rid status more)))}
+          #(is (thrown? Exception (search/select! room members {:policy :automatic :search-id id}))))
+        (let [again (search/select! room members {:policy :automatic :search-id id})]
+          (is (some #(= [:merged :settled] ((juxt :search/outcome :search/status) %)) (:search/members again))
+              "the merged world is settled from the evidence kept before the store failed"))))))
