@@ -331,3 +331,21 @@
     (is (= (Math/round (* 1000 0.10))
            (dvergr.chat.accounting/calculate-cost :input-tokens 1000
                                                   {:model "claude-haiku-5-5" :prompt-tokens 1000})))))
+
+(deftest the-persisted-ledger-prices-a-long-prompt-in-its-band
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :write}
+        chat-id (random-uuid)]
+    (dh/create-database cfg)
+    (let [conn (dh/connect cfg)]
+      (try
+        (schema/ensure-full-schema! conn)
+        (dh/transact conn [(schema/create-chat-entity {:id chat-id :title "ledger"})])
+        (let [{:keys [cost-microdollars]}
+              (dvergr.chat.accounting/record-usage! conn chat-id :input-tokens 100001
+                                                    :model "claude-haiku-5-5" :prompt-tokens 100001)]
+          (is (= (Math/round (* 100001 0.50)) cost-microdollars))
+          (is (= cost-microdollars
+                 (dh/q '[:find ?u . :in $ ?id :where [?c :chat/id ?id] [?c :chat/budget-used ?u]]
+                       @conn chat-id))
+              "what is persisted, and restored after a restart, is the band's cost"))
+        (finally (dh/release conn))))))

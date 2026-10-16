@@ -147,7 +147,8 @@
     ;; only reached the simmis billing path, never the room-turn rows.
     (when-let [conn (:db-conn chat-ctx)]
       (acct/record-usage! conn (:chat-id chat-ctx) resource-type amount
-                          :model model :provider provider :tool tool))
+                          :model model :provider provider :tool tool
+                          :prompt-tokens (:prompt-tokens opts)))
 
     ;; Return cost info
     (cond-> {:cost-microdollars cost}

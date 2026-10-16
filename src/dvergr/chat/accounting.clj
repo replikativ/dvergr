@@ -268,8 +268,8 @@
 
    Returns:
      {:ledger-id uuid :cost-microdollars N}"
-  [conn chat-id resource-type amount & {:keys [model provider tool metadata]}]
-  (let [cost (calculate-cost resource-type amount {:model model})
+  [conn chat-id resource-type amount & {:keys [model provider tool metadata prompt-tokens]}]
+  (let [cost (calculate-cost resource-type amount {:model model :prompt-tokens prompt-tokens})
         ledger-id (random-uuid)
         prior-used (or (d/q '[:find ?u .
                               :in $ ?cid
