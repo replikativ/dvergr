@@ -608,6 +608,40 @@
            0 (room-repos id)))))
    0 (sdb/all-rooms)))
 
+(defonce ^:private storage-gc-enabled (atom false))
+
+(defn enable-storage-gc!
+  "Allow storage GC that deletes (`gc-stores!`, `gc-room!` without
+   `:dry-run?`). Off by default: datahike's `gc-storage` fails open (an
+   incomplete mark, e.g. a branch walk dying on an Error, made its keep-set
+   `#{:branches}`, and the sweep deleted every other key of a system DB:
+   dev.simm.is, 2026-09-29). Turn it on only with a datahike that fails closed
+   (datahike#1117) and a backup. The daemon turns it on for `:gc {:enabled?
+   true}`."
+  [on?]
+  (reset! storage-gc-enabled (boolean on?)))
+
+(defn storage-gc-enabled? [] @storage-gc-enabled)
+
+(defn- refuse-gc-unless-enabled! [opts]
+  (when-not (or (:dry-run? opts) @storage-gc-enabled)
+    (throw (ex-info (str "Storage GC is off: datahike's gc-storage can delete a whole store when its "
+                         "mark is incomplete (datahike#1117). A dry run ({:dry-run? true}) is allowed; "
+                         "enable deleting GC with the daemon's :gc {:enabled? true}.")
+                    {:type ::storage-gc-disabled}))))
+
+(defn- gc-report
+  "A system DB GC result as a report: a dead or empty result is a failure,
+   never `:reclaimed 0`."
+  [r]
+  (cond
+    (= r ::timeout) {:error "timed out"}
+    (nil? r) {:error "the GC returned nothing (it may have died)"}
+    (number? r) {:reclaimed r}
+    (counted? r) {:reclaimed (count r)}
+    (seqable? r) {:reclaimed (count (seq r))}
+    :else {:error (str "unexpected GC result " (pr-str r))}))
+
 (defn gc-stores!
   "Reclaim unreachable storage across EVERY persistent store: the system-db plus
    each room's whole workspace (kb + msgs datahike, repo git, agent-created data).
@@ -623,15 +657,16 @@
    Returns `{:rooms n :system-db <report>}`. Best-effort, isolated per room."
   ([] (gc-stores! {}))
   ([opts]
+   (refuse-gc-unless-enabled! opts)
    (let [rb (or (:remove-before opts) (java.util.Date. 0))
          ;; system-db is a plain root datahike (the registry itself), not in any
          ;; ctx workspace — GC it directly. BOUNDARY deref with timeout (the api
          ;; returns datahike's async throwable-promise), mirroring the ygg adapter.
-         sysdb (try (let [r (deref (d/gc-storage (sdb/get-conn) rb) 600000 ::timeout)]
-                      {:reclaimed (if (= r ::timeout) :timeout
-                                      (cond (number? r) r (counted? r) (count r)
-                                            (seqable? r) (count (seq r)) :else 0))})
+         sysdb (try (gc-report (deref (d/gc-storage (sdb/get-conn) rb) 600000 ::timeout))
                     (catch Throwable e {:error (.getMessage e)}))
+         _ (when (:error sysdb)
+             (tel/log! {:level :warn :id :rooms/gc-failed :data {:system :system-db :error (:error sysdb)}}
+                       "System DB storage GC failed"))
          rooms (atom 0)]
      ;; Each room runs on its OWN ctx whose composite workspace holds all its
      ;; systems — one coordinated `ygg/gc!` sweeps kb+msgs+repo+data together.
@@ -803,8 +838,11 @@
    run later, after the room's grant changed."
   [sid cps]
   (cps (fn [report]
-         (tel/log! {:level :info :id :rooms/gc-done :data {:system sid :report (pr-str report)}}
-                   "Room storage GC finished"))
+         (if (nil? report)
+           (tel/log! {:level :warn :id :rooms/gc-failed :data {:system sid :error "the GC returned nothing"}}
+                     "Room storage GC failed")
+           (tel/log! {:level :info :id :rooms/gc-done :data {:system sid :report (pr-str report)}}
+                     "Room storage GC finished")))
        (fn [error]
          (tel/log! {:level :warn :id :rooms/gc-failed :data {:system sid :error (str error)}}
                    "Room storage GC failed")))
@@ -822,6 +860,7 @@
    may be collected."
   ([room-id] (gc-room! room-id {}))
   ([room-id opts]
+   (refuse-gc-unless-enabled! opts)
    (let [may-write? (system-write-check room-id)
          reports (into {}
                        (keep (fn [[sid sys]]

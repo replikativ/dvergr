@@ -673,7 +673,9 @@
 ;; Storage GC — periodic datahike index reclamation on a DEDICATED thread.
 ;; Runs OFF the reactive loop (it blocking-derefs datahike's async writer at a
 ;; boundary; doing that on a spin/dispatch thread could deadlock). Config:
-;;   :gc {:interval-ms <ms, default 6h> :retention-days <n, default nil = keep all>}
+;;   :gc {:enabled? true :interval-ms <ms, default 6h> :retention-days <n, default nil = keep all>}
+;; OFF unless `:enabled? true` (`srooms/enable-storage-gc!`: datahike's
+;; gc-storage fails open, datahike#1117).
 ;; retention-days nil ⇒ keep ALL history, reclaim only orphan (fork/branch) garbage;
 ;; set it to actually collapse old history (the load-bearing knob for bounded growth).
 ;; ---------------------------------------------------------------------------
@@ -918,8 +920,13 @@
         ;; took the old monolithic store to tens of GB.
         ;; `:gc false`: none (an experiment's home: its stores live as long
         ;; as the experiment, as they did before homes)
-        (when-not (false? (:gc config))
-          (start-gc-loop! exec-ctx (:gc config)))
+        ;; `:gc {:enabled? true}` only: datahike's gc-storage can delete a whole
+        ;; store when its mark is incomplete (datahike#1117)
+        (if (and (map? (:gc config)) (:enabled? (:gc config)))
+          (do (srooms/enable-storage-gc! true)
+              (start-gc-loop! exec-ctx (:gc config)))
+          (do (srooms/enable-storage-gc! false)
+              (tel/log! {:id :rooms/gc-off} "Storage GC is off (enable with :gc {:enabled? true})")))
 
         ;; Auto-create THE global room — the single default channel
         ;; every registered agent auto-joins. Slug is configurable via

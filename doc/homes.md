@@ -135,14 +135,23 @@ Each of these opens the home with a headless daemon, so call them where no daemo
 ## Storage GC
 
 Datahike's indices are immutable: every transaction writes new index nodes and leaves the
-superseded ones behind, and only a GC frees them. A normal daemon runs
+superseded ones behind, and only a GC frees them. With `:gc {:enabled? true}` a daemon runs
 `dvergr.system.rooms/gc-stores!` (the system DB and every room's stores) on a thread of its
 own, once at boot and then every `:interval-ms`. It is set by `:gc` in `config.local.edn`:
 
 ```clojure
-:gc {:interval-ms 21600000   ; every 6 h (default)
+:gc {:enabled? true          ; default OFF, see below
+     :interval-ms 21600000   ; every 6 h (default)
      :retention-days 30}     ; default nil: keep all history
 ```
+
+**Storage GC is off by default.** Datahike's `gc-storage` fails open: when its mark is
+incomplete (a branch walk that dies on an Error), the keep-set shrinks to `#{:branches}`
+and the sweep deletes every other key of the store; that wiped a system DB on 2026-09-29.
+Until a datahike that fails closed (datahike#1117) is released and dvergr depends on it,
+deleting GC (`gc-stores!`, `dvergr.room/gc!` without `:dry-run?`) is refused unless the
+daemon enables it; keep a backup when you do. A dry run is always allowed. A GC that
+returns nothing is logged as a failure (`:rooms/gc-failed`), not as `:reclaimed 0`.
 
 With `:retention-days` nil, the sweep keeps every snapshot and reclaims only what no snapshot
 or branch head reaches. With a number, snapshots older than that are collapsed:
