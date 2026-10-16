@@ -1612,24 +1612,31 @@
           ent (room-by-slug conn (store/room-id->slug room-id))
           _ (when-not ent
               (throw (ex-info "No room to store a Review in" {:type :room-store/unknown-room :room-id room-id})))
-          existing (fn [] (dh/q '[:find [?cid ?p] :in $ ?id
-                                  :where [?r :review/id ?id] [?r :review/payload-edn ?p]
-                                  [?r :review/chat ?c] [?c :chat/id ?cid]]
-                                @conn id))
+          existing (fn [db] (dh/q '[:find [?cid ?p] :in $ ?id
+                                    :where [?r :review/id ?id] [?r :review/payload-edn ?p]
+                                    [?r :review/chat ?c] [?c :chat/id ?cid]]
+                                  db id))
           same? (fn [[cid p]] (and (= cid (:chat/id ent)) (= p payload)))
-          collision #(ex-info "A Review is immutable" {:type :room-store/review-identity-collision :review/id id})]
-      (if-let [e (existing)]
+          collision #(ex-info "A Review is immutable" {:type :room-store/review-identity-collision :review/id id})
+          entity (cond-> {:review/id id
+                          :review/chat [:chat/id (:chat/id ent)]
+                          :review/world (:review/world review)
+                          :review/decision (:review/decision review)
+                          :review/reviewed-at (:review/reviewed-at review)
+                          :review/payload-edn payload}
+                   (:review/run-id review) (assoc :review/run-id (:review/run-id review)))]
+      (if-let [e (existing @conn)]
         (if (same? e) review (throw (collision)))
-        (do (dh/transact conn [(cond-> {:review/id id
-                                        :review/chat [:chat/id (:chat/id ent)]
-                                        :review/world (:review/world review)
-                                        :review/decision (:review/decision review)
-                                        :review/reviewed-at (:review/reviewed-at review)
-                                        :review/payload-edn payload}
-                                 (:review/run-id review) (assoc :review/run-id (:review/run-id review)))])
-            ;; an identity upserts: a concurrent writer of the same id with
-            ;; other content would have replaced it, so read it back
-            (when-not (some-> (existing) same?) (throw (collision)))
+        ;; decided inside the transaction (the writer runs it against the
+        ;; current db): absent → insert; this room's identical record → nothing;
+        ;; anything else → refused before any datom is written. An identity
+        ;; would otherwise upsert over another writer's Review, or move it to
+        ;; another room.
+        (do (dh/transact conn [[:db.fn/call
+                                (fn [db]
+                                  (if-let [e (existing db)]
+                                    (if (same? e) [] (throw (collision)))
+                                    [entity]))]])
             review))))
 
   (-load-review [{:keys [conn]} room-id review-id]
