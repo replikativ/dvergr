@@ -189,9 +189,10 @@
 (defn all-systems
   "Every registered system `{:system/type :system/scope …}` — used to re-register
    them as yggdrasil systems on daemon boot (the composite is in-memory)."
-  []
-  (d/q '[:find [(pull ?e [:system/id :system/type :system/scope :system/name]) ...]
-         :where [?e :system/id]] @(get-conn)))
+  ([] (all-systems @(get-conn)))
+  ([db]
+   (d/q '[:find [(pull ?e [:system/id :system/type :system/scope :system/name]) ...]
+          :where [?e :system/id]] db)))
 
 (defn- foreign-scope
   "When `scope` is a store of another home's `systems/` directory: that store's
@@ -590,13 +591,14 @@
   "The systems attached to a room, each as `{:system … :permission …}`.
    This is the resolver the sandbox/KB tools consult to know which stores a room
    may read/write."
-  [room-id]
-  (->> (d/q '[:find (pull ?se [*]) ?perm
-              :in $ ?r
-              :where [?g :grant/room ?re] [?re :room/id ?r]
-              [?g :grant/system ?se] [?g :grant/permission ?perm]]
-            @(get-conn) room-id)
-       (mapv (fn [[sys perm]] {:system sys :permission perm}))))
+  ([room-id] (systems-for-room @(get-conn) room-id))
+  ([db room-id]
+   (->> (d/q '[:find (pull ?se [*]) ?perm
+               :in $ ?r
+               :where [?g :grant/room ?re] [?re :room/id ?r]
+               [?g :grant/system ?se] [?g :grant/permission ?perm]]
+             db room-id)
+        (mapv (fn [[sys perm]] {:system sys :permission perm})))))
 
 (defn systems-for-room-of-type
   "Attached systems of a given `:system/type` (e.g. :kb or :repo) for a room."

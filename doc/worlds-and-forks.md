@@ -467,6 +467,19 @@ returned as explicit recovery state with the durable receipt still attached;
 `dvergr.discourse/retry-settlement-abort!` repairs that durable intent before
 the still-open capability can receive a new decision.
 
+Affine possession is not a current grant on the merge targets. Product adopters
+must check human decision authority and current originating-room grants before
+journaling a merge. `dvergr.system.rooms/assert-fork-merge-permitted!` supplies
+the room-grant preflight for a fixed partition leaf; partition even a singleton
+world before using it. Call it in the trusted `prepare!` callback with the
+actual leaf handle and origin slug resolved from the adopter's durable room
+identity, not caller-supplied descriptor ancestry. It checks only that leaf,
+refuses unavailable protected deltas, and leaves discard/commit-only recovery
+possible after revocation. This preflight is not atomic with an independent
+grant writer. `dvergr.system.rooms/registry-system-for` resolves runtime system
+names through the canonical registry rules so a product can separately enforce
+its human per-target permissions without duplicating those naming rules.
+
 The durable half belongs to the adopter and is not in this repository: store the
 descriptor as a GC root, index its systems, journal per-system settlement, and
 after a restart reopen the named Datahike/Geschichte branches under that

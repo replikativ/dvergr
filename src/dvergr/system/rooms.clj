@@ -841,6 +841,32 @@
     :book (book-system-name scope)
     nil))
 
+(defn- registry-system-index [db]
+  (let [systems (filter #(#{:kb :msgs :repo :data :book} (:system/type %))
+                        (sdb/all-systems db))]
+    (doseq [system systems]
+      (when-not (and (string? (:system/scope system)) (seq (:system/scope system)))
+        (throw (ex-info "Registry-backed system has no valid scope locator"
+                        {:type ::invalid-system-scope :system/id (:system/id system)}))))
+    (group-by #(system-name (:system/type %) (:system/scope %)) systems)))
+
+(defn- unambiguous-system [index runtime-id]
+  (let [matches (get index runtime-id)]
+    (when (> (count matches) 1)
+      (throw (ex-info "Runtime system has ambiguous registry identity"
+                      {:type ::ambiguous-system :system runtime-id})))
+    (first matches)))
+
+(defn registry-system-for
+  "Resolve an exact runtime system id through the canonical registry naming
+   rules. Nil means unregistered; ambiguous identities refuse rather than
+   selecting a grant by query order. The db arity is pure and lets a host
+   authorize several proposal components against ONE registry snapshot."
+  ([runtime-id] (registry-system-for @(sdb/get-conn) runtime-id))
+  ([db runtime-id]
+   (when runtime-id
+     (unambiguous-system (registry-system-index db) runtime-id))))
+
 (defn connection-system-id
   "The registry id of `conn` in the bound world, when a trunk policy is set.
    Tool transaction effects carry this so an unrelated protected KB does not
@@ -863,21 +889,23 @@
    still registered in the room's composite, not at all. A system the
    registry does not know (a mailbox) is the room's own. Read once: call it
    again after the grants change. The trunk policy is checked on each call
-   of the predicate. The second arity disables only that policy for merge
-   settlement, which still checks grants."
+   of the predicate. Ambiguous runtime identities refuse; registry identities
+   and room grants are read from one DB snapshot. The second arity disables
+   only that policy for merge settlement, which still checks grants."
   ([room-id] (system-write-check room-id true))
   ([room-id trunk-policy?]
-   (let [systems (sdb/all-systems)
-         ids (into {} (map #(vector (system-name (:system/type %) (:system/scope %)) (:system/id %))) systems)
-         registry (set (keys ids))
+   (let [db @(sdb/get-conn)
+         index (registry-system-index db)
          writable (into #{}
                         (keep (fn [{:keys [system permission]}]
                                 (when (grant-permits? permission :write)
-                                  (system-name (:system/type system) (:system/scope system)))))
-                        (when room-id (sdb/systems-for-room room-id)))]
+                                  (:system/id system))))
+                        (when room-id (sdb/systems-for-room db room-id)))]
      (fn [sid]
-       (and (or (contains? writable sid) (not (contains? registry sid)))
-            (or (not trunk-policy?) (nil? (trunk-write-refusal room-id (get ids sid sid)))))))))
+       (let [system (unambiguous-system index sid)
+             id (:system/id system)]
+         (and (or (nil? system) (contains? writable id))
+              (or (not trunk-policy?) (nil? (trunk-write-refusal room-id (or id sid))))))))))
 
 (defn- delta-changed?
   "Whether a fork's merge-base delta of one system (`ygg/context-diff`)
@@ -917,6 +945,51 @@
                                "not permit writes, or they were detached): " (pr-str changed)
                                "; discard the fork")
                           {:type ::merge-not-permitted :room/id room-id :systems changed})))))))
+
+(defn assert-fork-merge-permitted!
+  "Fresh room-grant preflight for an adopted ForkHandle settlement leaf.
+
+   The trusted adopter supplies the durable origin room's slug, NOT ancestry
+   copied from an external descriptor. Call from its merge prepare! callback,
+   under the handle's authority lock, before journaling the decision. Only the
+   selected handle's authoritative scope/delta is checked, never its siblings.
+   Only fixed partition leaves are accepted (partition a singleton too).
+   Original handles can outgrow their creation metadata, and their shared
+   delta does not describe every child-only system a merge could introduce.
+   Missing/error deltas for blocked mergeable systems fail closed; unchanged
+   blocked systems do not prevent a no-op merge. Discard and persistence-only
+   commit retries need no write grant.
+
+   This is a fresh preflight, not a transaction with an independent grant
+   writer. It does not grant human decision authority or replace an adopter's
+   own permission checks."
+  [slug handle]
+  (when-not (ygg/fork-handle? handle)
+    (throw (ex-info "Merge permission check requires a ForkHandle"
+                    {:type ::invalid-fork-handle})))
+  (let [room-id (:room/id (sdb/room-by-slug slug))]
+    (when-not room-id
+      (throw (ex-info "Cannot resolve the adopted world's origin room"
+                      {:type ::merge-not-permitted :room/slug slug})))
+    (let [may-write? (system-write-check room-id false)
+          descriptor (ygg/fork-descriptor handle)
+          _ (when-not (:fork/partition-of descriptor)
+              (throw (ex-info "Merge permission check requires a fixed partition leaf"
+                              {:type ::merge-scope-not-fixed})))
+          diff (try (ygg/fork-diff handle)
+                    (catch Throwable error
+                      (throw (ex-info "Cannot inspect the selected world's merge delta"
+                                      {:type ::merge-not-permitted :room/id room-id} error))))
+          described (into #{} (keep (fn [[sid metadata]]
+                                      (when-not (= :shared (:kind metadata)) sid)))
+                          (:fork/systems descriptor))
+          systems (into described (keys diff))
+          blocked (remove may-write? systems)
+          changed (filterv #(or (nil? (get diff %)) (delta-changed? (get diff %)))
+                           (sort-by pr-str blocked))]
+      (when (seq changed)
+        (throw (ex-info "The selected world changed systems its origin room may no longer write"
+                        {:type ::merge-not-permitted :room/id room-id :systems changed}))))))
 
 (defn- start-gc!
   "Start one system's GC: `gc-system!` answers a partial-cps computation,
