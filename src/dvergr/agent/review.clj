@@ -37,6 +37,7 @@
             [dvergr.agent.roster :as roster]
             [dvergr.model.registry :as models]
             [dvergr.principal :as principal]
+            [dvergr.resource :as resource]
             [dvergr.rooms.files :as files]
             [dvergr.discourse :as d]
             [dvergr.kb.wiki :as kb-wiki]
@@ -204,11 +205,12 @@
 (defn- parse-verdict [answer]
   (try
     (with-open [reader (java.io.PushbackReader. (java.io.StringReader. answer))]
-      (let [v (edn/read {:eof ::eof} reader)]
+      (let [eof (Object.)
+            v (edn/read {:eof eof} reader)]
         (if (and (map? v) (#{:approve :escalate} (:review/verdict v))
                  (every? #(and (vector? %) (every? string? %))
                          [(:review/reasons v) (:review/concerns v)])
-                 (= ::eof (edn/read {:eof ::eof} reader)))
+                 (identical? eof (edn/read {:eof eof} reader)))
           (select-keys v [:review/verdict :review/reasons :review/concerns])
           {:review/verdict :escalate :review/reasons ["the reviewer gave no valid EDN verdict"]
            :review/concerns []})))
@@ -216,9 +218,43 @@
       {:review/verdict :escalate :review/reasons ["the reviewer gave no valid EDN verdict"]
        :review/concerns []})))
 
+(defn- await-reviewer!
+  "Own settlement independently of the boundary thread. A handle publishes only
+   after physical quiescence; waiting Runs then need an explicit discard."
+  [room handle timeout-ms]
+  (let [finished (promise)
+        timeout (Object.)
+        watcher (Thread.
+                 ^Runnable
+                 (bound-fn []
+                   (binding [ec/*spin-id* nil]
+                     (deliver finished
+                              (try
+                                (let [result @handle]
+                                  (when-let [work (rreg/lookup (:run/world result))]
+                                    (let [{:keys [ok? error]} (forks/discard! work :reviewer-finished)]
+                                      (when-not ok?
+                                        (throw (ex-info "Reviewer world could not be discarded" {:error error})))))
+                                  result)
+                                (catch Throwable t t))))))]
+    (try
+      (doto watcher
+        (.setName (str "dvergr-review-settlement-" (:run/id handle)))
+        (.setDaemon true)
+        (.start))
+      (let [result (deref finished timeout-ms timeout)]
+        (when (identical? timeout result)
+          (throw (ex-info "Reviewer Run timed out" {:timeout-ms timeout-ms})))
+        (when (instance? Throwable result) (throw result))
+        result)
+      (catch Throwable t
+        (program/cancel! room handle)
+        (throw t)))))
+
 (defn model-reviewer
   "A one-review callback for `review!`: `(model-reviewer daemon room world spec caller)`.
-   `world` is the retained fork id; `caller` supplies :principal/delegation.
+   `world` is the retained fork id; `caller` supplies :principal/delegation
+   and optionally :principal/run (the payer Run UUID).
    The spec's :review/reviewer requires :model and :instructions. The model
    receives an EDN evidence snapshot and no callable tools. Its own hired Run
    settles :discard. Callback metadata supplies review!'s ops invocation and
@@ -229,7 +265,9 @@
         fork (or (resolve-room daemon (room-arg world))
                  (throw (ex-info "No retained world" {:world world})))
         world (room-arg (:id fork))
-        {:keys [model instructions]} (:review/reviewer spec)
+        {:keys [model instructions timeout-ms] :or {timeout-ms 60000}} (:review/reviewer spec)
+        _ (when-not (and (integer? timeout-ms) (pos? timeout-ms))
+            (throw (ex-info "Reviewer :timeout-ms must be a positive integer" {:type ::invalid-reviewer})))
         _ (when-not (and (string? model) (not (str/blank? model)) (string? instructions))
             (throw (ex-info "Model reviewer requires :model and :instructions" {:type ::invalid-reviewer})))
         _ (models/ensure-models-loaded!)
@@ -272,13 +310,11 @@
                                                     (throw e))))]))))
                 task (pr-str (assoc input :review/instructions instructions
                                     :review/fork-diff diff :review/fork-review rev :review/files contents))
-                result @(program/hire! room team :reviewer {:task task :from :reviewer :settlement :discard})]
-            ;; Generic waiting Runs retain their world even under :discard.
-            ;; A reviewer has no work to retain when it exhausts its limit.
-            (when-let [work (rreg/lookup (:run/world result))]
-              (let [{:keys [ok? error]} (forks/discard! work :reviewer-finished)]
-                (when-not ok?
-                  (throw (ex-info "Reviewer world could not be discarded" {:error error})))))
+                handle (program/hire! room team :reviewer
+                                      (cond-> {:task task :from :reviewer :settlement :discard
+                                               :resources {resource/microdollars 500000M}}
+                                        (:principal/run caller) (assoc :parent-run (:principal/run caller))))
+                result (await-reviewer! room handle timeout-ms)]
             (when-not (and (= :completed (:run/status result)) (= :discarded (:run/settlement-status result)))
               (throw (ex-info "Reviewer Run did not complete and discard" {:result result})))
             (parse-verdict (:run/value result)))))
@@ -365,7 +401,8 @@
                         {:review/verdict :escalate :review/reasons [(str "the reviewer failed: " (.getMessage t))]})))
           ;; with a reviewer, only its explicit approval approves
           approved? (and (empty? failed)
-                         (if asked? (= :approve (:review/verdict verdict)) true))
+                         (if asked? (and (= :approve (:review/verdict verdict))
+                                         (empty? (:review/concerns verdict))) true))
           spot? (and approved? (spot-checked? id (:review/spot-check spec)))
           base {:review/id id :review/world (room-arg world) :review/state-token state
                 :review/checks checks :review/policy (policy-id spec)
@@ -389,7 +426,8 @@
             (escalated reasons)))
 
         (not approved?)
-        (escalated (into ["the reviewer escalated"] (:review/reasons verdict)))
+        (escalated (into (into ["the reviewer escalated"] (:review/reasons verdict))
+                         (:review/concerns verdict)))
 
         spot?
         (escalated ["sampled for a person (spot check)"])

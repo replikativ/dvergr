@@ -339,8 +339,13 @@ For a model reviewer, the host constructs a callback for one review:
 `model-reviewer` takes `[daemon room world spec caller]`. The spec's
 `:review/reviewer` requires `:model` (a registry model id or alias) and `:instructions`.
 It hires a separate `:llm` Run in `room`, with `:settlement :discard`, a four-step
-limit and a $0.50 budget. The model has no callable tools: its read access is an EDN
-snapshot in the task containing the usual review input, plus `:review/fork-diff`,
+limit and a $0.50 budget allocated from the room ledger, or from the caller’s
+Run wallet when `:principal/run` supplies its UUID. Model usage debits this
+allocation; unused funds return to the payer after quiescence. Optional
+`[:review/reviewer :timeout-ms]` (default 60000) bounds the wait. Timeout or
+interruption cancels the Run; settlement continues independently of the caller
+and discards its world after quiescence. The model has no callable tools: its
+read access is an EDN snapshot in the task containing the usual review input, plus `:review/fork-diff`,
 `:review/fork-review` and `:review/files`. The last maps changed paths to `room_read`
 file data (including text or base64), or `{:deleted? true}`. Declared paths come from
 `[:diff/only-paths prefixes]`; unreadable or oversized files fail closed. Instructions
@@ -350,7 +355,8 @@ including when it exhausts its limit and stops at `:waiting`.
 
 The final answer must be exactly one EDN map, without fences or trailing text:
 `{:review/verdict :approve|:escalate :review/reasons ["…"] :review/concerns ["…"]}`.
-Both lists are vectors of strings. Malformed answers and failed Runs escalate.
+Both lists are vectors of strings. Malformed answers, failed Runs, and approvals
+with non-empty concerns escalate to a person.
 
 The callback carries an ops invocation in its metadata, which `review!` uses for
 settlement even if `:invoke` is supplied. Its principal is an agent run token with
