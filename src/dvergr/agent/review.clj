@@ -78,7 +78,10 @@
 
 (defn- under? [path prefixes]
   (let [p (str/replace (str path) #"^/+" "")]
-    (some #(str/starts-with? p (str/replace (str %) #"^/+" "")) prefixes)))
+    (some (fn [prefix]
+            (let [prefix (-> (str prefix) (str/replace #"^/+" "") (str/replace #"/+$" ""))]
+              (or (empty? prefix) (= p prefix) (str/starts-with? p (str prefix "/")))))
+          prefixes)))
 
 (defmethod run-check :diff/only-paths [[_ prefixes] {:keys [files other-systems kb-systems]}]
   (let [other-systems (remove (set kb-systems) other-systems)
@@ -166,11 +169,11 @@
           distinct (sort-by (juxt :entity (comp str :attribute))) (take 20) vec))))
 
 (defmethod run-check :diff/only-kb-pages
-  [[_ {:keys [system kinds]}] {:keys [fork other-systems]}]
+  [[_ {:keys [system kinds]}] {:keys [fork other-systems kb-systems]}]
   (let [sid (kb-system-id system)
         [before after] (kb-snapshots fork sid)
         offenders (kb-offenders (kb-wiki/datoms before) (kb-wiki/datoms after) kinds (kb-wiki/attrs before nil))
-        others (vec (remove #{sid} other-systems))]
+        others (vec (remove (conj (set kb-systems) sid) other-systems))]
     {:pass? (and (empty? offenders) (empty? others))
      :evidence (cond-> {:offenders offenders}
                  (seq others) (assoc :other-systems others))}))
@@ -254,15 +257,19 @@
 
 (defn model-reviewer
   "A one-review callback for `review!`: `(model-reviewer daemon room world spec caller)`.
-   `world` is the retained fork id; `caller` supplies :principal/delegation
-   and optionally :principal/run (a live payer Run with a child supervisor).
+   `world` is the retained fork id. A reviewer principal requires the caller's
+   :principal/delegation and :principal/delegation-scope map; otherwise reads
+   and decisions use the caller. Optional :principal/run is a live payer Run
+   with a child supervisor.
    The spec's :review/reviewer requires :model and :instructions. The model
    receives an EDN evidence snapshot and no callable tools. Its own hired Run
    settles :discard. A parent-funded Run is owned by the payer's supervisor.
    Callback metadata supplies review!'s ops invocation and
    token cleanup, including when checks fail before the model is asked."
   [daemon room world spec caller]
-  (let [invoke (requiring-resolve 'dvergr.ops/invoke)
+  (let [spec ((requiring-resolve 'dvergr.agent.workflow/bounded-reviewer-spec)
+              room {:daemon daemon :principal caller} spec)
+        invoke (requiring-resolve 'dvergr.ops/invoke)
         resolve-room (requiring-resolve 'dvergr.ops/resolve-room)
         fork (or (resolve-room daemon (room-arg world))
                  (throw (ex-info "No retained world" {:world world})))
@@ -278,15 +285,19 @@
               (roster/make-roster {:id :review/roster})
               {:id :reviewer :prompt reviewer-prompt :tools #{}
                :model-policy {:model model :provider (:provider (models/get-model! model))}
-               :program {:kind :llm :max-model-steps 4 :budget-dollars 0.50}})
-        token (principal/mint-run-token!
-               {:actor :reviewer :room world :tools #{"room_diff" "room_review" "room_merge"}
-                :claims (select-keys caller [:principal/delegation])})
-        p (principal/run-token-principal token)
+               :program {:kind :llm :max-model-steps 4 :budget-dollars (or (:budget-dollars (:review/reviewer spec)) 0.50)}})
+        scoped? (and (:principal/delegation caller) (map? (:principal/delegation-scope caller)))
+        token (when scoped?
+                (principal/mint-run-token!
+                 {:actor :reviewer :room world :tools #{"room_diff" "room_review" "room_merge"}
+                  :claims (select-keys caller [:principal/delegation :principal/delegation-scope])}))
+        p (if token (principal/run-token-principal token) caller)
         call (fn [op args]
                (when-not (#{:room/diff :room/review :room/merge} op)
                  (throw (ex-info "Operation outside reviewer tool pins" {:op op})))
-               (invoke daemon p op args))]
+               (invoke daemon p op (cond-> args
+                                     (= :room/merge op)
+                                     (merge (select-keys caller [:principal/delegation :principal/delegation-scope])))))]
     (with-meta
       (fn [input]
         (when-not (= world (:review/world input))
@@ -315,14 +326,14 @@
                 parent-run (:principal/run caller)
                 admit! #(program/hire! room team :reviewer
                                        (cond-> {:task task :from :reviewer :settlement :discard
-                                                :resources {resource/microdollars 500000M}}
+                                                :resources {resource/microdollars (* 1000000M (bigdec (or (get-in spec [:review/reviewer :budget-dollars]) 0.50)))}}
                                          parent-run (assoc :parent-run parent-run)))
                 handle (if parent-run (run/with-owned-child! room parent-run admit!) (admit!))
                 result (await-reviewer! room handle timeout-ms)]
             (when-not (and (= :completed (:run/status result)) (= :discarded (:run/settlement-status result)))
               (throw (ex-info "Reviewer Run did not complete and discard" {:result result})))
             (parse-verdict (:run/value result)))))
-      {::invoke call ::close #(principal/revoke-run-token! token)})))
+      {::invoke call ::close #(when token (principal/revoke-run-token! token))})))
 
 (defn- decide-merge!
   "Merge `fork` if it is still in `state`: through `invoke` (`(invoke op args)`,
@@ -344,24 +355,34 @@
     (forks/discard! fork :review-rejected)))
 
 (defn- record! [room review]
-  (when-let [st (:store room)]
-    (when (satisfies? store/PReviewStore st)
-      (store/-store-review! st (store/conversation-id room) review)))
-  review)
+  (let [review (merge review (select-keys (:review/effective-policy review)
+                                          [:review/declared-writes :review/delegation-scope :review/write-scope]))]
+    (when-let [st (:store room)]
+      (when (satisfies? store/PReviewStore st)
+        (store/-store-review! st (store/conversation-id room) review)))
+    review))
 
 (defn- escalate! [room review]
-  (try
-    ;; a room message like any other (`d/message`): conversation listeners
-    ;; (`on-each-message`, mirrors, a chat projection) see it
-    (d/post! room (d/message :reviewer (d/room-target room)
-                             (str "Review of " (:review/world review) " needs a person: "
-                                  (str/join "; " (:review/reasons review))
-                                  " (review_list, decision escalated)")
-                             nil
-                             (cond-> {:kind :review/escalated
-                                      :object {:kind :review :id (:review/id review)}}
-                               (:review/run-id review) (assoc :run-id (:review/run-id review)))))
-    (catch Throwable _ nil))
+  (let [id (hasch/uuid [:review/escalation (:review/id review)])
+        msg (assoc (d/message :reviewer (d/room-target room)
+                              (str "Review of " (:review/world review) " needs a person: "
+                                   (str/join "; " (:review/reasons review))
+                                   " (review_list, decision escalated)")
+                              nil
+                              (cond-> {:kind :review/escalated
+                                       :object {:kind :review :id (:review/id review)}}
+                                (:review/run-id review) (assoc :run-id (:review/run-id review))))
+                   :id id :thread-root-id id
+                   :ts (.getTime ^java.util.Date (:review/reviewed-at review)))]
+    (try
+      (d/post! room msg)
+      (catch clojure.lang.ExceptionInfo e
+        ;; Teardown has closed message routing, but the Review's durable
+        ;; notification is still part of settling an admitted worker.
+        (if (= :dvergr.discourse/fork-transfer-in-progress (:type (ex-data e)))
+          (when (= :failed (store/-store-message! (:store room) (store/conversation-id room) msg))
+            (throw e))
+          (throw e)))))
   review)
 
 (defn- review-world!
@@ -370,7 +391,7 @@
    `:reviewer` (a function, see the ns doc; required when the spec names a
    reviewer), `:invoke` (merge/discard through ops as a principal), `:now`.
    Returns the stored Review."
-  [room world spec & {:keys [run-id reviewer invoke now]}]
+  [room world spec & {:keys [run-id reviewer invoke now id]}]
   ;; the room's context: its registry, its forks (never a caller's)
   (binding [ec/*execution-context* (:ctx room)]
     (let [spec (merge default-spec spec)
@@ -382,7 +403,7 @@
                   (throw (ex-info (str world " is not a reviewable fork") {:type ::not-reviewable :world world})))
           state (:state rev)
           ctx (merge {:fork fork :review rev
-                      :kb-systems (vec (for [[k opts] (filter vector? (:review/checks spec))
+                      :kb-systems (vec (for [[k opts] (filter vector? (or (:review/host-checks spec) (:review/checks spec)))
                                              :when (= :diff/only-kb-pages k)]
                                          (try (kb-system-id (:system opts)) (catch Exception _ nil))))}
                      (changed-files fork rev))
@@ -390,7 +411,7 @@
                         (merge {:check c} (try (run-check c ctx)
                                                (catch Throwable t {:pass? false :evidence {:error (.getMessage t)}})))))
           failed (remove :pass? checks)
-          id (random-uuid)
+          id (or id (random-uuid))
           asked? (and (empty? failed) (:review/reviewer spec))
           verdict (when asked?
                     (try
@@ -410,6 +431,7 @@
           spot? (and approved? (spot-checked? id (:review/spot-check spec)))
           base {:review/id id :review/world (room-arg world) :review/state-token state
                 :review/checks checks :review/policy (policy-id spec)
+                :review/effective-policy spec
                 :review/reviewed-at (or now (java.util.Date.))}
           base (cond-> base
                  run-id (assoc :review/run-id run-id)
@@ -423,7 +445,9 @@
         (seq failed)
         (let [reasons (mapv #(str "check failed: " (pr-str (:check %))) failed)]
           (if (= :discard (:review/on-fail spec))
-            (let [{:keys [ok? error]} (decide-discard! fork invoke)]
+            (let [{:keys [ok? error]} (if (and (:review/settlement? spec) (not invoke))
+                                        {:error "No authorized discard principal"}
+                                        (decide-discard! fork invoke))]
               (if ok?
                 (record! room (assoc base :review/decision :discarded :review/reasons reasons))
                 (escalated (conj reasons (str "discard failed: " error)))))
@@ -440,7 +464,9 @@
         (escalated (into ["approved; merging is left to a person"] (:review/reasons verdict)))
 
         :else
-        (let [{:keys [ok? error]} (decide-merge! fork state invoke)]
+        (let [{:keys [ok? error]} (if (and (:review/settlement? spec) (not invoke))
+                                    {:error "No authorized merge principal"}
+                                    (decide-merge! fork state invoke))]
           (if ok?
             (record! room (assoc base :review/decision :merged))
             (escalated [(str "merge failed: " error)])))))))
@@ -453,7 +479,7 @@
   (let [{call ::invoke close ::close} (meta reviewer)]
     (try
       (apply review-world! room world spec
-             (mapcat identity (cond-> opts call (assoc :invoke call))))
+             (mapcat identity (cond-> opts (and call (not (:invoke opts))) (assoc :invoke call))))
       (finally (when close (close))))))
 
 (defn reviews
@@ -462,5 +488,63 @@
   ([room opts]
    (let [st (:store room)]
      (if (and st (satisfies? store/PReviewStore st))
-       (store/-list-reviews st (store/conversation-id room) opts)
+       (vec (take (or (:limit opts) 100)
+                  (remove #(= :pending (:review/decision %))
+                          (store/-list-reviews st (store/conversation-id room)
+                                               (assoc opts :limit Integer/MAX_VALUE)))))
        []))))
+
+(defn decision-id [run-id] (hasch/uuid [:settlement/decision run-id]))
+
+(defn decision [room run-id]
+  (store/-load-review (:store room) (store/conversation-id room) (decision-id run-id)))
+
+(defn intent!
+  "Persist each reviewable attempt before any reviewer is started. Claims are
+   separate so recording the batch does not acquire another finish's work."
+  [room run-id world policy]
+  (let [intent {:review/id (hasch/uuid [:settlement/review-intent run-id])
+                :review/run-id run-id :review/world (room-arg world)
+                :review/decision :pending :review/checks []
+                :review/reviewed-at (java.util.Date.) :review/effective-policy policy}]
+    (try (record! room intent)
+         (catch clojure.lang.ExceptionInfo e
+           (when-not (= :room-store/review-identity-collision (:type (ex-data e)))
+             (throw e))))))
+
+(defn claim!
+  "Atomically claim an attempt before reviewer setup. A unique claimant makes
+   the store's transactional identity collision the arbiter."
+  [room run-id world policy]
+  (let [intent {:review/id (hasch/uuid [:settlement/intent run-id])
+                :review/claimant (random-uuid) :review/run-id run-id
+                :review/world (room-arg world) :review/decision :pending
+                :review/checks [] :review/reviewed-at (java.util.Date.)
+                :review/effective-policy policy}]
+    (try (record! room intent) true
+         (catch clojure.lang.ExceptionInfo e
+           (if (= :room-store/review-identity-collision (:type (ex-data e)))
+             false (throw e))))))
+
+(defn failure!
+  "Durably escalate an interrupted or failed settlement attempt."
+  [room run-id world policy reason]
+  (if-let [existing (decision room run-id)]
+    (if (= :escalated (:review/decision existing)) (escalate! room existing) existing)
+    (escalate! room
+               (record! room {:review/id (decision-id run-id) :review/run-id run-id
+                              :review/world (room-arg world) :review/decision :escalated
+                              :review/checks [] :review/reviewed-at (java.util.Date.)
+                              :review/effective-policy policy :review/reasons [reason]}))))
+
+(defn recover-interrupted!
+  "Startup recovery: every intent or claim without a decision needs a person."
+  [room]
+  (doseq [intent (store/-list-reviews (:store room) (store/conversation-id room)
+                                      {:decision :pending :limit Integer/MAX_VALUE})
+          :when (not (decision room (:review/run-id intent)))]
+    (failure! room (:review/run-id intent) (:review/world intent)
+              (:review/effective-policy intent) "Review interrupted by daemon restart"))
+  (doseq [rv (store/-list-reviews (:store room) (store/conversation-id room)
+                                  {:decision :escalated :limit Integer/MAX_VALUE})]
+    (escalate! room rv)))

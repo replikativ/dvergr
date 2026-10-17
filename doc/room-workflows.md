@@ -359,10 +359,12 @@ Both lists are vectors of strings. Malformed answers, failed Runs, and approvals
 with non-empty concerns escalate to a person.
 
 The callback carries an ops invocation in its metadata, which `review!` uses for
-settlement even if `:invoke` is supplied. Its principal is an agent run token with
-actor `:reviewer`, pinned to the retained fork id, with tools
+settlement when no explicit `:invoke` is supplied. Its principal is an agent run
+token with actor `:reviewer`, pinned to the retained fork id, with tools
 `#{"room_diff" "room_review" "room_merge"}` and the caller's
-`:principal/delegation` claim unchanged. Diff/review reads and the state-pinned merge
+`:principal/delegation` and `:principal/delegation-scope` claims unchanged when
+present. Without both claims it uses the caller's principal for reads and
+settlement, creating no reviewer principal. Diff/review reads and the state-pinned merge
 pass through `ops/invoke` and the host authorizer as that principal. The parent's
 `:merge` authorization request keeps the parent in `:resolved :room` and adds
 `:resolved :via-room` naming the already authorized fork, so the fork pin permits
@@ -371,5 +373,81 @@ receives the token or the merge capability. `review!` revokes the token after th
 decision, also when checks fail; the callback is for one `review!` invocation.
 The principal has no discard permission in its tool pins.
 
-Next: starting the review from workflow settlement, and the reviewer benchmark
-(generated good and damaged updates: does it approve the good and escalate the bad?).
+Declare the spec under `:review` in a catalog workflow map or the bundle's
+`workflow.edn`. `catalog/plan` and `catalog.room/plan` carry it into
+`workflow/start`; `catalog_start` also accepts a room bundle as `<room>/<name>`
+(on its source room by default). A workflow without a spec retains its world
+for manual review as before. Benchmarks still discard their worlds.
+
+After each attempt settles `:review`, workflow finish commits its workspace and
+runs `review!` with the work Run's `:run-id` on a supervised native worker
+(`program/on-worker!`, using `start-worker!`). Finish waits at the boundary;
+review never blocks a Spin. The Run stays `:review` on escalation; merge and
+discard update its durable settlement status through the existing fork operations.
+When the spec names `:review/reviewer`, `model-reviewer` constructs the callback
+from `:model`, `:instructions` and optional `:timeout-ms`. Catalog jobs supply the
+daemon and invoking principal, including its `:principal/delegation` claim.
+Host callers of `workflow/start` supply `:daemon` and `:principal` (or an explicit
+`:reviewer` callback). The host-only `:on-settlement` callback receives
+`{:room :world :run-id :result}` on the same worker after review, for general
+settlement work. Its world may already have been merged or discarded.
+
+Next: the reviewer benchmark (generated good and damaged updates: does it approve
+the good and escalate the bad?).
+
+Automatic settlement treats a bundle's review specification as a request. The
+host always adds the conflict check and scope checks from the intersection of
+the trusted delegation scope and
+`:workflow/writes {:repo ["wiki/"] :kb {system-id #{:wiki/atom :wiki/overview :wiki/index}}}`.
+A KB set of system ids uses those three wiki kinds. The trusted host mints the
+caller's run token using `dvergr.principal/mint-run-token!` with host-supplied claims:
+
+```clojure
+{:claims {:principal/delegation delegation-id
+          :principal/delegation-scope
+          {:paths ["wiki/"] :kb {system-id #{:wiki/atom :wiki/overview}}}}}
+```
+
+Both claims are required to use delegated authority; the scope must be a map.
+Bundle data never supplies these claims. Paths are intersected by containment:
+a bundle path within a delegated path is retained; a broader bundle prefix is
+restricted to the delegated prefix. A bundle's `"/"` or empty prefix therefore
+cannot widen the delegation. KB systems and page-kind sets are intersected too.
+An empty intersection disables automatic merge. The Review's effective policy
+records `:review/declared-writes`, `:review/delegation-scope` and the enforced
+`:review/write-scope {:paths [...] :kb {...}}`; the Review also carries these
+three fields directly. With no declared writes,
+approval is proposed to a person. Extra bundle checks can further restrict the
+scope; they cannot widen it.
+
+Merge and discard go through `ops/invoke`, using the caller's principal or a
+fork-pinned reviewer principal carrying the caller's delegation. A reviewer
+principal is created and considered for automatic action only when both trusted
+claims exist. Its token carries both claims unchanged. Authorization requests,
+including the final `:room/merge` and its parent check, include
+`:principal/delegation` and `:principal/delegation-scope` in `:args` so the host's
+`:authorize` can validate them. A caller with an unscoped delegation never falls
+back to reviewer authority.
+Without an authorized principal, merge becomes propose and discard becomes
+escalate. The Review's `:review/effective-policy` records the checks, bounded
+reviewer configuration and `:review/downgrades` with reasons. Reviewer models use
+the same admission as workflow candidates, including the host authorization
+request for `[:model id]` and any `:principal/models` cap. Reviewer spending is
+bounded by the requested budget, the workflow's caller budget cap
+(`:budget-dollars`, default $0.50), `:principal/budget-dollars`, and the caller
+Run wallet's remaining balance. A caller Run funds the reviewer when present.
+
+As soon as finish starts, settlement durably writes a `:pending` intent for
+every attempt before claiming or reviewing any of them. A separate atomic claim
+keyed by the attempt Run selects one reviewer. The final Review has a separate
+deterministic identity.
+Concurrent finish calls share that decision; retries never start another review.
+Pending intents are internal records, omitted from `review_list`. Startup
+escalates each intent without a final decision, retaining its world and effective
+policy in the durable Review and posting `:review/escalated`. Setup and execution
+failures also escalate per attempt, allowing subsequent attempts to settle.
+Settlement workers have a room-owned lifecycle Run and a job cancellation hook;
+job cancellation interrupts them and room teardown waits for their termination.
+
+Cancellation durably escalates every remaining undecided attempt before it
+propagates, including attempts whose reviewer has not started.

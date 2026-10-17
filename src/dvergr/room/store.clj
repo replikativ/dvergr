@@ -291,7 +291,7 @@
                        :applied applied :result-run result-run}))))
   applied)
 
-(def review-decisions #{:merged :escalated :discarded})
+(def review-decisions #{:pending :merged :escalated :discarded})
 
 (defn validate-review!
   "Validate one Review record (`dvergr.agent.review`) and return it."

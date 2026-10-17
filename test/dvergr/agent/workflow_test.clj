@@ -71,6 +71,7 @@
       (with-stub-model calls
         (let [out (ops/invoke {:execution-ctx (:ctx room)} dvergr.principal/local-principal :workflow/attempt
                               {:room "workflow-op-test" :task "summarise" :attempts 2
+                               :review {:review/checks [] :review/on-pass :merge}
                                :models ["claude-haiku-4-5"]})]
           (is (= :write (:kind (ops/specification :workflow/attempt))))
           (is (= 2 (count (:attempts out))))
@@ -82,6 +83,8 @@
           (testing "each attempt shows its grounds; nothing was fetched, so nothing is shared"
             (is (every? #(= {:external 0 :local 0} (:grounds %)) (:attempts out)))
             (is (= [] (:shared-sources out))))
+          (testing "request data cannot enable the host-only review policy"
+            (is (every? #(= :review (:run/settlement-status %)) (run/runs room))))
           (testing "adoption goes through the existing fork ops"
             (let [[a b] (map :world (:attempts out))]
               (is (= a (:merged (ops/invoke {:execution-ctx (:ctx room)} dvergr.principal/local-principal :room/merge {:room a}))))
@@ -209,3 +212,23 @@
         (try (binding [ec/*execution-context* (:ctx host)] (rreg/unregister! (:id room))) (catch Throwable _ nil))
         (d/close-room! room)
         (d/close-room! host)))))
+
+(deftest a-settlement-hook-decides-a-retained-world-on-a-worker
+  (with-room [room :workflow-settlement-hook]
+    (let [calls (atom []) seen (atom [])]
+      (with-stub-model calls
+        (let [[row] (workflow/attempt!
+                     room {:task "prepare a proposal" :models ["claude-haiku-4-5"]
+                           :on-settlement
+                           (fn [{:keys [room world run-id result]}]
+                             (swap! seen conj {:world world :run-id run-id :spin ec/*spin-id*
+                                               :result-status (:run/settlement-status result)
+                                               :durable-status (:run/settlement-status (run/run room run-id))
+                                               :discarded? (:ok? (forks/discard! (rreg/lookup world)))}))})
+              [{:keys [world run-id spin result-status durable-status discarded?]}] @seen]
+          (is (nil? spin))
+          (is (= :review result-status durable-status))
+          (is discarded?)
+          (is (= world (:world row)))
+          (is (= :discarded (:run/settlement-status (run/run room run-id))))
+          (is (nil? (binding [ec/*execution-context* (:ctx room)] (rreg/lookup world)))))))))
