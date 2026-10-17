@@ -74,7 +74,10 @@
             [dvergr.agent.workflow :as workflow]
             [dvergr.catalog.wiki :as wiki]
             [dvergr.catalog.wiki-gen :as gen]
-            [dvergr.catalog.workspace :as ws]))
+            [dvergr.catalog.workspace :as ws]
+            [dvergr.kb.wiki :as kb-wiki])
+  (:import [org.jsoup Jsoup]
+           [org.jsoup.nodes Element TextNode]))
 
 (def params {:source "/docs" :target "/wiki"})
 
@@ -85,6 +88,123 @@
 (defn- lower [s] (str/lower-case (str s)))
 
 (defn slug [s] (-> (lower s) (str/replace #"[^a-z0-9]+" "-") (str/replace #"(^-|-$)" "")))
+
+(defn- html-markdown [html]
+  (letfn [(walk [node]
+            (if (instance? TextNode node)
+              (.getWholeText ^TextNode node)
+              (let [tag (when (instance? Element node) (.tagName ^Element node))
+                    body (apply str (map walk (.childNodes node)))]
+                (case tag
+                  "h2" (str "\n## " (str/trim body) "\n")
+                  "blockquote" (str "\n> " (str/trim body) "\n")
+                  "strong" (str "**" body "**") "b" (str "**" body "**")
+                  "em" (str "*" body "*") "i" (str "*" body "*")
+                  "a" (str "[" body "](" (.attr ^Element node "href") ")")
+                  "pre" (str "\n```\n" (.text ^Element node) "\n```\n")
+                  "code" (str "`" body "`")
+                  "li" (str "\n- " (str/trim body))
+                  ("ul" "ol") (str body "\n")
+                  "br" "\n" "p" (str body "\n\n")
+                  body))))]
+    (let [body (.body (Jsoup/parseBodyFragment (str html)))
+          children (vec (.children body))]
+      ;; A quote and its citation are one block, and one Markdown line.
+      (if (and (= 2 (count children))
+               (= ["blockquote" "p"] (mapv #(.tagName ^Element %) children))
+               (re-matches #"(?s)\s*(?:\[\[[^\n]+\]\]\s*)+" (.text ^Element (second children)))
+               (= (str/trim (.text body))
+                  (str (.text ^Element (first children)) " " (.text ^Element (second children)))))
+        (str "> " (.text ^Element (first children)) " " (.text ^Element (second children)))
+        (-> (walk body) str/trim (str/replace #"\n{3,}" "\n\n"))))))
+
+(defn kb->pages
+  "Project a KB into `{:pages {path markdown} :sources {path text}}` for the
+   v4 scorers. `:resolve-source` maps a citation target to `{:path :text}` or
+   nil. `:attrs` overrides `dvergr.kb.wiki/defaults`. Missing sources stay
+   broken citations. Blocks are ordered lexicographically, depth first."
+  [db {:keys [resolve-source attrs]}]
+  (let [a (kb-wiki/attrs db attrs)
+        entities (reduce (fn [m [e attr value]]
+                           (if (= attr (:source a))
+                             (update-in m [e attr] (fnil conj #{}) value)
+                             (assoc-in m [e attr] value)))
+                         {} (kb-wiki/datoms db))
+        pages (into (sorted-map) (filter (fn [[_ e]] (#{:wiki/atom :wiki/overview :wiki/index} (get e (:kind a))))) entities)
+        base-path (fn [e] (case (get e (:kind a))
+                            :wiki/index "/wiki/index.md"
+                            (str "/wiki/" (if (= :wiki/atom (get e (:kind a))) "atoms/" "overviews/")
+                                 (slug (get e (:title a))) ".md")))
+        collisions (frequencies (map (comp base-path val) pages))
+        ;; Reserve natural paths before allocating suffixes, including later pages.
+        paths (reduce (fn [paths [id e]]
+                        (let [base (base-path e)
+                              stem (str (subs base 0 (- (count base) 3)) "-"
+                                        (or (get e (:page-uuid a))
+                                            (java.util.UUID/nameUUIDFromBytes (.getBytes (str id) "UTF-8"))))
+                              occupied (into (set (keys collisions)) (vals paths))
+                              path (if (= 1 (collisions base)) base
+                                       (first (remove occupied
+                                                      (cons (str stem ".md")
+                                                            (map #(str stem "-" % ".md") (iterate inc 2))))))]
+                          (assoc paths id path)))
+                      {} pages)
+        titles (into {} (for [[id e] pages] [(get e (:title a)) (paths id)]))
+        children (update-vals (group-by #(get (val %) (:parent a)) entities)
+                              #(sort-by (fn [[id e]] [(get e (:order a) "") (str id)]) %))
+        refs (sort (distinct (mapcat #(let [v (get % (:source a))] (if (string? v) [v] v)) (vals pages))))
+        resolved (into {} (for [r (distinct (concat refs (map #(first (str/split % #"#" 2)) refs))) :let [doc (when resolve-source (resolve-source r))] :when doc] [r doc]))
+        ;; A resolved section also identifies its document; explicit results take precedence.
+        resolved (merge (reduce (fn [aliases ref]
+                                  (if-let [doc (resolved ref)]
+                                    (let [bare (first (str/split ref #"#" 2))]
+                                      (if (contains? aliases bare) aliases (assoc aliases bare doc)))
+                                    aliases))
+                                {} refs)
+                        resolved)
+        source-link (fn [ref display]
+                      (let [[doc section] (str/split ref #"#" 2)]
+                        (if-let [{:keys [path]} (or (resolved ref) (resolved doc))]
+                          (str "[" display "](" path (when section (str "#" section)) ")")
+                          (str "[[" ref "|" display "]]"))))
+        block-links (atom {})
+        render (fn render [id page heading seen depth]
+                 (when (or (seen id) (>= depth 1000))
+                   (throw (ex-info "Cyclic or too deep wiki blocks" {:entity id})))
+                 (let [e (entities id)
+                       claim? (and (zero? depth) (str/starts-with? (str (get e (:content a))) "<h2>"))
+                       text (cond-> (html-markdown (get e (:content a)))
+                              (not claim?) (str/replace #"(?m)^## " ""))
+                       heading (if claim? (second (re-find #"(?m)^## (.*)$" text)) heading)]
+                   (when-let [uuid (get e (:block-uuid a))]
+                     (swap! block-links assoc (str uuid) (str page (when heading (str "#" (slug heading))))))
+                   (str/join "\n\n" (cons text (for [[child _] (children id)]
+                                                 (render child page heading (conj seen id) (inc depth)))))))
+        bodies (into {} (for [[id _] pages]
+                          [id (str/join "\n\n" (for [[child _] (children id)] (render child (paths id) nil #{} 0)))]))
+        rewrite (fn [text]
+                  (-> text
+                      (str/replace #"\[\[([^\]\n]+)\]\[([^\]\n]+)\]\]"
+                                   (fn [[_ ref display]] (source-link ref display)))
+                      (str/replace #"\[\[([^\]|\n]+)(?:\|([^\]\n]*))?\]\]"
+                                   (fn [[whole ref display]]
+                                     (if-let [path (titles ref)]
+                                       (str "[" (or display ref) "](" path ")")
+                                       (if (or (resolved ref) (resolved (first (str/split ref #"#" 2))))
+                                         (source-link ref (or display ref)) whole))))
+                      (str/replace #"\(\(([^)]+)\)\)"
+                                   (fn [[whole uuid]] (if-let [path (@block-links uuid)]
+                                                        (str "[block](" path ")") whole)))))]
+    {:pages (into {} (for [[id e] pages
+                           :let [sources (get e (:source a))
+                                 sources (if (string? sources) [sources] sources)
+                                 declared (sort (distinct (map #(let [doc (first (str/split % #"#" 2))]
+                                                                  (or (:path (resolved %)) (:path (resolved doc)) doc)) sources)))]]
+                       [(paths id)
+                        (str "---\ntype: " (case (get e (:kind a)) :wiki/atom "entity" :wiki/overview "overview" "index")
+                             "\nsource: [" (str/join ", " declared) "]\nentry-point: " (get e (:entry-point a))
+                             "\n---\n# " (get e (:title a)) "\n\n" (rewrite (bodies id)) "\n")]))
+     :sources (into {} (for [[_ {:keys [path text]}] resolved] [path text]))}))
 
 (defn- stem
   "`/docs/annual-report-2019.md` → `annual-report-2019`."

@@ -167,7 +167,7 @@
   "Yggdrasil system id for a room's kontor book at `path`."
   [path] (str "room-book-" (.getName (io/file path))))
 
-(defn- kb-system-name   "Yggdrasil system id for a KB store path."  [path]
+(defn kb-system-name   "Yggdrasil system id for a KB store path."  [path]
   (str "room-kb-" (.getName (io/file path))))
 (defn- repo-system-name "Yggdrasil system id for a repo path."      [path]
   (str "room-repo-" (.getName (io/file path))))
