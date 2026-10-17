@@ -304,7 +304,18 @@ child context, and live settlement capability come from the canonical handle
 `dvergr.discourse`), and are not recreated in Dvergr. `settle!` decides
 once: failure or cancellation discards; `:deferred` holds the world until the
 host releases it; `:waiting` and `:review` retain it; `:discard` drops it;
-otherwise it merges, and a failed merge is retained for review.
+otherwise it merges. A failed merge is ordinary review only while the canonical
+handle is still open. Failure after substrate mutation begins remains fenced
+and registered as `:recovery-required` (`:settlement-incomplete`); it is not a
+fresh review/adoption capability. Fully merged substrate whose later cleanup
+fails remains `:merged` with reason `:settlement-cleanup-failed`.
+
+Search selection uses canonical terminal substrate disposition as merge
+evidence, never an inactive lifecycle claim. A partially settled member has
+`:search/outcome :recovery-required` and `:search/status :incomplete`, is not a
+selected winner, and retries repair failed durable projections without merging
+again. This retains branches/topology for recovery, not provider allowance:
+unused Run resources still return after physical execution quiesces.
 
 ### Simmis: governance
 

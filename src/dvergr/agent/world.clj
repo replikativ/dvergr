@@ -6,7 +6,8 @@
    second axis from execution: a completed program may be merged, retained for
    review, or discarded without rewriting its execution outcome."
   (:require [dvergr.discourse :as d]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.yggdrasil :as ygg]))
 
 (def settlement-policies #{:automatic :review :discard :deferred})
 
@@ -67,6 +68,27 @@
             (reset! (:settlement world) result))
           result))))
 
+(defn settlement-failure
+  "Project a failed settlement from its canonical substrate authority, not the
+   operation a lifecycle claim attempted. Only an open capability is ordinary
+   review. Partial mutation requires recovery; a terminal substrate settlement
+   remains terminal even if later cleanup/projection failed."
+  [world reason error]
+  (let [fork (:work world)
+        handle (d/fork-handle fork)
+        status (some-> handle ygg/fork-disposition :status)
+        completed (:op (d/settlement fork))]
+    (cond->
+     (cond
+       (= :incomplete status) {:status :recovery-required :reason :settlement-incomplete}
+       (= :merged completed) {:status :merged :reason :settled-elsewhere}
+       (= :discarded completed) {:status :discarded :reason :settled-elsewhere}
+       (= :merged status) {:status :merged :reason :settlement-cleanup-failed}
+       (= :discarded status) {:status :discarded :reason :settlement-cleanup-failed}
+       (and handle (ygg/open-fork? handle)) {:status :review :reason reason}
+       :else {:status :recovery-required :reason :settlement-authority-unavailable})
+      error (assoc :error error))))
+
 (defn- discarded
   "Discard the work plane, reporting `status`, or the settlement that holds
    or settled it (`:review` while that one is in progress)."
@@ -74,9 +96,13 @@
   (let [{:keys [outcome settlement in-progress?]} (d/discard-outcome (:work world))]
     (cond
       (not= :lost outcome) status
-      in-progress? {:status :review :reason :settlement-in-progress}
-      (= :discarded (:op settlement)) {:status :discarded :reason :settled-elsewhere}
-      :else {:status :merged :reason :settled-elsewhere})))
+      (and in-progress?
+           (not= :incomplete (some-> (:work world) d/fork-handle ygg/fork-disposition :status)))
+      {:status :review :reason :settlement-in-progress}
+      (and (not in-progress?) (#{:merged :discarded} (:op settlement))
+           (not= :incomplete (some-> (:work world) d/fork-handle ygg/fork-disposition :status)))
+      {:status (:op settlement) :reason :settled-elsewhere}
+      :else (settlement-failure world :settlement-failed nil))))
 
 (defn settle!
   "Settle `world` after the executor has quiesced.
@@ -84,7 +110,8 @@
    Successful automatic work merges. Explicit review, and partial work that
    stopped at `:waiting`, remains registered for inspection. Discard policy,
    cancellation, and failure remove the work plane. An automatic merge failure
-   is retained for review rather than destroying the only inspectable diff."
+   is retained for review only if authority is still open. Partial mutation is
+   retained as `:recovery-required`, never advertised as ordinary review."
   [world execution-status]
   (settle-once!
    world
@@ -116,11 +143,8 @@
          (d/merge-room (:parent world) (:work world))
          {:status :merged}
          (catch Throwable t
-           (if (= :dvergr.discourse/already-settled (:type (ex-data t)))
-             (let [{:keys [settlement in-progress?]} (ex-data t)]
-               (cond in-progress? {:status :review :reason :settlement-in-progress}
-                     (= :discarded (:op settlement)) {:status :discarded :reason :settled-elsewhere}
-                     :else {:status :merged :reason :settled-elsewhere}))
-             {:status :review
-              :reason :automatic-merge-failed
-              :error t})))))))
+           (if (and (= :dvergr.discourse/already-settled (:type (ex-data t)))
+                    (:in-progress? (ex-data t))
+                    (not= :incomplete (some-> (:work world) d/fork-handle ygg/fork-disposition :status)))
+             {:status :review :reason :settlement-in-progress}
+             (settlement-failure world :automatic-merge-failed t))))))))

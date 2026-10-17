@@ -1421,8 +1421,8 @@
                        :data {:run/id (:run/id result)
                               :run/world (:id run-world)
                               :error (ex-message t)}}
-                      "Run world settlement failed; retaining it for review")
-            {:status :review :reason :settlement-failed}))]
+                      "Run world settlement failed; retaining its canonical settlement state")
+            (world/settlement-failure run-world :settlement-failed t)))]
     {:result (assoc result
                     :run/world (:id run-world)
                     :run/settlement-status status
