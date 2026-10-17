@@ -22,7 +22,25 @@
             [jsonista.core :as json]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
-            [taoensso.telemere :as tel]))
+            [taoensso.telemere :as tel])
+  (:import [java.nio.file Files Path]
+           [java.nio.file.attribute FileAttribute PosixFilePermissions]))
+
+(defn- failure-message
+  ([message] (failure-message message []))
+  ([message secrets]
+   (let [redacted (reduce (fn [s secret]
+                            (if (str/blank? secret) s (str/replace s secret "[REDACTED]")))
+                          (str message) secrets)
+         redacted (-> redacted
+                      (str/replace #"(?i)(authorization[\"']?\s*(?::|=|\s)\s*[\"']?)[^\r\n\"'}]+" "$1[REDACTED]")
+                      (str/replace #"(?i)\bbearer\s+[^\s\"',;}]+" "Bearer [REDACTED]")
+                      (str/replace #"(?i)((?:api[_ -]?key|access[_-]?token|refresh[_-]?token|token|secret)[\"']?\s*[:=]\s*[\"']?)[^\s&\"',;}]+" "$1[REDACTED]")
+                      (str/replace #"(?i)([?&][^=&#\s]*(?:key|token|secret|signature|auth)[^=&#\s]*=)[^&#\s\"']*" "$1[REDACTED]")
+                      (str/replace #"\b(?:sk|gsk|fw)_[A-Za-z0-9_-]+|\bsk-[A-Za-z0-9_-]+" "[REDACTED]"))]
+     (if (> (count redacted) 2048)
+       (str (subs redacted 0 2034) "...[truncated]")
+       redacted))))
 
 (defonce ^:private native-model (atom nil))
 
@@ -75,19 +93,23 @@
     local? (transcribe-local bytes ext)
     :else
     (when-let [key (key-fn)]
-      (let [resp (hc/post url
-                          {:headers {"Authorization" (str "Bearer " key)}
-                           :multipart [{:name "file" :content bytes
-                                        :file-name (str "voice." ext)
-                                        :content-type (or mime "audio/ogg")}
-                                       {:name "model" :content model}]
-                           :as :string
-                           :timeout 60000
-                           :throw-exceptions false})]
-        (if (= 200 (:status resp))
-          (:text (json/read-value (:body resp) json/keyword-keys-object-mapper))
-          (throw (ex-info (str "HTTP " (:status resp) ": " (:body resp))
-                          {:status (:status resp)})))))))
+      (try
+        (let [resp (hc/post url
+                            {:headers {"Authorization" (str "Bearer " key)}
+                             :multipart [{:name "file" :content bytes
+                                          :file-name (str "voice." ext)
+                                          :content-type (or mime "audio/ogg")}
+                                         {:name "model" :content model}]
+                             :as :string
+                             :timeout 60000
+                             :throw-exceptions false})]
+          (if (= 200 (:status resp))
+            (:text (json/read-value (:body resp) json/keyword-keys-object-mapper))
+            (throw (ex-info (str "HTTP " (:status resp) ": " (:body resp))
+                            {:status (:status resp)}))))
+        (catch Exception e
+          (throw (ex-info (failure-message (.getMessage e) [key])
+                          (select-keys (ex-data e) [:status]))))))))
 
 (defn- transcribe-one [bytes mime ext]
   (loop [[backend & remaining] backends, attempts [], silence? false]
@@ -97,7 +119,7 @@
                      (catch Exception e
                        {:failure {:backend (:name backend)
                                   :status (or (:status (ex-data e)) :error)
-                                  :message (or (.getMessage e) (str (class e)))}}))]
+                                  :message (failure-message (or (.getMessage e) (str (class e))))}}))]
         (if-let [failure (:failure result)]
           (do (tel/log! {:level :warn :id ::backend-failed :data failure})
               (recur remaining (conj attempts failure) silence?))
@@ -125,7 +147,30 @@
     (System/arraycopy pcm 0 out 44 size)
     out))
 
-(defn- transcribe-chunks [bytes ext {:keys [max-bytes seconds]}]
+(defn- chunk-directory []
+  (try
+    (Files/createTempDirectory "stt-"
+                               (into-array FileAttribute
+                                           [(PosixFilePermissions/asFileAttribute
+                                             (PosixFilePermissions/fromString "rwx------"))]))
+    (catch UnsupportedOperationException _
+      (Files/createTempDirectory "stt-" (make-array FileAttribute 0)))))
+
+(defn- chunk-file [^Path directory filename]
+  (Files/createFile (.resolve directory filename) (make-array FileAttribute 0)))
+
+(defn- delete-chunk-path! [^Path path]
+  (Files/deleteIfExists path))
+
+(defn- cleanup-chunks! [^Path directory]
+  (doseq [path [(.resolve directory "input") (.resolve directory "output.raw") directory]]
+    (try
+      (delete-chunk-path! path)
+      (catch Exception e
+        (tel/log! {:level :warn :id ::cleanup-failed
+                   :data {:path (str path) :message (failure-message (.getMessage e))}})))))
+
+(defn- transcribe-chunks [bytes _ext {:keys [max-bytes seconds]}]
   (when-not (and (integer? max-bytes) (<= 46 max-bytes Integer/MAX_VALUE)
                  (number? seconds) (pos? seconds) (Double/isFinite (double seconds))
                  (>= seconds (/ 1.0 16000)))
@@ -135,39 +180,39 @@
                         (catch java.io.IOException _ false))]
     (when-not available?
       (throw (ex-info "Audio chunking requires ffmpeg on PATH" {:tool :ffmpeg}))))
-  (let [input (java.io.File/createTempFile "stt-input" (str "." ext))
-        output (java.io.File/createTempFile "stt-pcm" ".raw")
-        samples (long (min (quot (- max-bytes 44) 2) (Math/floor (* 16000.0 seconds))))]
+  (let [directory (chunk-directory)]
     (try
-      (java.nio.file.Files/write (.toPath input) bytes
-                                 (make-array java.nio.file.OpenOption 0))
-      (let [{:keys [exit err]} (shell/sh "ffmpeg" "-nostdin" "-hide_banner" "-loglevel" "error"
-                                         "-y" "-i" (.getAbsolutePath input) "-vn"
-                                         "-ac" "1" "-ar" "16000" "-f" "s16le"
-                                         (.getAbsolutePath output))]
-        (when-not (zero? exit)
-          (throw (ex-info (str "ffmpeg audio decoding failed: " (str/trim err))
-                          {:tool :ffmpeg :status exit}))))
-      (with-open [stream (java.io.FileInputStream. output)]
-        (loop [offset 0, chunks []]
-          (let [pcm (.readNBytes stream (int (* 2 samples)))]
-            (if (zero? (alength pcm))
-              {:text (when-let [texts (seq (keep (fn [{:keys [start-seconds text]}]
-                                                   (when text
-                                                     (str "[" start-seconds "s] " text))) chunks))]
-                       (str/join "\n" texts))
-               :chunks chunks}
-              (let [end (+ offset (quot (alength pcm) 2))
-                    boundary {:start-seconds (/ offset 16000.0)
-                              :end-seconds (/ end 16000.0)}
-                    text (try (transcribe-one (wav-bytes pcm) "audio/wav" "wav")
-                              (catch clojure.lang.ExceptionInfo e
-                                (throw (ex-info (.getMessage e)
-                                                (assoc (ex-data e) :chunk boundary) e))))]
-                (recur end (conj chunks (assoc boundary :text text))))))))
+      (let [input (.toFile (chunk-file directory "input"))
+            output (.toFile (chunk-file directory "output.raw"))
+            samples (long (min (quot (- max-bytes 44) 2) (Math/floor (* 16000.0 seconds))))]
+        (java.nio.file.Files/write (.toPath input) bytes
+                                   (make-array java.nio.file.OpenOption 0))
+        (let [{:keys [exit err]} (shell/sh "ffmpeg" "-nostdin" "-hide_banner" "-loglevel" "error"
+                                           "-y" "-i" (.getAbsolutePath input) "-vn"
+                                           "-ac" "1" "-ar" "16000" "-f" "s16le"
+                                           (.getAbsolutePath output))]
+          (when-not (zero? exit)
+            (throw (ex-info (failure-message (str "ffmpeg audio decoding failed: " (str/trim err)))
+                            {:tool :ffmpeg :status exit}))))
+        (with-open [stream (java.io.FileInputStream. output)]
+          (loop [offset 0, chunks []]
+            (let [pcm (.readNBytes stream (int (* 2 samples)))]
+              (if (zero? (alength pcm))
+                {:text (when-let [texts (seq (keep (fn [{:keys [start-seconds text]}]
+                                                     (when text
+                                                       (str "[" start-seconds "s] " text))) chunks))]
+                         (str/join "\n" texts))
+                 :chunks chunks}
+                (let [end (+ offset (quot (alength pcm) 2))
+                      boundary {:start-seconds (/ offset 16000.0)
+                                :end-seconds (/ end 16000.0)}
+                      text (try (transcribe-one (wav-bytes pcm) "audio/wav" "wav")
+                                (catch clojure.lang.ExceptionInfo e
+                                  (throw (ex-info (.getMessage e)
+                                                  (assoc (ex-data e) :chunk boundary) e))))]
+                  (recur end (conj chunks (assoc boundary :text text)))))))))
       (finally
-        (.delete input)
-        (.delete output)))))
+        (cleanup-chunks! directory)))))
 
 (defn transcribe
   "Transcribe audio bytes to text, or nil for silence. Backend failures throw

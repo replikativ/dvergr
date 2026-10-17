@@ -1,6 +1,7 @@
 (ns dvergr.audio.stt-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.java.shell :as shell]
+            [clojure.string :as str]
             [dvergr.audio.stt :as stt]
             [hato.client :as hc]
             [taoensso.telemere :as tel]))
@@ -127,3 +128,122 @@
                 stt/backends http-backends
                 hc/post (fn [& _] {:status 200 :body "{\"text\":\"hello\"}"})]
     (is (= "hello" (stt/transcribe audio)))))
+
+(def secret-diagnostic
+  (str "echoed opaque-credential\n"
+       "Authorization: Basic header-password\n"
+       "{\"authorization\":\"Bearer json-password\", \"api_key\":\"json-key\"}\n"
+       "Bearer bearer-password\n"
+       "{:authorization \"Basic edn-password\"}\n"
+       "X-API-Key: header-key\n"
+       "https://example.invalid/?access_token=query-token&X-Amz-Signature=query-signature&ok=yes\n"
+       "api-key=assignment-key sk-providerkey gsk_providerkey fw_providerkey\n"
+       (apply str (repeat 5000 "x")) "END-OF-DIAGNOSTIC"))
+
+(def diagnostic-secrets
+  ["opaque-credential" "header-password" "json-password" "json-key" "bearer-password"
+   "edn-password" "header-key" "query-token" "query-signature" "assignment-key"
+   "sk-providerkey" "gsk_providerkey" "fw_providerkey" "END-OF-DIAGNOSTIC"])
+
+(deftest secret-bearing-failures
+  (doseq [mode [:response :http-exception :native-exception :local-stderr]]
+    (testing (str mode)
+      (let [{:keys [value signals error]}
+            (tel/with-signals
+              (with-redefs [stt/backends (case mode
+                                           :native-exception [{:name :native :native? true}]
+                                           :local-stderr [{:name :local :local? true}]
+                                           [{:name :groq :url "stub" :key-fn (constantly "opaque-credential")}])
+                            hc/post (fn [& _]
+                                      (if (= mode :response)
+                                        {:status 401 :body secret-diagnostic}
+                                        (throw (java.io.IOException. secret-diagnostic))))
+                            stt/transcribe-native (fn [& _]
+                                                    (throw (ex-info (str/replace secret-diagnostic
+                                                                                 "opaque-credential" "api_key=native-key") {})))
+                            shell/sh (fn [& _] {:exit 1 :err (str/replace secret-diagnostic
+                                                                          "opaque-credential" "token=local-token")})]
+                (failure #(stt/transcribe audio))))
+            attempts (:attempts value)
+            logs (filter #(= :dvergr.audio.stt/backend-failed (:id %)) signals)]
+        (is (nil? error))
+        (is (= 1 (count attempts)))
+        (is (= attempts (mapv :data logs)))
+        (is (<= (count (:message (first attempts))) 2048))
+        (is (str/includes? (:message (first attempts)) "[REDACTED]"))
+        (is (str/ends-with? (:message (first attempts)) "...[truncated]"))
+        (doseq [secret (conj diagnostic-secrets "native-key" "local-token")]
+          (is (not (str/includes? (pr-str value) secret)))
+          (is (not (str/includes? (pr-str signals) secret))))))))
+
+(def chunk-options (assoc audio :chunk {:max-bytes 32044 :seconds 1}))
+
+(deftest private-chunk-directory-and-cleanup
+  (let [directories (atom [])]
+    (doseq [mode [:success :backend-failure :decoder-failure :first-allocation :partial-allocation]]
+      (testing (str mode)
+        (let [paths (atom [])
+              create-file @#'stt/chunk-file
+              create-directory @#'stt/chunk-directory
+              {:keys [value error]}
+              (tel/with-signals
+                (with-redefs [stt/chunk-directory (fn []
+                                                    (let [directory (create-directory)]
+                                                      (swap! directories conj directory)
+                                                      directory))
+                              stt/chunk-file (fn [directory filename]
+                                               (is (= (last @directories) directory))
+                                               (when (.supportsFileAttributeView
+                                                      (java.nio.file.Files/getFileStore directory) "posix")
+                                                 (is (= "rwx------"
+                                                        (java.nio.file.attribute.PosixFilePermissions/toString
+                                                         (java.nio.file.Files/getPosixFilePermissions
+                                                          directory (make-array java.nio.file.LinkOption 0))))))
+                                               (when (or (= mode :first-allocation)
+                                                         (and (= mode :partial-allocation) (= filename "output.raw")))
+                                                 (throw (java.io.IOException. "allocation failed")))
+                                               (let [path (create-file directory filename)]
+                                                 (swap! paths conj path)
+                                                 path))
+                              shell/sh (fn [& args]
+                                         (if (= "-version" (second args))
+                                           {:exit 0}
+                                           (do
+                                             (is (= 2 (count @paths)))
+                                             (is (= (.getParent (first @paths)) (.getParent (second @paths))))
+                                             (java.nio.file.Files/write (second @paths) (byte-array 20)
+                                                                        (make-array java.nio.file.OpenOption 0))
+                                             {:exit (if (= mode :decoder-failure) 1 0) :err "decode failed"})))
+                              stt/backends [{:name :test}]
+                              stt/try-backend (fn [& _]
+                                                (if (= mode :backend-failure)
+                                                  (throw (ex-info "backend failed" {}))
+                                                  "hello"))]
+                  (stt/transcribe chunk-options)))]
+          (if (= mode :success)
+            (do (is (nil? error)) (is (= "[0.0s] hello" (:text value))))
+            (is (some? error)))
+          (is (= (case mode :first-allocation 0 :partial-allocation 1 2) (count @paths)))
+          (is (every? #(not (java.nio.file.Files/exists % (make-array java.nio.file.LinkOption 0)))
+                      (conj @paths (last @directories)))))))
+    (is (= 5 (count (distinct @directories))))))
+
+(deftest cleanup-failures-are-logged-and-do-not-mask-result
+  (let [deleted (atom [])
+        delete-path @#'stt/delete-chunk-path!
+        {:keys [value signals error]}
+        (tel/with-signals
+          (with-redefs [stt/delete-chunk-path! (fn [path]
+                                                 (delete-path path)
+                                                 (swap! deleted conj path)
+                                                 (when (= "input" (str (.getFileName path)))
+                                                   (throw (java.io.IOException. "token=cleanup-secret"))))
+                        shell/sh (fn [& _] {:exit 0})]
+            (stt/transcribe chunk-options)))
+        logs (filter #(= :dvergr.audio.stt/cleanup-failed (:id %)) signals)]
+    (is (nil? error))
+    (is (= {:text nil :chunks []} value))
+    (is (= 3 (count @deleted)))
+    (is (= 1 (count logs)))
+    (is (= "token=[REDACTED]" (get-in (first logs) [:data :message])))
+    (is (not (str/includes? (pr-str signals) "cleanup-secret")))))
