@@ -698,6 +698,12 @@
     :db/cardinality :db.cardinality/one
     :db/doc "The search this Run was a member of, EDN: its id and policy, the Run's weight and the decision on its world (dvergr.agent.search, doc/design/runs-as-worlds.md)"}
 
+   {:db/ident :run/role
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/index true
+    :db/doc "The part a Run plays for its parent (:candidate, :judge, :member, ...); spend is summed by it over a subtree (dvergr.agent.budget)"}
+
    {:db/ident :run/status
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one

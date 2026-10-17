@@ -414,7 +414,7 @@
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
-    :run/reason :run/error :run/savepoint :run/resumed-by :run/search])
+    :run/reason :run/error :run/savepoint :run/resumed-by :run/search :run/role])
 
 (def ^:private attempt-pull-pattern
   '[:attempt/id :attempt/content-id :attempt/payload-ref :attempt/payload-blob
@@ -492,6 +492,7 @@
     (:run/savepoint run) (assoc :run/savepoint (:run/savepoint run))
     (:run/resumed-by run) (assoc :run/resumed-by (:run/resumed-by run))
     (:run/search run) (assoc :run/search (:run/search run))
+    (:run/role run) (assoc :run/role (:run/role run))
     (:run/reason run)   (assoc :run/reason (:run/reason run))
     (:run/error run)    (assoc :run/error (str (:run/error run)))))
 

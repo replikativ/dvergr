@@ -63,7 +63,7 @@
                                 (do (chat-context/account-usage! chat-ctx :output-tokens 250000)
                                     (tool-step! chat-ctx 0))
                                 (throw (ex-info "the process stopped" {}))))]
-                (let [h (program/hire! room team :worker {:task "calculate"})]
+                (let [h (program/hire! room team :worker {:task "calculate" :role :candidate})]
                   (reset! first-metrics (:run/metrics @h))
                   (program/run-id h)))
               old (run/run room first-run)
@@ -99,6 +99,8 @@
                              (select-keys (:run/metrics result) [:prompt-id :inputs-id]))
                           "it records the system prompt it continues with, the stopped Run's")
                       (program/run-id h)))]
+              (is (= :candidate (:run/role (run/run room second-run)))
+                  "the successor plays the part its predecessor did")
               (is (= [1] (mapv :step @seen)) "the steps count on from the savepoint")
               (is (= 750000 (:budget (first @seen)))
                   "its budget is what the stopped Run left, not a fresh one")

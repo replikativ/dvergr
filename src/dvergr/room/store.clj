@@ -407,6 +407,8 @@
     :run/settlement-status :run/settlement-reason
     :run/roster :run/agent-version :run/program-kind
     :run/interpreter-version :run/agent-def-hash :run/chat-id
+    ;; the part the Run plays for its parent (dvergr.agent.budget)
+    :run/role
     ;; resuming (doc/runs.md, Resuming a Run): the latest portable savepoint, as EDN,
     ;; and the Run that continued from it
     :run/savepoint :run/resumed-by
@@ -418,7 +420,7 @@
    :run/created-at :run/started-at
    :run/world :run/isolation :run/settlement-policy
    :run/roster :run/agent-version :run/program-kind
-   :run/interpreter-version :run/agent-def-hash :run/chat-id])
+   :run/interpreter-version :run/agent-def-hash :run/chat-id :run/role])
 
 (defn validate-run!
   "Validate the minimal durable Run contract and return `run`."

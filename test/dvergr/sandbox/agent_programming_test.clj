@@ -904,3 +904,33 @@
         (try (binding [ec/*execution-context* (:ctx room)] (room-registry/unregister! (:id room)))
              (catch Throwable _ nil))
         (d/close-room! room)))))
+
+(deftest sci-splits-a-grant-and-hires-children-by-role
+  (let [room    (d/make-room {:id :sci-agent-roles :store (memory/make)})
+        sci-ctx (sandbox/fork-for-session (:ctx room))]
+    (try
+      (agent-ns/add-programming-ns! sci-ctx (:id room) (:ctx room) nil)
+      (let [result
+            (binding [ec/*execution-context* (:ctx room)]
+              (sandbox/eval-code
+               sci-ctx
+               (str "(require '[dvergr.agent :as agent]) "
+                    "(let [team (agent/make-agent (agent/roster) {:id :worker :program {:kind :echo}}) "
+                    "      grants (agent/split {\"microUSD\" 1000M} {:candidate 1/2 :judge 1/4}) "
+                    "      h (agent/hire! team :worker {:task :x :role :judge})] "
+                    "  {:grants grants :run (agent/run-id h)})")))]
+        (is (:success result) (pr-str (:error result)))
+        (is (= {:candidate {"microUSD" 500M} :judge {"microUSD" 250M}}
+               (get-in result [:value :grants])))
+        (is (wait-until #(= :judge (:run/role (run/run room (get-in result [:value :run])))) 5000)
+            "the role reaches the durable Run"))
+      (testing "a role must be a keyword"
+        (is (not (:success (binding [ec/*execution-context* (:ctx room)]
+                             (sandbox/eval-code
+                              sci-ctx
+                              (str "(require '[dvergr.agent :as agent]) "
+                                   "(agent/hire! (agent/make-agent (agent/roster) {:id :w :program {:kind :echo}}) "
+                                   ":w {:task :x :role \"judge\"})"))))))
+        (is (wait-until #(empty? (run/active-runs (:id room))) 5000)))
+      (finally
+        (d/close-room! room)))))
