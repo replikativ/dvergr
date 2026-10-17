@@ -152,6 +152,14 @@ and a work-world fork never copies or settles that authority. A child receives
 resources only through one governed Kontor transfer from its parent's wallet
 (`dvergr.resource`).
 
+Model clients can load that resource vocabulary without initializing its
+database. `resource/install-connection!` remains the trusted host boot boundary;
+it loads the Datahike installer, installs Kontor and recomposes the Attempt
+writer governor before opening the Room wallet. Loading the model gateway does
+not grant a wallet or relax dispatch accounting. Tool-schema conversion is
+similarly independent of its database installer; installing schemas still uses
+one writer-serialized claim that rejects incompatible durable attribute shapes.
+
 Injected host capabilities follow a stricter rule than ordinary SCI values.
 They never close over a Room, Datahike connection, Geschichte workspace, or
 filesystem. Each interpreter component owns a stable capability identity whose

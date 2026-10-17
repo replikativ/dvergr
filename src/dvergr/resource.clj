@@ -5,10 +5,9 @@
    create or discard speculative application state, but they never copy or
    settle this authority: a child receives resources only through one governed
    Kontor transfer from its parent wallet."
-  (:require [dvergr.agent.attempt.governance :as attempt-governance]
-            [dvergr.model.registry :as registry]
+  (:require [dvergr.model.registry :as registry]
             [dvergr.room.store :as store]
-            [kontor.resource :as kontor]
+            [kontor.resource.identity :as kontor]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.protocols :as rtp])
   (:import [java.nio.charset StandardCharsets]
@@ -61,20 +60,10 @@
   "Install the minimal Kontor kernel and the Room's root wallet on `conn`.
 
    This is a trusted boot boundary, not an SCI capability. The chat entity must
-   already exist so its lookup ref can own the wallet."
+   already exist so its lookup ref can own the wallet. Database initialization
+   loads only at this host boot boundary, not in model/gateway clients."
   [conn room-id chat-id]
-  (kontor/install! conn)
-  ;; Kontor currently owns Datahike's single tx-predicate registration slot.
-  ;; Recompose the Attempt governor after every (idempotent) installation so
-  ;; neither invariant family can replace the other by boot order.
-  (attempt-governance/govern! conn)
-  (kontor/install-unit! conn {:symbol microdollars
-                              :name "Micro US dollars"
-                              :precision 0})
-  (kontor/open-account! conn {:id (room-wallet-id room-id)
-                              :owner [:chat/id chat-id]
-                              :name (str "Room " room-id)})
-  conn)
+  ((requiring-resolve 'dvergr.resource.datahike/install-connection!) conn room-id chat-id))
 
 (defn install-unit!
   "Trusted host operation: install a resource coordinate in a Room's book."
