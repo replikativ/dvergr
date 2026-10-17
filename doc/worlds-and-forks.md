@@ -304,7 +304,12 @@ child context, and live settlement capability come from the canonical handle
 `dvergr.discourse`), and are not recreated in Dvergr. `settle!` decides
 once: failure or cancellation discards; `:deferred` holds the world until the
 host releases it; `:waiting` and `:review` retain it; `:discard` drops it;
-otherwise it merges, and a failed merge is retained for review.
+otherwise it merges, and a failed merge is retained for review. Automatic
+settlement drains the fork's work, refuses a dirty parent, commits pending
+workspace edits, and rechecks current merge permissions before adopting those
+commits. Binary contents, modes and deletions therefore settle with the Run,
+not just changes the agent explicitly committed. A pinned review-state merge
+keeps its separate guard: preparing different contents would invalidate its pin.
 
 ### Simmis: governance
 
