@@ -901,17 +901,31 @@
    (`system-write-check`): a fork may have written a KB while the room's grant
    permitted it, and the grant was downgraded or detached since. Only a
    system the fork changed counts (`delta-changed?` on its merge-base delta,
-   retractions included); a delta that cannot be computed counts as a
-   change. Nothing is diffed when every system in the fork may be written.
+   retractions included). Introducing a child-only protected system also
+   requires a current write grant: shared-pair diffs omit that structural
+   change. Missing deltas for mergeable systems fail closed. Shared,
+   non-mergeable compatibility systems need no state merge. Nothing is
+   diffed when every system in the fork may be written.
    The room is named by its `slug`: the durable room's, for a fork of a fork."
   [slug fork-ctx]
   (let [room-id (some-> slug sdb/room-by-slug :room/id)
         may-write? (system-write-check room-id false)
-        blocked (binding [ec/*execution-context* fork-ctx]
-                  (into #{} (remove may-write?) (keys (ygg/registered-systems))))]
+        systems (binding [ec/*execution-context* fork-ctx]
+                  (ygg/registered-systems))
+        blocked (into #{} (remove may-write?) (keys systems))]
     (when (seq blocked)
       (let [diff (ygg/context-diff fork-ctx)
-            changed (filterv #(delta-changed? (get diff %)) (sort blocked))]
+            parent-systems (when-let [parent (:parent-ctx fork-ctx)]
+                             (binding [ec/*execution-context* parent]
+                               (ygg/registered-systems)))
+            changed (filterv
+                     (fn [sid]
+                       (or (not (contains? parent-systems sid))
+                           (and (nil? (get diff sid))
+                                (or (contains? diff sid)
+                                    (satisfies? ygg-protocols/Mergeable (get systems sid))))
+                           (delta-changed? (get diff sid))))
+                     (sort blocked))]
         (when (seq changed)
           (throw (ex-info (str "The fork changed databases this room may not write (its grant does "
                                "not permit writes, or they were detached): " (pr-str changed)

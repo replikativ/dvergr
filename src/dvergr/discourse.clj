@@ -2362,6 +2362,12 @@
              ((or guard (fn [substrate!] (substrate!)))
               (fn []
                 (when-let [handle (fork-handle fork)]
+                  ;; Early preflight precedes quiescence. A worker or guard
+                  ;; may have changed the world or its grants since then;
+                  ;; inspect again at the actual substrate write frontier.
+                  (srooms/assert-merge-permitted!
+                   (or (some-> fork :meta deref :origin-slug) (:slug parent))
+                   (:ctx fork))
                   (try
                     (let [pending (when (:store fork)
                                     (binding [ec/*execution-context* (:ctx fork)]
