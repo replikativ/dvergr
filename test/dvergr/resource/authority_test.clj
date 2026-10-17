@@ -33,6 +33,29 @@
       (resource/install-connection! conn id chat-id)
       [(d/make-room {:id id :store (datahike-store/make conn)}) conn])))
 
+(deftest repeated-host-installation-keeps-both-writer-governors
+  (let [[room conn] (ledger-room)
+        chat-id (dh/q '[:find ?id . :where [_ :chat/id ?id]] @conn)
+        wallet (kontor/account-ref (resource/room-wallet-id (:id room)))]
+    (try
+      (dotimes [_ 2]
+        (is (identical? conn (resource/install-connection! conn (:id room) chat-id)))
+        (testing "Kontor still rejects a raw overdraft"
+          (let [tx (kontor/transfer-tx-data
+                    {:id (random-uuid) :kind :consume
+                     :source wallet :destination kontor/sink-account
+                     :resources {resource/microdollars 1M}
+                     :effective-date (java.util.Date.)})]
+            (is (thrown? Exception (dh/transact conn tx)))
+            (is (= {} (resource/balance room wallet)))))
+        (testing "reinstalling Kontor did not replace Attempt protection"
+          (let [id (random-uuid)]
+            (is (thrown? Exception (dh/transact conn [{:attempt/id id}])))
+            (is (nil? (dh/q '[:find ?e . :in $ ?id :where [?e :attempt/id ?id]] @conn id))))))
+      (finally
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))
+
 (defn- cps [op]
   (let [p (promise)]
     (op #(deliver p [:ok %]) #(deliver p [:error %]))

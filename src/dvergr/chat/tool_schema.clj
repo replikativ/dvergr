@@ -23,8 +23,7 @@
        :tool-input.clj-kondo.config/linters (ref to component)
        ..."
   (:require [clojure.string :as str]
-            [clojure.edn :as edn]
-            [datahike.api :as d]))
+            [clojure.edn :as edn]))
 
 ;; ============================================================================
 ;; Name Conversion
@@ -211,49 +210,11 @@
 ;; Schema Installation
 ;; ============================================================================
 
-(def ^:private durable-schema-keys
-  [:db/valueType :db/cardinality :db/isComponent :db/unique])
-
-(defn- durable-attr-shape [attr]
-  (select-keys attr durable-schema-keys))
-
-(defn- install-compatible-attrs
-  "Datahike transaction function for an atomic schema claim.
-
-   Writer serialization makes the current DB schema authoritative even when
-   different processes race the first use of one late-bound tool. Existing
-   attributes must have the same durable shape; only absent attributes are
-   returned for installation. In particular, do not rely on Datahike rejecting
-   a redeclaration: under `:schema-flexibility :write` it may legally rewrite
-   an unused attribute before an older serialized message reaches the writer.
-   An attribute proposed twice in one claim (two tools installed together)
-   must have one shape too; it is installed once."
-  [db attrs]
-  (let [installed (d/schema db)]
-    (:missing
-     (reduce
-      (fn [{:keys [claimed] :as acc} attr]
-        (let [ident (:db/ident attr)
-              proposed-shape (durable-attr-shape attr)]
-          (if-let [current (or (get installed ident) (get claimed ident))]
-            (let [current-shape (durable-attr-shape current)]
-              (when-not (= current-shape proposed-shape)
-                (throw
-                 (ex-info
-                  "Incompatible durable tool schema is already installed"
-                  {:type ::incompatible-installed-tool-schema
-                   :attribute ident
-                   :installed current-shape
-                   :proposed proposed-shape})))
-              acc)
-            (-> acc
-                (update :missing conj attr)
-                (assoc-in [:claimed ident] attr)))))
-      {:missing [] :claimed {}}
-      attrs))))
-
 (defn- install-compatible-schema! [conn schema]
-  (d/transact conn [[:db.fn/call install-compatible-attrs schema]]))
+  ;; Provider history formatting only needs the pure conversion vocabulary.
+  ;; Keep schema installation at the trusted database boundary, with the same
+  ;; serialized writer claim and durable-shape checks as before.
+  ((requiring-resolve 'dvergr.chat.tool-schema.datahike/install-compatible-schema!) conn schema))
 
 (defn install-tool-schema!
   "Install schema for a tool into a Datahike connection.
