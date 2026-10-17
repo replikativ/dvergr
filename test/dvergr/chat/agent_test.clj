@@ -6,6 +6,7 @@
             [dvergr.chat.accounting :as accounting]
             [datahike.api :as dh]
             [dvergr.tools :as tools]
+            [dvergr.model.registry :as model-registry]
             [dvergr.model.chat :as model-chat]))
 
 (defn- response [content]
@@ -65,6 +66,30 @@
                  (:used (chat-ctx/get-budget ctx))
                  (accounting/get-total-cost (:db-conn ctx) (:chat-id ctx)))))
         (finally (chat-ctx/close-chat! ctx))))))
+
+(deftest response-execution-id-determines-the-charge
+  (let [ctx (chat-ctx/create-chat-context {:title "execution identity" :with-sci? false})
+        old "accounts/fireworks/models/kimi-k2p5"
+        successor "accounts/fireworks/models/kimi-k3"]
+    (try
+      (model-registry/ensure-models-loaded!)
+      ;; A stored charge keeps its identity and price when a new call resolves.
+      (chat-ctx/account-tokens! ctx :input-tokens 1000 {:model old})
+      (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat (fn [& _] (assoc (response "done")
+                                                     :model successor
+                                                     :usage {:input-tokens 1000}))]
+        (is (= :complete (agent/run-agent-turn! ctx {:provider :test :model "stub" :tools {}
+                                                     :auto-compact? false})))
+        (is (= 3600 (:used (chat-ctx/get-budget ctx))
+               (accounting/get-total-cost (:db-conn ctx) (:chat-id ctx))))
+        (is (= #{[old 600] [successor 3000]}
+               (set (dh/q '[:find ?model ?cost :in $ ?chat-id
+                            :where [?c :chat/id ?chat-id] [?l :ledger/context ?c]
+                            [?l :ledger/cost-microdollars ?cost]
+                            [?l :ledger/model ?model]]
+                          @(:db-conn ctx) (:chat-id ctx))))))
+      (finally (chat-ctx/close-chat! ctx)))))
 
 (deftest message-token-metadata-does-not-charge-for-appending-history
   (let [ctx (chat-ctx/create-chat-context {:title "message-metadata" :with-sci? false})]

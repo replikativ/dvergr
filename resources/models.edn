@@ -49,7 +49,7 @@
   {:name "Kimi K3"
    :provider :fireworks
    :api-type :openai-chat
-   :capabilities #{:tools :streaming}
+   :capabilities #{:tools :vision :streaming}
    :context 1048576
    :max-output 16384
    :pricing {:input 3.00 :cache-read 0.30 :output 15.00}
@@ -79,7 +79,7 @@
   {:name "GLM 5.3 Flash"
    :provider :fireworks
    :api-type :openai-chat
-   :capabilities #{:tools :streaming}
+   :capabilities #{:tools :vision :streaming}
    :context 1048573
    :max-output 16384
    :pricing {:input 0.15 :cache-read 0.03 :output 0.50}
@@ -206,9 +206,8 @@
   ;; path). OpenAI-compat chat endpoint takes image_url content parts. Override
   ;; with DVERGR_VISION_MODEL.
   ;;
-  ;; None of the served Fireworks models is tagged :vision (2026-10-16).
-  ;; Configure :defaults :vision-model or DVERGR_VISION_MODEL explicitly.
-  ;; Retired Kimi ids resolve to text-only K3; vision callers reject them.
+  ;; Kimi K3 and GLM 5.3 Flash accept image input (live screenshot probe).
+  ;; K3 is the default; retired Kimi ids also resolve to K3.
 
   }
 
@@ -234,7 +233,7 @@
  ;; the cheapest one-off summary model.
 
  :defaults
- {:vision-model     nil
+ {:vision-model     "accounts/fireworks/models/kimi-k3"
   :compaction-model "accounts/fireworks/models/minimax-m3"
   :primary-model    "accounts/fireworks/models/minimax-m3"
   :summary-model    "accounts/fireworks/models/gpt-oss-20b"}}
