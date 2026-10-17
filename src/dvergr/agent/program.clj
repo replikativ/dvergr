@@ -1791,6 +1791,7 @@
         (try ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
              (catch Throwable _ nil))
         (throw t)))
+    (run/register-child-owner! id #(with-owned-child! supervisor %))
     (run/register-cancel-hook! id ::native-worker
                                #(cancel-supervisor! supervisor))
     ;; The trigger is the Run's durable causal input, not candidate execution.

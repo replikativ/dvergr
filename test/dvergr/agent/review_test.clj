@@ -9,6 +9,9 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.agent.review :as review]
+            [dvergr.agent.program :as program]
+            [dvergr.agent.roster :as roster]
+            [org.replikativ.spindel.core :as sp]
             [dvergr.agent.run :as run]
             [dvergr.resource :as resource]
             [dvergr.room.store :as store]
@@ -433,49 +436,55 @@
           spec (-> wiki-only
                    (assoc :review/on-pass :propose)
                    (assoc-in [:review/reviewer :model] "claude-haiku-4-5"))
-          parent-id (when parent? (random-uuid))
+          parent-handle (atom nil)
           seen (atom nil)]
       (binding [ec/*execution-context* (:ctx room)]
         (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 1000000M}})
-        (when parent-id
-          (let [trigger (d/message :payer (d/room-target room) "pay for review")]
-            (d/post! room trigger)
-            (run/start! room :payer trigger nil {:id parent-id})
-            (resource/allocate-run! room parent-id nil {resource/microdollars 750000M})))
-        (try
-          (with-redefs [providers/ensure-initialized! (constantly nil)
-                        chat-agent/messages->api-format (fn [messages _ _] messages)
-                        dvergr.chat.accounting/get-model-pricing (fn [_] {:input 1 :output 2})
-                        model-chat/chat
-                        (fn [_ _]
-                          (let [r (first (remove #(= parent-id (:run/id %)) (run/runs room)))]
-                            (reset! seen {:id (:run/id r)
-                                          :wallet (resource/wallet-microdollars room (:run/id r))
-                                          :payer (if parent-id
-                                                   (resource/wallet-microdollars room parent-id)
-                                                   (get (resource/balance room) resource/microdollars))}))
-                          {:content "{:review/verdict :approve :review/reasons [] :review/concerns []}"
-                           :usage {:input-tokens 100 :output-tokens 20} :stop-reason :end-turn})]
-            (let [reviewer (review/model-reviewer *daemon* room (fork-id world) spec
-                                                  (cond-> {} parent-id (assoc :principal/run parent-id)))
-                  rv (review/review! room (fork-id world) spec :reviewer reviewer)
-                  id (:id @seen)
-                  receipt #(store/-resource-receipt (:store room) %)]
-              (is (= :escalated (:review/decision rv)))
-              (is (= 500000M (:wallet @seen)) "the model runs with its allocated wallet")
-              (is (= (if parent? 250000M 500000M) (:payer @seen)) "the intended payer funded it")
-              (is (= parent-id (:run/parent (run/run room id))))
-              (when parent?
-                (is (= 250000M (get (resource/balance room) resource/microdollars))
-                    "the room root is not charged for its child Run’s review"))
-              (is (= 0M (resource/wallet-microdollars room id)))
-              (is (= (if parent? 749860M 999860M)
-                     (if parent-id (resource/wallet-microdollars room parent-id)
-                         (get (resource/balance room) resource/microdollars))))
-              (is (= {resource/microdollars 499860M} (:resources (receipt (resource/return-id id))))
-                  "the real model usage debits 140 and the unused allocation returns")
-              (is (= {resource/microdollars 500000M} (:resources (receipt (resource/allocation-id id)))))))
-          (finally (when parent-id (run/finish! parent-id :completed))))))))
+        (when parent?
+          (reset! parent-handle
+                  (program/hire! room
+                                 (roster/make-agent (roster/make-roster {:id :payer})
+                                                    {:id :payer :program {:kind :echo :delay-ms 600000}})
+                                 :payer {:task "pay for review" :settlement :discard
+                                         :resources {resource/microdollars 750000M}})))
+        (let [parent-id (some-> @parent-handle program/run-id)]
+          (try
+            (with-redefs [providers/ensure-initialized! (constantly nil)
+                          chat-agent/messages->api-format (fn [messages _ _] messages)
+                          dvergr.chat.accounting/get-model-pricing (fn [_] {:input 1 :output 2})
+                          model-chat/chat
+                          (fn [_ _]
+                            (let [r (first (remove #(= parent-id (:run/id %)) (run/runs room)))]
+                              (reset! seen {:id (:run/id r)
+                                            :wallet (resource/wallet-microdollars room (:run/id r))
+                                            :payer (if parent-id
+                                                     (resource/wallet-microdollars room parent-id)
+                                                     (get (resource/balance room) resource/microdollars))}))
+                            {:content "{:review/verdict :approve :review/reasons [] :review/concerns []}"
+                             :usage {:input-tokens 100 :output-tokens 20} :stop-reason :end-turn})]
+              (let [reviewer (review/model-reviewer *daemon* room (fork-id world) spec
+                                                    (cond-> {} parent-id (assoc :principal/run parent-id)))
+                    rv (review/review! room (fork-id world) spec :reviewer reviewer)
+                    id (:id @seen)
+                    receipt #(store/-resource-receipt (:store room) %)]
+                (is (= :escalated (:review/decision rv)))
+                (is (= 500000M (:wallet @seen)) "the model runs with its allocated wallet")
+                (is (= (if parent? 250000M 500000M) (:payer @seen)) "the intended payer funded it")
+                (is (= parent-id (:run/parent (run/run room id))))
+                (when parent?
+                  (is (= 250000M (get (resource/balance room) resource/microdollars))
+                      "the room root is not charged for its child Run’s review"))
+                (is (= 0M (resource/wallet-microdollars room id)))
+                (is (= (if parent? 749860M 999860M)
+                       (if parent-id (resource/wallet-microdollars room parent-id)
+                           (get (resource/balance room) resource/microdollars))))
+                (is (= {resource/microdollars 499860M} (:resources (receipt (resource/return-id id))))
+                    "the real model usage debits 140 and the unused allocation returns")
+                (is (= {resource/microdollars 500000M} (:resources (receipt (resource/allocation-id id)))))))
+            (finally
+              (when-let [handle @parent-handle]
+                (program/cancel! room handle)
+                (deref handle 10000 nil)))))))))
 
 (defn- await-condition [f]
   (let [deadline (+ (System/nanoTime) 30000000000)]
@@ -533,3 +542,98 @@
                 (is (nil? (binding [ec/*execution-context* (:ctx room)] (rreg/lookup (:run/world settled))))))
               (is (= before (state)) "the retained fork is untouched"))
             (finally (deliver release true) (.join caller 10000))))))))
+
+(deftest a-parent-funded-timeout-waits-to-return-funds-until-the-provider-quiesces
+  (let [[room world] (room-with-fork "rv-parent-timeout" {} {"wiki/a.md" "# A\n"})
+        spec (assoc wiki-only :review/reviewer {:instructions "Review" :model "claude-haiku-4-5"
+                                                :timeout-ms 2000})
+        team (roster/make-agent (roster/make-roster {:id :payer})
+                                {:id :payer :program {:kind :echo}})
+        finish-parent (promise)
+        parent-finished (promise)
+        parent-supervisor (promise)
+        entered (promise)
+        interrupted (promise)
+        release (promise)
+        finished (promise)
+        execute #'program/execute-agent-program
+        original @execute]
+    (binding [ec/*execution-context* (:ctx room)]
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 1000000M}})
+      (with-redefs-fn
+        {execute (fn [control work id chat agent task trigger supervisor]
+                   (if (= :payer (:agent/id agent))
+                     (sp/spin
+                      (deliver parent-supervisor supervisor)
+                      (sp/await
+                       (:done (#'program/start-worker! supervisor
+                                                       #(do @finish-parent
+                                                            (deliver parent-finished true)
+                                                            {:dvergr.agent.program/status :completed
+                                                             :dvergr.agent.program/value :done})))))
+                     (original control work id chat agent task trigger supervisor)))
+         #'providers/ensure-initialized! (constantly nil)
+         #'chat-agent/messages->api-format (fn [messages _ _] messages)
+         #'dvergr.chat.accounting/get-model-pricing (fn [_] {:input 1 :output 2})
+         #'model-chat/chat
+         (fn [_ _]
+           (deliver entered true)
+           (loop []
+             (when-not (try @release true
+                            (catch InterruptedException _ (deliver interrupted true) false))
+               (recur)))
+           {:content "{:review/verdict :approve :review/reasons [] :review/concerns []}"
+            :usage {:input-tokens 100 :output-tokens 20} :stop-reason :end-turn})}
+        (fn []
+          (let [parent (program/hire! room team :payer
+                                      {:task :pay :settlement :discard
+                                       :resources {resource/microdollars 750000M}})
+                parent-id (program/run-id parent)
+                reviewer (review/model-reviewer *daemon* room (fork-id world) spec
+                                                {:principal/run parent-id})
+                caller (Thread. ^Runnable (bound-fn []
+                                            (deliver finished
+                                                     (review/review! room (fork-id world) spec :reviewer reviewer))))
+                returns (atom [])
+                return-resources resource/return!]
+            (try
+              (with-redefs [resource/return!
+                            (fn [& args]
+                              (let [result (apply return-resources args)]
+                                (swap! returns conj (second args))
+                                result))]
+                (.start caller)
+                (is (= true (deref entered 10000 nil)))
+                (let [rv (deref finished 3000 nil)
+                      child-id (:run/id (first (remove #(= parent-id (:run/id %)) (run/runs room))))
+                      receipt #(store/-resource-receipt (:store room) (resource/return-id %))]
+                  (is (= :escalated (:review/decision rv)))
+                  (is (some #(str/includes? % "timed out") (:review/reasons rv)))
+                  (is (= true (deref interrupted 2000 nil)))
+                  (deliver finish-parent true)
+                  (is (= true (deref parent-finished 2000 nil)) "the parent body has finished")
+                  (is (await-condition #(some-> @parent-supervisor :state deref :sealed?))
+                      "the parent has sealed its supervisor")
+                  (is (= ::pending (deref parent 200 ::pending)) "parent settlement waits for its owned reviewer")
+                  (is (nil? (receipt parent-id)))
+                  (is (= 250000M (get (resource/balance room) resource/microdollars)))
+                  (is (= 250000M (resource/wallet-microdollars room parent-id)))
+                  (is (= 500000M (resource/wallet-microdollars room child-id)))
+                  (deliver release true)
+                  (is (= :completed (:run/status (deref parent 10000 nil))))
+                  (is (await-condition #(= :discarded (:run/settlement-status (run/run room child-id)))))
+                  (is (= :cancelled (:run/status (run/run room child-id))))
+                  (let [refund (get-in (receipt child-id) [:resources resource/microdollars])
+                        balance (resource/balance room)]
+                    (is (<= 499860M refund 500000M) "only any recorded provider usage is spent")
+                    (is (= (+ 500000M refund) (get balance resource/microdollars)))
+                    (is (= (+ 250000M refund) (get-in (receipt parent-id) [:resources resource/microdollars])))
+                    (is (= {parent-id 1 child-id 1} (frequencies @returns)) "each Run returns its funds exactly once"))
+                  (doseq [r (run/runs room)]
+                    (is (= {} (resource/run-balance room (:run/id r))) "every Run wallet is empty"))))
+              (finally
+                (deliver finish-parent true)
+                (deliver release true)
+                (.join caller 10000)
+                (program/cancel! room parent)
+                (deref parent 10000 nil)))))))))

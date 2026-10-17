@@ -35,6 +35,7 @@
             [clojure.edn :as edn]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
+            [dvergr.agent.run :as run]
             [dvergr.model.registry :as models]
             [dvergr.principal :as principal]
             [dvergr.resource :as resource]
@@ -254,10 +255,11 @@
 (defn model-reviewer
   "A one-review callback for `review!`: `(model-reviewer daemon room world spec caller)`.
    `world` is the retained fork id; `caller` supplies :principal/delegation
-   and optionally :principal/run (the payer Run UUID).
+   and optionally :principal/run (a live payer Run with a child supervisor).
    The spec's :review/reviewer requires :model and :instructions. The model
    receives an EDN evidence snapshot and no callable tools. Its own hired Run
-   settles :discard. Callback metadata supplies review!'s ops invocation and
+   settles :discard. A parent-funded Run is owned by the payer's supervisor.
+   Callback metadata supplies review!'s ops invocation and
    token cleanup, including when checks fail before the model is asked."
   [daemon room world spec caller]
   (let [invoke (requiring-resolve 'dvergr.ops/invoke)
@@ -310,10 +312,12 @@
                                                     (throw e))))]))))
                 task (pr-str (assoc input :review/instructions instructions
                                     :review/fork-diff diff :review/fork-review rev :review/files contents))
-                handle (program/hire! room team :reviewer
-                                      (cond-> {:task task :from :reviewer :settlement :discard
-                                               :resources {resource/microdollars 500000M}}
-                                        (:principal/run caller) (assoc :parent-run (:principal/run caller))))
+                parent-run (:principal/run caller)
+                admit! #(program/hire! room team :reviewer
+                                       (cond-> {:task task :from :reviewer :settlement :discard
+                                                :resources {resource/microdollars 500000M}}
+                                         parent-run (assoc :parent-run parent-run)))
+                handle (if parent-run (run/with-owned-child! room parent-run admit!) (admit!))
                 result (await-reviewer! room handle timeout-ms)]
             (when-not (and (= :completed (:run/status result)) (= :discarded (:run/settlement-status result)))
               (throw (ex-info "Reviewer Run did not complete and discard" {:result result})))
