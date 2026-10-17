@@ -402,8 +402,13 @@
     (and (pinned? principal) (not (live-run? principal)))
     {:allow? false :reason "This run token has ended"}
 
-    ;; a run token works in its room only, whatever the authorizer would allow
-    (and (pinned? principal) (not= (:principal/room principal) (:room (:resolved request))))
+    ;; A run token works in its room only. ops marks a merge's parent check
+    ;; with the fork it already authorized; the host still sees the parent.
+    (and (pinned? principal)
+         (not= (:principal/room principal)
+               (if (and (= :room/merge (:op request)) (= :merge (:action request)))
+                 (or (:via-room (:resolved request)) (:room (:resolved request)))
+                 (:room (:resolved request)))))
     {:allow? false :reason (str "This run token is for room " (:principal/room principal) " only")}
 
     :else

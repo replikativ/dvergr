@@ -5,10 +5,20 @@
   (:require [datahike.api :as dh]
             [dvergr.catalog.kb-pages-test :as kb-pages]
             [dvergr.system.rooms :as rooms]
-            [org.replikativ.spindel.engine.core :as ec]
+            [clojure.edn :as edn]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.agent.review :as review]
+            [dvergr.agent.program :as program]
+            [dvergr.agent.roster :as roster]
+            [org.replikativ.spindel.core :as sp]
+            [dvergr.agent.run :as run]
+            [dvergr.resource :as resource]
+            [dvergr.room.store :as store]
+            [dvergr.chat.agent :as chat-agent]
+            [dvergr.model.chat :as model-chat]
+            [dvergr.model.providers :as providers]
+            [org.replikativ.spindel.engine.core :as ec]
             [dvergr.catalog :as catalog]
             [dvergr.catalog.wiki-gen :as gen]
             [dvergr.catalog.wiki-v4 :as v4]
@@ -17,6 +27,7 @@
             [muschel.fs]
             [dvergr.ops :as ops]
             [dvergr.rooms.forks]
+            [dvergr.room.registry :as rreg]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.principal :as principal]
             [dvergr.substrate.paths :as paths]
@@ -290,3 +301,339 @@
              (get-in rv [:review/checks 1 :evidence :offenders]))))
     (is (not (:pass? (review/run-check (second (:review/checks spec))
                                        {:fork fork :other-systems ["another-kb"]}))))))
+(defn- model-review! [slug answer & {:keys [propose? attack? deny-merge? exhaust?]}]
+  (let [[parent world] (room-with-fork slug {"docs/a.md" "A."} {"wiki/a.md" "# A\n"})
+        fork (ops/resolve-room *daemon* world)
+        spec (cond-> (assoc-in wiki-only [:review/reviewer :model] "claude-haiku-4-5")
+               propose? (assoc :review/on-pass :propose))
+        _ (resource/mint! parent {:id (random-uuid) :resources {resource/microdollars 1000000M}})
+        calls (atom [])
+        authorized (atom [])
+        dmn (assoc-in *daemon* [:config :auth :authorize]
+                      (fn [p request]
+                        (swap! authorized conj [p request])
+                        (not (and deny-merge? (= :room/merge (:op request))))))
+        state #(binding [ec/*execution-context* (:ctx fork)] (dvergr.rooms.forks/state-token fork))
+        before (state)
+        reviewer (review/model-reviewer dmn parent (:id fork) spec {:principal/delegation {:id "delegation-1"}})]
+    (with-redefs [providers/ensure-initialized! (constantly nil)
+                  chat-agent/messages->api-format (fn [messages _ _] messages)
+                  model-chat/chat
+                  (fn [messages opts]
+                    (swap! calls conj {:messages messages :opts opts})
+                    (if (or exhaust? (and attack? (= 1 (count @calls))))
+                      {:content "" :tool-calls [{:id (str "write-" (count @calls)) :name "write_file"
+                                                 :input {:path "/wiki/a.md" :content "corrupted"}}]
+                       :usage (if exhaust? {:input-tokens 1000000 :output-tokens 1000000}
+                                  {:input-tokens 100 :output-tokens 20})
+                       :stop-reason :tool-use}
+                      {:content answer :tool-calls nil :usage {:input-tokens 100 :output-tokens 20}
+                       :stop-reason :end-turn}))]
+      (let [rv (review/review! parent (:id fork) spec :reviewer reviewer)
+            runs (run/runs parent)
+            [r] runs]
+        (is (= 1 (count runs)) "the reviewer is its own durable Run")
+        (is (= (if exhaust? :waiting :completed) (:run/status r)))
+        (is (= :discard (:run/settlement-policy r)))
+        (is (= :discarded (:run/settlement-status r)))
+        (is (nil? (binding [ec/*execution-context* (:ctx parent)] (rreg/lookup (:run/world r))))
+            "the reviewer world is released")
+        (when exhaust? (is (= 1 (count @calls)) "the reviewer stops at its budget limit"))
+        (is (every? #(empty? (get-in % [:opts :tools])) @calls) "the model has no callable world tools")
+        (let [messages (:messages (first @calls))
+              task (some #(when (= :user (or (:role %) (:message/role %)))
+                            (or (:content %) (:message/content %))) messages)
+              evidence (edn/read-string {:default (fn [_ value] value)} task)]
+          (is (= "# A\n" (get-in evidence [:review/files "wiki/a.md" :text])))
+          (is (every? :pass? (:review/checks evidence)))
+          (is (map? (:review/fork-diff evidence)))
+          (is (= "Approve faithful wiki updates." (:review/instructions evidence))))
+        (when attack? (is (= 2 (count @calls)) "the unavailable write tool is refused"))
+        (when propose?
+          (is (= before (state)) "the reviewer leaves the retained fork's state token unchanged")
+          (is (= {"/wiki/a.md" "# A\n"} (catalog/read-tree fork "/wiki"))))
+        (is (= (if (or propose? (not= :approve (get-in rv [:review/verdict :review/verdict]))
+                       (seq (get-in rv [:review/verdict :review/concerns])))
+                 #{:room/diff :room/review}
+                 #{:room/diff :room/review :room/merge})
+               (set (map (comp :op second) @authorized))))
+        (doseq [[p _] @authorized]
+          (is (= (name (:id fork)) (:principal/room p)))
+          (is (= #{"room_diff" "room_review" "room_merge"} (:principal/tools p)))
+          (is (= {:id "delegation-1"} (:principal/delegation p))))
+        (when (and (not propose?) (empty? (get-in rv [:review/verdict :review/concerns])) (= :approve (get-in rv [:review/verdict :review/verdict])) (not deny-merge?))
+          (is (= (:id parent)
+                 (some (fn [[_ request]]
+                         (when (= :merge (:action request))
+                           (keyword (get-in request [:resolved :room])))) @authorized)))
+          (is (= (name (:id fork))
+                 (some (fn [[_ request]]
+                         (when (= :merge (:action request)) (get-in request [:resolved :via-room]))) @authorized))))
+        (when-let [[p request] (first @authorized)]
+          (is (false? (:allow? (principal/decide dmn p request))) "the reviewer token is revoked"))
+        rv))))
+
+(deftest model-approval-merges
+  (let [rv (model-review! "rv-model-approve"
+                          (pr-str {:review/verdict :approve :review/reasons ["faithful"] :review/concerns []}))]
+    (is (= :merged (:review/decision rv)) (pr-str rv))))
+
+(deftest model-escalation-keeps-its-reasons
+  (let [rv (model-review! "rv-model-escalate"
+                          (pr-str {:review/verdict :escalate :review/reasons ["contradicts the source"]
+                                   :review/concerns ["unsupported claim"]}))]
+    (is (= :escalated (:review/decision rv)))
+    (is (some #{"contradicts the source"} (:review/reasons rv)))
+    (is (= ["unsupported claim"] (get-in rv [:review/verdict :review/concerns])))))
+
+(deftest model-garbage-escalates
+  (doseq [[suffix answer] [["garbage" "looks good"]
+                           ["trailing" "{:review/verdict :approve :review/reasons [] :review/concerns []} garbage"]
+                           ["sentinel" "{:review/verdict :approve :review/reasons [] :review/concerns []} :dvergr.agent.review/eof arbitrary trailing text"]
+                           ["shape" "{:review/verdict :approve :review/reasons \"yes\" :review/concerns []}"]]]
+    (is (= :escalated (:review/decision (model-review! (str "rv-model-" suffix) answer))))))
+
+(deftest model-cannot-write-the-reviewed-world
+  (is (= :escalated (:review/decision
+                     (model-review! "rv-model-readonly"
+                                    (pr-str {:review/verdict :approve :review/reasons [] :review/concerns []})
+                                    :propose? true :attack? true)))))
+
+(deftest model-merge-respects-the-host-authorizer
+  (is (= :escalated (:review/decision
+                     (model-review! "rv-model-denied"
+                                    (pr-str {:review/verdict :approve :review/reasons [] :review/concerns []})
+                                    :deny-merge? true)))))
+
+(deftest failed-checks-never-call-the-model-and-revoke-the-token
+  (let [[parent world] (room-with-fork "rv-model-check-fails" {} {"schedules.edn" "{}"})
+        spec (assoc-in wiki-only [:review/reviewer :model] "claude-haiku-4-5")
+        mint principal/mint-run-token!
+        token (atom nil)]
+    (with-redefs [principal/mint-run-token! (fn [opts] (reset! token (mint opts)))
+                  model-chat/chat (fn [& _] (throw (AssertionError. "model must not be called")))]
+      (let [reviewer (review/model-reviewer *daemon* parent (fork-id world) spec {})
+            rv (review/review! parent (fork-id world) spec :reviewer reviewer)]
+        (is (= :escalated (:review/decision rv)))
+        (is (empty? (run/runs parent)))
+        (is (nil? (principal/run-token-principal @token)))))))
+
+(deftest an-exhausted-model-reviewer-discards-its-world
+  (let [rv (model-review! "rv-model-exhausted" "" :exhaust? true :propose? true)]
+    (is (= :escalated (:review/decision rv)))
+    (is (some #(str/includes? % "Reviewer Run did not complete") (:review/reasons rv)))))
+
+(deftest approval-with-concerns-needs-a-person
+  (let [rv (model-review! "rv-model-concerns"
+                          (pr-str {:review/verdict :approve :review/reasons ["mostly faithful"]
+                                   :review/concerns ["verify the date"]}))]
+    (is (= :escalated (:review/decision rv)))
+    (is (some #{"verify the date"} (:review/reasons rv)))))
+
+(deftest model-reviewer-debits-the-payer-and-returns-the-remainder
+  (doseq [parent? [false true]]
+    (let [[room world] (room-with-fork (str "rv-paid-" parent?) {} {"wiki/a.md" "# A\n"})
+          spec (-> wiki-only
+                   (assoc :review/on-pass :propose)
+                   (assoc-in [:review/reviewer :model] "claude-haiku-4-5"))
+          parent-handle (atom nil)
+          seen (atom nil)]
+      (binding [ec/*execution-context* (:ctx room)]
+        (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 1000000M}})
+        (when parent?
+          (reset! parent-handle
+                  (program/hire! room
+                                 (roster/make-agent (roster/make-roster {:id :payer})
+                                                    {:id :payer :program {:kind :echo :delay-ms 600000}})
+                                 :payer {:task "pay for review" :settlement :discard
+                                         :resources {resource/microdollars 750000M}})))
+        (let [parent-id (some-> @parent-handle program/run-id)]
+          (try
+            (with-redefs [providers/ensure-initialized! (constantly nil)
+                          chat-agent/messages->api-format (fn [messages _ _] messages)
+                          dvergr.chat.accounting/get-model-pricing (fn [_] {:input 1 :output 2})
+                          model-chat/chat
+                          (fn [_ _]
+                            (let [r (first (remove #(= parent-id (:run/id %)) (run/runs room)))]
+                              (reset! seen {:id (:run/id r)
+                                            :wallet (resource/wallet-microdollars room (:run/id r))
+                                            :payer (if parent-id
+                                                     (resource/wallet-microdollars room parent-id)
+                                                     (get (resource/balance room) resource/microdollars))}))
+                            {:content "{:review/verdict :approve :review/reasons [] :review/concerns []}"
+                             :usage {:input-tokens 100 :output-tokens 20} :stop-reason :end-turn})]
+              (let [reviewer (review/model-reviewer *daemon* room (fork-id world) spec
+                                                    (cond-> {} parent-id (assoc :principal/run parent-id)))
+                    rv (review/review! room (fork-id world) spec :reviewer reviewer)
+                    id (:id @seen)
+                    receipt #(store/-resource-receipt (:store room) %)]
+                (is (= :escalated (:review/decision rv)))
+                (is (= 500000M (:wallet @seen)) "the model runs with its allocated wallet")
+                (is (= (if parent? 250000M 500000M) (:payer @seen)) "the intended payer funded it")
+                (is (= parent-id (:run/parent (run/run room id))))
+                (when parent?
+                  (is (= 250000M (get (resource/balance room) resource/microdollars))
+                      "the room root is not charged for its child Run’s review"))
+                (is (= 0M (resource/wallet-microdollars room id)))
+                (is (= (if parent? 749860M 999860M)
+                       (if parent-id (resource/wallet-microdollars room parent-id)
+                           (get (resource/balance room) resource/microdollars))))
+                (is (= {resource/microdollars 499860M} (:resources (receipt (resource/return-id id))))
+                    "the real model usage debits 140 and the unused allocation returns")
+                (is (= {resource/microdollars 500000M} (:resources (receipt (resource/allocation-id id)))))))
+            (finally
+              (when-let [handle @parent-handle]
+                (program/cancel! room handle)
+                (deref handle 10000 nil)))))))))
+
+(defn- await-condition [f]
+  (let [deadline (+ (System/nanoTime) 30000000000)]
+    (loop []
+      (cond (f) true
+            (> (System/nanoTime) deadline) false
+            :else (do (Thread/sleep 20) (recur))))))
+
+(deftest a-blocked-reviewer-is-cancelled-and-discarded-after-the-caller-leaves
+  (doseq [interrupt? [false true]]
+    (let [[room world] (room-with-fork (str "rv-blocked-" interrupt?) {} {"wiki/a.md" "# A\n"})
+          fork (ops/resolve-room *daemon* world)
+          state #(binding [ec/*execution-context* (:ctx fork)] (dvergr.rooms.forks/state-token fork))
+          before (state)
+          spec (assoc wiki-only :review/reviewer {:instructions "Review" :model "claude-haiku-4-5"
+                                                  :timeout-ms (if interrupt? 30000 2000)})
+          entered (promise)
+          interrupted (promise)
+          release (promise)
+          finished (promise)]
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 1000000M}})
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat
+                    (fn [_ _]
+                      (deliver entered true)
+                      ;; A provider can take time to acknowledge cancellation. Keep
+                      ;; it physically live until the test releases it.
+                      (loop []
+                        (when-not (try @release true
+                                       (catch InterruptedException _ (deliver interrupted true) false))
+                          (recur)))
+                      {:content "{:review/verdict :approve :review/reasons [] :review/concerns []}"
+                       :usage {:input-tokens 100 :output-tokens 20} :stop-reason :end-turn})]
+        (let [reviewer (review/model-reviewer *daemon* room (:id fork) spec {})
+              caller (Thread. ^Runnable (bound-fn []
+                                          (deliver finished (review/review! room (:id fork) spec :reviewer reviewer))))]
+          (try
+            (.start caller)
+            (is (= true (deref entered 10000 nil)) "the scripted model is blocked")
+            (when interrupt? (.interrupt caller))
+            (let [rv (deref finished (if interrupt? 2000 3000) nil)
+                  [r] (run/runs room)]
+              (is (= :escalated (:review/decision rv)) "the boundary returns without provider quiescence")
+              (when-not interrupt?
+                (is (some #(str/includes? % "timed out") (:review/reasons rv))))
+              (is (= true (deref interrupted 2000 nil)) "the Run interrupts its provider worker")
+              (is (run/cancel-requested? (:run/id r)))
+              (is (not= :discarded (:run/settlement-status r)) "discard waits for quiescence")
+              (deliver release true)
+              (is (await-condition #(= :discarded (:run/settlement-status (run/run room (:run/id r))))))
+              (let [settled (run/run room (:run/id r))]
+                (is (= :cancelled (:run/status settled)))
+                (is (= :discard (:run/settlement-policy settled)))
+                (is (nil? (binding [ec/*execution-context* (:ctx room)] (rreg/lookup (:run/world settled))))))
+              (is (= before (state)) "the retained fork is untouched"))
+            (finally (deliver release true) (.join caller 10000))))))))
+
+(deftest a-parent-funded-timeout-waits-to-return-funds-until-the-provider-quiesces
+  (let [[room world] (room-with-fork "rv-parent-timeout" {} {"wiki/a.md" "# A\n"})
+        spec (assoc wiki-only :review/reviewer {:instructions "Review" :model "claude-haiku-4-5"
+                                                :timeout-ms 2000})
+        team (roster/make-agent (roster/make-roster {:id :payer})
+                                {:id :payer :program {:kind :echo}})
+        finish-parent (promise)
+        parent-finished (promise)
+        parent-supervisor (promise)
+        entered (promise)
+        interrupted (promise)
+        release (promise)
+        finished (promise)
+        execute #'program/execute-agent-program
+        original @execute]
+    (binding [ec/*execution-context* (:ctx room)]
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 1000000M}})
+      (with-redefs-fn
+        {execute (fn [control work id chat agent task trigger supervisor]
+                   (if (= :payer (:agent/id agent))
+                     (sp/spin
+                      (deliver parent-supervisor supervisor)
+                      (sp/await
+                       (:done (#'program/start-worker! supervisor
+                                                       #(do @finish-parent
+                                                            (deliver parent-finished true)
+                                                            {:dvergr.agent.program/status :completed
+                                                             :dvergr.agent.program/value :done})))))
+                     (original control work id chat agent task trigger supervisor)))
+         #'providers/ensure-initialized! (constantly nil)
+         #'chat-agent/messages->api-format (fn [messages _ _] messages)
+         #'dvergr.chat.accounting/get-model-pricing (fn [_] {:input 1 :output 2})
+         #'model-chat/chat
+         (fn [_ _]
+           (deliver entered true)
+           (loop []
+             (when-not (try @release true
+                            (catch InterruptedException _ (deliver interrupted true) false))
+               (recur)))
+           {:content "{:review/verdict :approve :review/reasons [] :review/concerns []}"
+            :usage {:input-tokens 100 :output-tokens 20} :stop-reason :end-turn})}
+        (fn []
+          (let [parent (program/hire! room team :payer
+                                      {:task :pay :settlement :discard
+                                       :resources {resource/microdollars 750000M}})
+                parent-id (program/run-id parent)
+                reviewer (review/model-reviewer *daemon* room (fork-id world) spec
+                                                {:principal/run parent-id})
+                caller (Thread. ^Runnable (bound-fn []
+                                            (deliver finished
+                                                     (review/review! room (fork-id world) spec :reviewer reviewer))))
+                returns (atom [])
+                return-resources resource/return!]
+            (try
+              (with-redefs [resource/return!
+                            (fn [& args]
+                              (let [result (apply return-resources args)]
+                                (swap! returns conj (second args))
+                                result))]
+                (.start caller)
+                (is (= true (deref entered 10000 nil)))
+                (let [rv (deref finished 3000 nil)
+                      child-id (:run/id (first (remove #(= parent-id (:run/id %)) (run/runs room))))
+                      receipt #(store/-resource-receipt (:store room) (resource/return-id %))]
+                  (is (= :escalated (:review/decision rv)))
+                  (is (some #(str/includes? % "timed out") (:review/reasons rv)))
+                  (is (= true (deref interrupted 2000 nil)))
+                  (deliver finish-parent true)
+                  (is (= true (deref parent-finished 2000 nil)) "the parent body has finished")
+                  (is (await-condition #(some-> @parent-supervisor :state deref :sealed?))
+                      "the parent has sealed its supervisor")
+                  (is (= ::pending (deref parent 200 ::pending)) "parent settlement waits for its owned reviewer")
+                  (is (nil? (receipt parent-id)))
+                  (is (= 250000M (get (resource/balance room) resource/microdollars)))
+                  (is (= 250000M (resource/wallet-microdollars room parent-id)))
+                  (is (= 500000M (resource/wallet-microdollars room child-id)))
+                  (deliver release true)
+                  (is (= :completed (:run/status (deref parent 10000 nil))))
+                  (is (await-condition #(= :discarded (:run/settlement-status (run/run room child-id)))))
+                  (is (= :cancelled (:run/status (run/run room child-id))))
+                  (let [refund (get-in (receipt child-id) [:resources resource/microdollars])
+                        balance (resource/balance room)]
+                    (is (<= 499860M refund 500000M) "only any recorded provider usage is spent")
+                    (is (= (+ 500000M refund) (get balance resource/microdollars)))
+                    (is (= (+ 250000M refund) (get-in (receipt parent-id) [:resources resource/microdollars])))
+                    (is (= {parent-id 1 child-id 1} (frequencies @returns)) "each Run returns its funds exactly once"))
+                  (doseq [r (run/runs room)]
+                    (is (= {} (resource/run-balance room (:run/id r))) "every Run wallet is empty"))))
+              (finally
+                (deliver finish-parent true)
+                (deliver release true)
+                (.join caller 10000)
+                (program/cancel! room parent)
+                (deref parent 10000 nil)))))))))

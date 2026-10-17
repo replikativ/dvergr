@@ -784,6 +784,26 @@
                     "Run cancellation hook failed"))))
     (boolean entry)))
 
+(defn register-child-owner!
+  "Attach the executor's process-local child admission lease to a live Run."
+  [run-id own-child!]
+  (locking lifecycle-lock
+    (when (get @active run-id)
+      (swap! active assoc-in [run-id :own-child!] own-child!)
+      true)))
+
+(defn with-owned-child!
+  "Admit a child under a live parent Run's executor. The executor reserves
+   ownership before admission and rejects admission after cancellation/seal."
+  [room run-id admit-child!]
+  (let [owner (locking lifecycle-lock
+                (let [entry (get @active run-id)]
+                  (when (= (:id room) (get-in entry [:run :run/room]))
+                    (:own-child! entry))))]
+    (when-not owner
+      (throw (ex-info "Parent Run has no live child supervisor" {:run/id run-id})))
+    (owner admit-child!)))
+
 (defn register-cancel-hook!
   "Register process-local `f` for targeted cancellation of a live Run. If a
    cancellation request already won the race, invoke `f` immediately. Returns
