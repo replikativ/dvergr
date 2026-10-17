@@ -290,7 +290,8 @@
 
 (deftest an-attempts-spend-and-experiment-cell-are-typed
   (let [[conn _] (mem-store)
-        st (dhs/make conn (artifact/memory-store))
+        artifacts (artifact/memory-store)
+        st (dhs/make conn artifacts)
         room-id :datahike-attempt-cell
         [cell plain] [(random-uuid) (random-uuid)]
         experiment-id (random-uuid)
@@ -334,7 +335,30 @@
     (is (= #{[cell inputs-id]}
            (dh/q '[:find ?run-id ?inputs
                    :where [?a :attempt/inputs-id ?inputs] [?a :attempt/run ?r] [?r :run/id ?run-id]] @conn))
-        "what the candidate was presented with is typed")))
+        "what the candidate was presented with is typed")
+    (is (= #{[cell true true false] [plain false false false]}
+           (dh/q '[:find ?run-id ?priced ?notional ?reported
+                   :where [?a :attempt/run ?r] [?r :run/id ?run-id]
+                   [?a :attempt/spend-priced? ?priced]
+                   [?a :attempt/notional-priced? ?notional]
+                   [?a :attempt/usage-reported? ?reported]] @conn)))
+    (testing "false flags are projected and cannot be forged independently of the exact payload"
+      (let [before (store/-load-attempt st room-id cell)
+            entity (dh/q '[:find ?a . :in $ ?run :where [?a :attempt/id ?run]] @conn cell)
+            projected (dh/pull @conn @#'dhs/attempt-pull-pattern entity)]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Certified Attempt rows are immutable"
+                              (dh/transact conn [[:db/add entity :attempt/usage-reported? true]])))
+        ;; Exercise read-time validation separately from the write governor.
+        (doseq [[flag forged] [[:attempt/usage-reported? true]
+                               [:attempt/notional-priced? false]
+                               [:attempt/spend-priced? false]]]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"typed projection differs"
+                                (@#'dhs/entity->attempt (assoc projected flag forged) artifacts))))
+        (is (= before (store/-load-attempt st room-id cell)))
+        (is (= before (@#'dhs/entity->attempt
+                       (dissoc projected :attempt/spend-priced? :attempt/notional-priced? :attempt/usage-reported?)
+                       artifacts))
+            "legacy rows missing flags still reconstruct the same payload")))))
 
 (deftest legacy-artifact-injection-and-domain-readers-remain-compatible
   (let [[conn _] (mem-store)

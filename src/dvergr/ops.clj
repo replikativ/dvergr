@@ -247,21 +247,28 @@
 
 ;; ---- the evaluation read model: what the MCP tool and the web view share ----
 
+(defn- measured-money [measured]
+  (assoc measured
+         :dollars (some-> (:microdollars measured) double (/ 1e6))
+         :notional-dollars (some-> (:notional-microdollars measured) double (/ 1e6))))
+
 (defn- spend-data
   "A spend as plain data: what was paid (`:dollars`) and, for subscription
    models, what the same tokens are worth at list price (`:notional-dollars`;
    equal to `:dollars` otherwise)."
-  [spend]
-  (when spend
-    {:microdollars (:microdollars spend 0)
-     :dollars      (/ (double (:microdollars spend 0)) 1e6)
-     :notional-microdollars (spend/notional-microdollars spend)
-     :notional-dollars (/ (double (spend/notional-microdollars spend)) 1e6)
-     :priced?      (:priced? spend true)
-     :tokens       (:tokens spend {})
-     :by-model     (into {} (map (fn [[m sp]] [(str m) {:microdollars (:microdollars sp 0)
-                                                        :tokens (:tokens sp {})}]))
-                         (:by-model spend {}))}))
+  ([recorded] (spend-data recorded [recorded]))
+  ([recorded contributions]
+   (when recorded
+     (let [measured (spend/measurements contributions)
+           attributed? (and (:priced? measured) (:usage-reported? measured)
+                            (every? (comp seq :by-model) contributions))
+           models (group-by key (mapcat :by-model contributions))]
+       (assoc (measured-money measured)
+              :model-attribution-complete? (boolean attributed?)
+              :by-model (if attributed?
+                          (into {} (map (fn [[model parts]]
+                                          [(str model) (measured-money (spend/measurements (map val parts)))])) models)
+                          {}))))))
 
 (defn- run-data [r]
   (when r
@@ -325,7 +332,7 @@
                                                  es)))]
     (mapv (fn [row]
             (if-let [spends (seq (get by-candidate (:candidate row)))]
-              (assoc row :judge-spend (spend-data (spend/total spends)))
+              (assoc row :judge-spend (spend-data (spend/total spends) spends))
               row))
           rows)))
 
@@ -404,27 +411,32 @@
   [sc & [{:keys [full? load-attempt compare? baseline]}]]
   (when sc
     (let [exp (:scorecard/experiment sc)
+          contributions (update-vals (group-by :candidate/id (:scorecard/entries sc)) #(mapv :spend %))
+          measured (update-vals contributions spend/measurements)
           rewards (update-vals (group-by :candidate/id (:scorecard/entries sc)) #(mapv :reward %))
           rows (->> (:scorecard/summary sc)
                     (map (fn [s]
-                           {:candidate       (kw->str (:candidate/id s))
-                            :attempts        (:attempt-count s)
-                            :passed          (:passed-count s)
-                            :pass-rate       (when (pos? (:attempt-count s 0))
-                                               (/ (double (:passed-count s)) (:attempt-count s)))
-                            :pass-rate-interval (xstats/pass-rate-interval (:passed-count s 0) (:attempt-count s 0))
-                            :reward-mean     (:reward-mean s)
-                            :reward-interval (xstats/mean-interval (get rewards (:candidate/id s)))
-                            :spend           (spend-data (:spend s))
-                            :microdollars-per-attempt (:microdollars-per-attempt s)
-                            :microdollars-per-pass    (:microdollars-per-pass s)
+                           (let [m (get measured (:candidate/id s))]
+                             {:candidate       (kw->str (:candidate/id s))
+                              :attempts        (:attempt-count s)
+                              :passed          (:passed-count s)
+                              :pass-rate       (when (pos? (:attempt-count s 0))
+                                                 (/ (double (:passed-count s)) (:attempt-count s)))
+                              :pass-rate-interval (xstats/pass-rate-interval (:passed-count s 0) (:attempt-count s 0))
+                              :reward-mean     (:reward-mean s)
+                              :reward-interval (xstats/mean-interval (get rewards (:candidate/id s)))
+                              :spend           (spend-data (:spend s) (get contributions (:candidate/id s)))
+                              :microdollars-per-attempt (when (and (:priced? m) (pos? (:attempt-count s 0)))
+                                                          (quot (:microdollars m) (:attempt-count s)))
+                              :microdollars-per-pass (when (and (:priced? m) (pos? (:passed-count s 0)))
+                                                       (quot (:microdollars m) (:passed-count s)))
                             ;; at list price, so a subscription run compares with a paid one
-                            :notional-microdollars-per-attempt
-                            (when (pos? (:attempt-count s 0))
-                              (quot (spend/notional-microdollars (:spend s)) (:attempt-count s)))
-                            :notional-microdollars-per-pass
-                            (when (pos? (:passed-count s 0))
-                              (quot (spend/notional-microdollars (:spend s)) (:passed-count s)))}))
+                              :notional-microdollars-per-attempt
+                              (when (and (:notional-priced? m) (pos? (:attempt-count s 0)))
+                                (quot (:notional-microdollars m) (:attempt-count s)))
+                              :notional-microdollars-per-pass
+                              (when (and (:notional-priced? m) (pos? (:passed-count s 0)))
+                                (quot (:notional-microdollars m) (:passed-count s)))})))
                     (sort-by (juxt #(- (or (:reward-mean %) 0))
                                    #(or (:microdollars-per-pass %) Long/MAX_VALUE)))
                     vec)]
@@ -645,15 +657,18 @@
      (->> attempts
           (group-by :model)
           (mapv (fn [[model xs]]
-                  (let [md (reduce + 0 (keep #(get-in % [:spend :microdollars]) xs))
+                  (let [measured (spend/measurements (map :spend xs))
+                        md (:microdollars measured)
                         ok (count (filter #(= 1.0 (:reward %)) xs))
                         rewards (keep :reward xs)]
                     {:model model :attempts (count xs) :completed ok
                      :mean-reward (when (seq rewards)
                                     (/ (Math/round (* 1000 (/ (reduce + rewards) (count rewards)))) 1000.0))
                      :microdollars md
-                     :microdollars-per-completion (when (pos? ok) (quot md ok))})))
-          (sort-by (juxt #(- (or (:mean-reward %) 0)) #(- (:completed %)) :microdollars))
+                     :priced? (:priced? measured)
+                     :unpriced-attempts (:unpriced-attempts measured)
+                     :microdollars-per-completion (when (and (some? md) (pos? ok)) (quot md ok))})))
+          (sort-by (juxt #(- (or (:mean-reward %) 0)) #(- (:completed %)) #(or (:microdollars %) Long/MAX_VALUE)))
           vec)
      :wallet (in-ctx daemon (wallet-data room nil))
      :adopt (str "room_merge {room: <world>, expect-state: <review.state>} adopts one attempt; "

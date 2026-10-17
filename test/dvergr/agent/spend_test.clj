@@ -9,6 +9,33 @@
     (assert (acct/get-model-pricing id) "the test model has a registry price")
     id))
 
+(deftest presentation-measurements-never-divide-partial-cost-or-usage-totals
+  (let [known {:microdollars 0 :notional-microdollars 25 :priced? true :tokens {:input 10 :output 0 :cache-read 2}}
+        unknown {:microdollars 0 :priced? false :tokens {}}
+        measured (spend/measurements [known unknown])]
+    (is (nil? (:microdollars measured)))
+    (is (nil? (:notional-microdollars measured)))
+    (is (false? (:priced? measured)))
+    (is (= 1 (:unpriced-attempts measured)))
+    (is (false? (:usage-reported? measured)))
+    (is (= 1 (:unreported-attempts measured)))
+    (is (= {} (:tokens measured)))
+    (is (= {:input 10 :output 0 :cache-read 2} (:tokens (spend/measurements [known]))))
+    (is (= 0 (:microdollars (spend/measurements [known]))))
+    (is (= 25 (:notional-microdollars (spend/measurements [known]))))
+    (testing "unknown price does not erase actually reported tokens"
+      (let [m (spend/measurements [(assoc unknown :tokens {:input 9 :output 1})])]
+        (is (nil? (:microdollars m)))
+        (is (true? (:usage-reported? m)))
+        (is (= {:input 9 :output 1} (:tokens m)))))
+    (testing "dimensions and billed/list-price completeness are independent"
+      (let [m (spend/measurements [{:notional-microdollars 17 :tokens {:input 8}}])]
+        (is (nil? (:microdollars m)))
+        (is (= 17 (:notional-microdollars m)))
+        (is (= {:input 8} (:tokens m)))))
+    (is (nil? (:microdollars (spend/measurements [nil]))))
+    (is (nil? (:microdollars (spend/measurements [{}]))))))
+
 (deftest a-provider-usage-record-is-priced-with-the-registry
   (let [usage {:input-tokens 1000 :output-tokens 100 :cache-read-tokens 10}
         s (spend/of-usage priced-model usage)]

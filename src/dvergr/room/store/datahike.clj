@@ -11,6 +11,7 @@
             [datahike.api :as dh]
             [dvergr.agent.attempt :as attempt]
             [dvergr.agent.attempt.governance :as attempt-governance]
+            [dvergr.agent.spend :as spend]
             [dvergr.artifact :as artifact]
             [dvergr.chat.schema :as schema]
             [dvergr.chat.persist :as persist]
@@ -428,6 +429,7 @@
     :attempt/model-resolution :attempt/model-steps
     :attempt/evidence-content-id :attempt/settlement-intent
     :attempt/microdollars :attempt/notional-microdollars
+    :attempt/spend-priced? :attempt/notional-priced? :attempt/usage-reported?
     :attempt/experiment-content-id :attempt/experiment-candidate
     :attempt/inputs-id
     {:attempt/run [:run/id]}
@@ -507,7 +509,8 @@
   (let [receipt (:attempt/receipt value)
         definition (:attempt/environment value)
         verifier (:environment/verifier definition)
-        metrics (:attempt/metrics receipt)]
+        metrics (:attempt/metrics receipt)
+        measurements (spend/measurements [(:spend metrics)])]
     (cond-> {:attempt/id (:attempt/id value)
              :attempt/chat [:chat/id chat-id]
              :attempt/run [:run/id (:attempt/run-id value)]
@@ -526,6 +529,9 @@
              :attempt/elapsed-ms (long (:attempt/elapsed-ms receipt))
              :attempt/certified-at (java.util.Date. ^long (:attempt/certified-at value))
              :attempt/reward (double (:attempt/reward receipt))
+             :attempt/spend-priced? (:priced? measurements)
+             :attempt/notional-priced? (:notional-priced? measurements)
+             :attempt/usage-reported? (:usage-reported? measurements)
              :attempt/agent-def-hash (:attempt/agent-def-hash value)
              :attempt/program-kind (:program-kind metrics)
              :attempt/interpreter-version (long (:interpreter-version metrics))
@@ -624,6 +630,9 @@
                                     (select-keys
                                      {:attempt/microdollars (get-in metrics [:spend :microdollars])
                                       :attempt/notional-microdollars (get-in metrics [:spend :notional-microdollars])
+                                      :attempt/spend-priced? (:priced? (spend/measurements [(:spend metrics)]))
+                                      :attempt/notional-priced? (:notional-priced? (spend/measurements [(:spend metrics)]))
+                                      :attempt/usage-reported? (:usage-reported? (spend/measurements [(:spend metrics)]))
                                       :attempt/experiment-content-id (:experiment-content-id metrics)
                                       :attempt/experiment-candidate (:experiment-candidate metrics)
                                       :attempt/inputs-id (:inputs-id metrics)}

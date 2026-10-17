@@ -51,9 +51,10 @@
                  passes (count (filter :passed? entries))
                  rewards (mapv #(double (or (:reward %) 0)) entries)
                  ;; a paid call's bill is its list price; a subscription's is notional
-                 notional (reduce + 0 (map #(spend/notional-microdollars (:spend % {})) entries))
-                 tok (fn [k] (reduce + 0 (map #(get-in % [:spend :tokens k] 0) entries)))
-                 tokens (+ (tok :input) (tok :output))
+                 measured (spend/measurements (map :spend entries))
+                 notional (:notional-microdollars measured)
+                 tok #(get-in measured [:tokens %])
+                 tokens (when (:usage-reported? measured) (+ (tok :input) (tok :output)))
                  receipts (keep #(receipt-by-id (:attempt/id %)) entries)
                  secs (sort (keep #(some-> (:attempt/elapsed-ms %) (/ 1000.0)) receipts))
                  spans (keep (fn [r] (when-let [t0 (:attempt/started-at r)]
@@ -62,20 +63,23 @@
                  failed (frequencies (mapcat (fn [r] (keep (fn [[k v]] (when (false? v) k)) (:attempt/checks r))) receipts))
                  ;; judging the candidate's attempts: the experiment's cost,
                  ;; never in the candidate's own
-                 judge (spend/total (keep #(get-in % [:attempt/metrics :judge-spend]) receipts))
+                 judge (spend/measurements (keep #(get-in % [:attempt/metrics :judge-spend]) receipts))
                  judged? (some #(get-in % [:attempt/metrics :judge-spend]) receipts)]]
        {:candidate cid :n n :passes passes
         :pass-rate (when (pos? n) (/ passes (double n)))
         :pass-interval (xstats/pass-rate-interval passes n)
         :reward (when (pos? n) (/ (reduce + rewards) n))
         :reward-interval (xstats/mean-interval rewards)
-        :notional-per-attempt (when (pos? n) (/ notional n))
-        :notional-per-pass (when (pos? passes) (/ notional passes))
-        :tokens-per-attempt (when (pos? n) (quot tokens n))
-        :input-per-attempt (when (pos? n) (quot (tok :input) n))
-        :output-per-attempt (when (pos? n) (quot (tok :output) n))
+        :priced? (:priced? measured) :notional-priced? (:notional-priced? measured)
+        :unpriced-attempts (:unpriced-attempts measured)
+        :usage-reported? (:usage-reported? measured) :unreported-attempts (:unreported-attempts measured)
+        :notional-per-attempt (when (and (some? notional) (pos? n)) (/ notional n))
+        :notional-per-pass (when (and (some? notional) (pos? passes)) (/ notional passes))
+        :tokens-per-attempt (when (and (some? tokens) (pos? n)) (quot tokens n))
+        :input-per-attempt (when (and (some? (tok :input)) (pos? n)) (quot (tok :input) n))
+        :output-per-attempt (when (and (some? (tok :output)) (pos? n)) (quot (tok :output) n))
         ;; unknown, not 0, where no attempt recorded its cache split
-        :cache-share (when (and (pos? (tok :input)) (some #(contains? (get-in % [:spend :tokens]) :cache-read) entries))
+        :cache-share (when (and (some? (tok :input)) (pos? (tok :input)) (some? (tok :cache-read)))
                        (/ (tok :cache-read) (double (tok :input))))
         :notional-total notional
         :median-seconds (median secs)
@@ -85,8 +89,9 @@
         :wall-seconds (when (seq spans)
                         (/ (- (reduce max (map second spans)) (reduce min (map first spans))) 1000.0))
         :failed-checks (into (sorted-map) failed)
-        :judge-notional-total (when judged? (spend/notional-microdollars judge))
-        :judge-billed-total (when judged? (:microdollars judge 0))}))))
+        :judge-recorded? (boolean judged?)
+        :judge-notional-total (when judged? (:notional-microdollars judge))
+        :judge-billed-total (when judged? (:microdollars judge))}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Paired comparisons
@@ -212,21 +217,24 @@
    whose attempts it judged, at list price and as billed. It is the
    experiment's cost, so no candidate's cost above includes it."
   [rs]
-  (when (some :judge-notional-total rs)
-    (let [total #(reduce + 0 (keep % rs))]
+  (when (some :judge-recorded? rs)
+    (let [judged (filter :judge-recorded? rs)
+          total (fn [field] (let [xs (map field judged)] (when (every? some? xs) (reduce + 0 xs))))]
       (str "\n### Judge\n\n"
            "What the judge model's calls cost, grading each candidate's attempts. Judging is the experiment's "
            "cost: it is in no candidate's cost per attempt, per pass or total above.\n\n"
            "| Candidate judged | Judge cost (list price) | Judge cost (billed) | Per attempt (list price) |\n"
            "|---|---:|---:|---:|\n"
            (str/join
-            (for [{:keys [candidate n judge-notional-total judge-billed-total]} rs
-                  :when judge-notional-total]
+            (for [{:keys [candidate n judge-recorded? judge-notional-total judge-billed-total]} rs
+                  :when judge-recorded?]
               (format "| %s | %s | %s | %s |\n" (name candidate)
-                      (money judge-notional-total) (money judge-billed-total)
-                      (if (pos? n) (money (/ judge-notional-total n)) "–"))))
+                      (if (some? judge-notional-total) (money judge-notional-total) "–")
+                      (if (some? judge-billed-total) (money judge-billed-total) "–")
+                      (if (and (some? judge-notional-total) (pos? n)) (money (/ judge-notional-total n)) "–"))))
            (format "| **judge, all** | %s | %s | |\n"
-                   (money (total :judge-notional-total)) (money (total :judge-billed-total)))))))
+                   (if-some [n (total :judge-notional-total)] (money n) "–")
+                   (if-some [n (total :judge-billed-total)] (money n) "–"))))))
 
 (defn markdown
   "The pilot report: `title`, the run `result`, and optionally the bundle's
@@ -269,12 +277,12 @@
                 (if p90-seconds (format "%.0f s" p90-seconds) "–")
                 (if total-seconds (format "%.1f min" (/ total-seconds 60.0)) "–")
                 (if wall-seconds (format "%.1f min" (/ wall-seconds 60.0)) "–")
-                (money (or notional-total 0)))))
+                (if (some? notional-total) (money notional-total) "–"))))
      "\nSummed time adds up every attempt's own time; the wall clock runs from the first attempt's start to "
      "the last one's end (it includes waits, and is shorter than the sum when attempts run in parallel). "
      "Cached input is the share of input tokens read from the provider's cache (– where it was not recorded).\n"
      "\nCosts are at the models' list prices (what the same tokens cost through the API), whether or not "
-     "a subscription paid for them.\n"
+     "a subscription paid for them. Unreported or incompletely priced usage is shown as –, never as measured zero.\n"
      (judge-markdown rs)
      (when (seq checks)
        (str "\n## Where answers fail\n\n"

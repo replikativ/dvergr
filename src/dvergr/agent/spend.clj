@@ -24,6 +24,7 @@
    solved task compares across a subscription, a customer's own key and a
    paid run; the bill (`:microdollars`) stays what was paid."
   (:require [dvergr.chat.accounting :as acct]
+            [dvergr.agent.measurements :as measurements]
             [dvergr.model.registry :as registry]))
 
 (def ^:private token-keys
@@ -107,6 +108,12 @@
     (assoc :notional-microdollars (+ (notional-microdollars a) (notional-microdollars b)))))
 
 (def zero {:microdollars 0 :tokens {} :by-model {} :priced? true})
+
+(defn measurements
+  "Presentation-only completeness; see dvergr.agent.measurements/summarize.
+   Does not change canonical spend or stored Scorecard identities."
+  [spends]
+  (measurements/summarize spends))
 
 (defn of-usage
   "The spend of one provider usage record under `model`."

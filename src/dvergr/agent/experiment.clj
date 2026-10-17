@@ -1022,7 +1022,7 @@
      :verdicts (count verdicts)
      :faults (- (count attempts) (count verdicts))
      :reward-mean (when (seq rewards) (/ (reduce + rewards) (count rewards)))
-     :microdollars (reduce + 0 (keep #(get-in (metrics %) [:spend :microdollars]) attempts))
+     :microdollars (:microdollars (spend/measurements (map #(get-in (metrics %) [:spend]) attempts)))
      :failures (frequencies (keep #(get-in (metrics %) [:failure :cause]) attempts))}))
 
 (defn progress
@@ -1046,26 +1046,28 @@
         running (if (satisfies? store/PRoomStore room-store)
                   (try (store/-list-runs room-store (store/conversation-id room) {:status :running :limit 1000})
                        (catch Throwable _ []))
-                  [])]
+                  [])
+        measured (spend/measurements (map #(get-in % [:attempt/receipt :attempt/metrics :spend]) mine))]
     {:experiments
      (->> mine
           (group-by #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
           (mapv (fn [[content-id xs]]
                   (let [spent (into {} (map (fn [[c ys]]
-                                              [c (reduce + 0 (keep #(get-in % [:attempt/receipt :attempt/metrics
-                                                                               :spend :microdollars])
-                                                                   ys))]))
+                                              [c (spend/measurements (map #(get-in % [:attempt/receipt :attempt/metrics :spend]) ys))]))
                                     (group-by #(get-in % [:attempt/receipt :attempt/metrics :experiment-candidate]) xs))]
                     {:experiment/content-id content-id
                      :inputs (inputs-changes xs)
                      :candidates
                      (->> (current-attempts xs)
                           (group-by #(get-in % [:attempt/receipt :attempt/metrics :experiment-candidate]))
-                          (mapv (fn [[c ys]] (assoc (candidate-progress ys)
-                                                    :candidate/id c
+                          (mapv (fn [[c ys]] (merge (candidate-progress ys)
+                                                    {:candidate/id c}
                                                     ;; what was spent, superseded Attempts too
-                                                    :microdollars (get spent c 0))))
+                                                    (select-keys (get spent c) [:microdollars :priced? :unpriced-attempts
+                                                                                :usage-reported? :unreported-attempts]))))
                           (sort-by (comp str :candidate/id))
                           vec)}))))
      :running (mapv #(select-keys % [:run/id :run/actor :run/started-at]) running)
-     :microdollars (reduce + 0 (keep #(get-in % [:attempt/receipt :attempt/metrics :spend :microdollars]) mine))}))
+     :microdollars (:microdollars measured)
+     :priced? (:priced? measured)
+     :unpriced-attempts (:unpriced-attempts measured)}))
