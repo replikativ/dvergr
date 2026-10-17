@@ -53,6 +53,14 @@ grants with its own words (simmis adds `:merge`) answers for them through
 `dvergr.system.rooms/set-grant-permits!`, a `(fn [permission action])` that
 dvergr asks with `:write`; without it `:owner` and `:read-write` write.
 
+Introducing a protected system that exists only in the child also requires a
+current write grant, even when its database has no content changes. Ordinary
+Room merges recheck after quiescence and inside the merge guard's substrate
+callback, not only at early preflight. Missing deltas for protected mergeable
+systems refuse settlement; unchanged shared non-mergeable systems and ordinary
+unregistered extensions keep their existing behavior. This is a fresh check,
+not an atomic transaction with an independent grant writer.
+
 ### Shared, durable: the system DB
 
 One Datahike DB per home (`dvergr.system.db`), not per room and not forked:
