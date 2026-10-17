@@ -1075,6 +1075,7 @@
                                                               :evidence (pr-str (:evidence c))})
                                                      (:review/checks rv))
                                        :reviewed_at (str (.toInstant ^java.util.Date (:review/reviewed-at rv)))}
+                                (:review/effective-policy rv) (assoc :effective_policy (:review/effective-policy rv))
                                 (:review/run-id rv) (assoc :run (str (:review/run-id rv)))
                                 (:review/verdict rv) (assoc :verdict (update (:review/verdict rv) :review/verdict name))
                                 (:review/spot-check? rv) (assoc :spot_check true)))

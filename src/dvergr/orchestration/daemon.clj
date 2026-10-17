@@ -903,6 +903,9 @@
         ;; its room-ctx, so this MUST run before it.
         (srooms/hydrate-rooms!)
         (rooms/hydrate-registry! exec-ctx)
+        (doseq [room (dvergr.room.registry/list-rooms :where #(some? (:store %)))]
+          (binding [rtc/*execution-context* (:ctx room)]
+            ((requiring-resolve 'dvergr.agent.review/recover-interrupted!) room)))
 
         ;; P3: GC abandoned fork worktrees/branches. Fork rooms are in-memory only,
         ;; so any fork branch on disk now is an orphan from a prior run — prune it.

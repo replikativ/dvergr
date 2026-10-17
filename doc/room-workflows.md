@@ -392,3 +392,32 @@ settlement work. Its world may already have been merged or discarded.
 
 Next: the reviewer benchmark (generated good and damaged updates: does it approve
 the good and escalate the bad?).
+
+Automatic settlement treats a bundle's review specification as a request. The
+host always adds the conflict check and scope checks derived from
+`:workflow/writes {:repo ["wiki/"] :kb {system-id #{:wiki/atom :wiki/overview :wiki/index}}}`.
+A KB set of system ids uses those three wiki kinds. With no declared writes,
+approval is proposed to a person. Extra bundle checks can further restrict the
+scope; they cannot widen it.
+
+Merge and discard go through `ops/invoke`, using the caller's principal or a
+fork-pinned reviewer principal carrying the caller's delegation. A reviewer
+principal is considered for automatic action only when that delegation exists.
+Without an authorized principal, merge becomes propose and discard becomes
+escalate. The Review's `:review/effective-policy` records the checks, bounded
+reviewer configuration and `:review/downgrades` with reasons. Reviewer models use
+the same admission as workflow candidates, including the host authorization
+request for `[:model id]` and any `:principal/models` cap. Reviewer spending is
+bounded by the requested budget, the workflow's caller budget cap
+(`:budget-dollars`, default $0.50), `:principal/budget-dollars`, and the caller
+Run wallet's remaining balance. A caller Run funds the reviewer when present.
+
+Before setup, settlement atomically writes an immutable `:pending` intent keyed
+by the attempt Run. The final Review has a separate deterministic identity.
+Concurrent finish calls share that decision; retries never start another review.
+Pending intents are internal records, omitted from `review_list`. Startup
+escalates each intent without a final decision, retaining its world and effective
+policy in the durable Review and posting `:review/escalated`. Setup and execution
+failures also escalate per attempt, allowing subsequent attempts to settle.
+Settlement workers have a room-owned lifecycle Run and a job cancellation hook;
+job cancellation interrupts them and room teardown waits for their termination.

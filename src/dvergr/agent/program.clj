@@ -106,6 +106,19 @@
   (UUID/nameUUIDFromBytes
    (.getBytes (str "dvergr-agent-run|" run-id) StandardCharsets/UTF_8)))
 
+(def ^:dynamic *worker-supervisor* nil)
+
+(defn with-worker-decision!
+  "Serialize an irreversible decision with this worker's cancellation fence."
+  [f]
+  (if-let [supervisor *worker-supervisor*]
+    (locking supervisor
+      (when (or (:cancelled? @(:state supervisor))
+                (and (:lifecycle-run supervisor) (run/cancel-requested? (:lifecycle-run supervisor))))
+        (throw (ex-info "Worker cancelled before decision" {})))
+      (f))
+    (f)))
+
 (declare start-worker!)
 
 (defn- make-supervisor
@@ -227,7 +240,8 @@
                                     ;; In particular trusted world setup must
                                     ;; not inherit the drain/graph identity
                                     ;; which admitted the Run.
-                                    ec/*spin-id* nil]
+                                    ec/*spin-id* nil
+                                    *worker-supervisor* supervisor]
                             (try
                               (reset! result (f))
                               (catch Throwable t
@@ -278,19 +292,54 @@
            (.cancel task false))))
      worker)))
 
+(declare cancel-supervisor! mark-cleanup-safe! seal-supervisor!)
+
 (defn on-worker!
-  "Call `f` on a supervised native worker in `room`, and await its result.
-   A boundary operation: never call from a Spin."
-  [room f]
-  (when ec/*spin-id*
-    (throw (ex-info "A worker boundary cannot block a Spin" {:type ::worker-boundary})))
-  (let [outcome (promise)
-        worker (start-worker! (make-supervisor (:ctx room))
-                              #(deliver outcome (try {:value (f)}
-                                                     (catch Throwable t {:error t}))))]
-    (.get ^FutureTask (:task worker))
-    (let [{:keys [value error]} @outcome]
-      (if error (throw error) value))))
+  "Call f on a native worker. The owned arity admits a room lifecycle Run,
+   links job cancellation to its supervisor, and waits for physical quiescence."
+  ([room f]
+   (when ec/*spin-id*
+     (throw (ex-info "A worker boundary cannot block a Spin" {:type ::worker-boundary})))
+   (let [outcome (promise)
+         worker (start-worker! (make-supervisor (:ctx room))
+                               #(deliver outcome (try {:value (f)}
+                                                      (catch Throwable t {:error t}))))]
+     (.get ^FutureTask (:task worker))
+     (let [{:keys [value error]} @outcome]
+       (if error (throw error) value))))
+  ([room owner f]
+   (when ec/*spin-id*
+     (throw (ex-info "A worker boundary cannot block a Spin" {:type ::worker-boundary})))
+   (let [r (run/start! room :settlement (random-uuid) nil
+                       (cond-> {:kind :settlement} owner (assoc :parent owner)))
+         id (:run/id r)
+         supervisor (assoc (make-supervisor (:ctx room)) :lifecycle-run id)
+         key [::settlement id]
+         cancelled? (atom false)
+         cancel #(do (reset! cancelled? true) (cancel-supervisor! supervisor))
+         outcome (promise)]
+     (try
+       (run/register-cancel-hook! id key cancel)
+       (when owner
+         (when-not (run/register-cancel-hook! owner key cancel)
+           (throw (ex-info "Settlement job is no longer live" {:run/id owner}))))
+       (let [worker (start-worker! supervisor
+                                   #(deliver outcome (try {:value (f)}
+                                                          (catch Throwable t {:error t}))))]
+         (try (.get ^FutureTask (:task worker))
+              (catch java.util.concurrent.CancellationException _ nil))
+         (mark-cleanup-safe! supervisor)
+         (seal-supervisor! supervisor)
+         (.await ^CountDownLatch (:quiesced-latch supervisor))
+         (when @cancelled? (throw (ex-info "Settlement cancelled" {:run/id id})))
+         (let [{:keys [value error]} @outcome]
+           (if error (throw error) value)))
+       (finally
+         (mark-cleanup-safe! supervisor)
+         (seal-supervisor! supervisor)
+         (.await ^CountDownLatch (:quiesced-latch supervisor))
+         (when owner (run/unregister-cancel-hook! owner key))
+         (run/finish! id (if @cancelled? :cancelled :completed)))))))
 
 (defn- cancel-supervisor! [supervisor]
   (let [[tasks cancel-children]

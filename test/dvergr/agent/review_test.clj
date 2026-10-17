@@ -309,9 +309,10 @@
         _ (resource/mint! parent {:id (random-uuid) :resources {resource/microdollars 1000000M}})
         calls (atom [])
         authorized (atom [])
+        admissions (atom [])
         dmn (assoc-in *daemon* [:config :auth :authorize]
                       (fn [p request]
-                        (swap! authorized conj [p request])
+                        (swap! (if (= :model (first (:resource request))) admissions authorized) conj [p request])
                         (not (and deny-merge? (= :room/merge (:op request))))))
         state #(binding [ec/*execution-context* (:ctx fork)] (dvergr.rooms.forks/state-token fork))
         before (state)
@@ -332,6 +333,8 @@
       (let [rv (review/review! parent (:id fork) spec :reviewer reviewer)
             runs (run/runs parent)
             [r] runs]
+        (is (= 1 (count @admissions)) "the reviewer model is admitted as its caller")
+        (is (= [:model "claude-haiku-4-5"] (get-in @admissions [0 1 :resource])))
         (is (= 1 (count runs)) "the reviewer is its own durable Run")
         (is (= (if exhaust? :waiting :completed) (:run/status r)))
         (is (= :discard (:run/settlement-policy r)))

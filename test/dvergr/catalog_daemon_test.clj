@@ -594,7 +594,8 @@
         r (ops/resolve-room *daemon* room)
         spec {:review/checks [[:diff/only-paths ["wiki/"]]] :review/on-pass :propose}]
     (catalog/seed! r {"/workflows/notes/workflow.edn"
-                      (pr-str {:title "Notes" :task "Write notes" :review spec})
+                      (pr-str {:title "Notes" :task "Write notes" :review spec
+                               :workflow/writes {:repo ["wiki/"]}})
                       "/workflows/notes/checker.clj"
                       "(ns check) (defn check [_] {:checks {:done? true} :reward 1.0})"
                       "/workflows/notes/fixtures/docs/brief.md" "Prepare wiki notes."})

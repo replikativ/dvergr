@@ -49,6 +49,7 @@
    [:params {:optional true} [:map-of :keyword :any]]
    [:profile {:optional true} :string]
    [:review {:optional true} :map]
+   [:workflow/writes {:optional true} :map]
    [:capture {:optional true} [:vector [:re #"^/[^.]*$"]]]
    ;; give the checker the pages the attempt fetched (`:fetched {url body}`)
    [:fetched {:optional true} :boolean]
@@ -458,6 +459,7 @@
   {:task (task b (:params opts))
    :profile (get-in b [:definition :profile] "developer")
    :review (get-in b [:definition :review])
+   :workflow/writes (get-in b [:definition :workflow/writes])
    :timeout-ms (or (:timeout-ms opts) (get-in b [:definition :timeout-ms]))
    :evaluator (evaluator b opts)
    :environment-id (keyword "room-workflow" (:name b))})
