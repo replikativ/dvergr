@@ -45,7 +45,8 @@
             [dvergr.room.registry :as rreg]
             [dvergr.room.store :as store]
             [dvergr.rooms.forks :as forks]
-            [org.replikativ.spindel.engine.core :as ec]))
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.yggdrasil :as ygg]))
 
 (def policies #{:automatic :review :keep-all})
 
@@ -164,14 +165,22 @@
 
 (defn- confirmed-merged?
   "Has `fork`'s substrate been merged into its parent, by this search or
-   anyone: its settlement recorded as merged, or a merge claim that has ended
-   with its substrate settled. A claim still in progress is not evidence: it
-   may abort."
+   anyone? An isolated world requires canonical terminal :merged authority.
+   An ended merge claim is not evidence: mutation may have been incomplete.
+   Message-only forks have no substrate handle and use completed settlement."
   [fork]
   (boolean
-   (or (= :merged (:op (d/settlement fork)))
-       (let [claim (:dvergr.discourse/settlement-claim @(:meta fork))]
-         (and (= :merged (get-in claim [:settlement :op])) (false? (:active? claim)))))))
+   (if-let [handle (d/fork-handle fork)]
+     (= :merged (:status (ygg/fork-disposition handle)))
+     (= :merged (:op (d/settlement fork))))))
+
+(defn- incomplete? [fork]
+  (= :incomplete (some-> fork d/fork-handle ygg/fork-disposition :status)))
+
+(defn- reviewable? [fork]
+  (if-let [handle (d/fork-handle fork)]
+    (ygg/open-fork? handle)
+    (nil? (d/settlement fork))))
 
 (defn- project-merged!
   "Record durably that `member`'s world merged, when its substrate merged but
@@ -182,6 +191,12 @@
            (run/update-durable-settlement! room run-id :merged :search-selected))
          (catch Throwable _ nil))
     (= :merged (:run/settlement-status (durable-run room run-id)))))
+
+(defn- recovery-result! [room member error]
+  (run/update-durable-settlement! room (run-id-of member)
+                                  :recovery-required :settlement-incomplete)
+  (cond-> {:outcome :recovery-required :status :incomplete}
+    error (assoc :error error)))
 
 (defn- settle!
   "Settle a held member's world by `decision`. Returns `{:outcome :merged |
@@ -211,6 +226,8 @@
                        durable (try (:run/settlement-status (durable-run room (run-id-of member)))
                                     (catch Throwable _ nil))]
                    (cond
+                     (incomplete? fork)
+                     (recovery-result! room member (:error merged))
                      (and (:ok? merged) (= :merged durable) (nil? (rreg/lookup (:world member))))
                      {:outcome :merged :status :settled}
                      ;; the substrate merged, its cleanup or projection did
@@ -227,7 +244,7 @@
                      {:outcome :discarded :status :settled :error (:error merged)}
                      ;; refused before merging, still there and unclaimed: it
                      ;; waits in review for a person
-                     (and (rreg/lookup (:world member))
+                     (and (rreg/lookup (:world member)) (reviewable? fork)
                           (not (:active? (:dvergr.discourse/settlement-claim @(:meta fork)))))
                      {:outcome :review :status :settled :error (:error merged)}
                      ;; another settlement is in progress: reconciled on retry
@@ -238,11 +255,14 @@
    write, a crash), or whose merge was incomplete: read from its Run's
    durable settlement and its world; an incomplete merge (its recorded
    outcome is the evidence that its substrate merged) has its settlement
-   projected again. nil while it is still held or incomplete."
+   projected again. Canonical partial mutation returns a structured recovery
+   result so retries repair both durable projections before ordinary preflight.
+   nil while the member is still held or its cleanup is unfinished."
   [room member prior]
   (let [status (:run/settlement-status (durable-run room (run-id-of member)))
         fork (rreg/lookup (:world member))]
     (cond
+      (incomplete? fork) (recovery-result! room member nil)
       (and (= :merged status) (nil? fork)) :merged
       ;; its substrate merged (recorded, or seen by this process), and its
       ;; settlement and cleanup have finished since
@@ -250,7 +270,7 @@
           (contains? @merged-worlds (:world member)))
       (when (and (project-merged! room member) (nil? fork)) :merged)
       (= :discarded status) :discarded
-      (and (= :review status) fork (not (forks/deferred? fork))) :review
+      (and (= :review status) fork (reviewable? fork) (not (forks/deferred? fork))) :review
       :else nil)))
 
 (defonce ^:private search-locks (atom {}))
@@ -328,11 +348,16 @@
           ;; members settled but not recorded, or incomplete merges completed since
           (doseq [i (range (count members))
                   :let [p (nth prior i)]
-                  :when (or (and (= search-id (:search/id p)) (#{:pending :incomplete} (:search/status p)))
+                  :when (or (and (= search-id (:search/id p))
+                                 (or (#{:pending :incomplete} (:search/status p))
+                                     (incomplete? (rreg/lookup (:world (nth members i))))))
                             (and (nil? p) (contains? @merged-worlds (:world (nth members i)))))
                   :let [outcome (reconciled room (nth members i) p)]
                   :when outcome]
-            (record! i {:search/outcome outcome :search/status :settled}))
+            (record! i (if (map? outcome)
+                         (cond-> {:search/status (:status outcome)}
+                           (:outcome outcome) (assoc :search/outcome (:outcome outcome)))
+                         {:search/outcome outcome :search/status :settled})))
           (let [now (records)
                 _ (doseq [[i r] (map-indexed vector now)
                           :when (and r (not= search-id (:search/id r)))]

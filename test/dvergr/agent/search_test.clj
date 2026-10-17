@@ -345,9 +345,9 @@
     (is (false? (confirmed? (fork {:dvergr.discourse/settlement-claim
                                    {:settlement {:op :merged} :active? true}})))
         "a claim in progress may abort")
-    (is (true? (confirmed? (fork {:dvergr.discourse/settlement-claim
-                                  {:settlement {:op :merged} :active? false}})))
-        "a claim that ended with its substrate settled")
+    (is (false? (confirmed? (fork {:dvergr.discourse/settlement-claim
+                                   {:settlement {:op :merged} :active? false}})))
+        "an ended claim is not proof that all substrate mutation completed")
     (is (true? (confirmed? (fork {:dvergr.discourse/settled {:op :merged}}))))
     (is (false? (confirmed? (fork {:dvergr.discourse/settled {:op :discarded}}))))))
 
