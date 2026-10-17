@@ -2184,6 +2184,9 @@
          (budget/split {"microUSD" 1000M "model-dispatch" 1M} {:candidate 0.1}))
       "a coordinate that rounds to nothing is left out")
   (is (= {} (budget/split {"microUSD" 1M} {:tiny 1/10})))
+  (is (= {:candidate {"microUSD" 333M} :judge {"microUSD" 500M}}
+         (budget/split {"microUSD" 1000M} {:candidate 1/3 :judge 0.5M}))
+      "ratios and decimals mix")
   (is (thrown? clojure.lang.ExceptionInfo (budget/split {"microUSD" 1M} {:a 3/4 :b 1/2})))
   (is (thrown? clojure.lang.ExceptionInfo (budget/split {"microUSD" 1M} {"a" 1/2})))
   (is (thrown? clojure.lang.ExceptionInfo (budget/split {"microUSD" 1M} {:a 0}))))
@@ -2347,4 +2350,22 @@
           "without a current Run there is no subtree")
       (finally
         (doseq [id [a b r]] (run/finish! id :completed))
+        (close-resource-test-room! room conn)))))
+
+(deftest a-partial-return-is-not-spend
+  (let [[room conn] (resource-test-room :budget-partial)
+        [r c] (repeatedly 2 random-uuid)
+        md #(hash-map resource/microdollars %)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources (md 100M)})
+      (ledger-runs! room [{:id r} {:id c :parent r :role :judge}])
+      (resource/allocate-run! room r nil (md 100M))
+      (resource/allocate-run! room c r (md 80M))
+      (resource/return! room c r (md 60M))
+      (is (= {} (budget/spend-of room c)) "it returned 60 and still holds 20")
+      (is (= {} (budget/spend-of room r)))
+      (resource/consume! room c {:id (random-uuid) :resources (md 5M)})
+      (is (= {:judge (md 5M)} (budget/spend-by-role room r)))
+      (finally
+        (doseq [id [c r]] (run/finish! id :completed))
         (close-resource-test-room! room conn)))))

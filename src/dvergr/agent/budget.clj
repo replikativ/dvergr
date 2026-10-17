@@ -6,7 +6,8 @@
    A Run's own spend is read from the ledger, not from metrics, and follows
    the ledger's transfers, not `:run/parent`: what its wallet was granted and
    got back from the Runs it funded, less what it granted to Runs (children,
-   or the successor that resumes it), less what it holds or returned. That
+   or the successor that resumes it), less what it returned and what it
+   still holds. That
    counts every other way its wallet was drawn on: model spend, dispatch
    reservations and their holds (`dvergr.resource`), any consumption. All
    ledger reads come from one snapshot of it, so a transfer is never seen
@@ -70,7 +71,9 @@
           (map (fn [{:keys [id wallet in out]}]
                  [id (minus (plus (:resources in) (get returned-to wallet))
                             (plus (get granted-from wallet)
-                                  (if out (:resources out) (holding book wallet))))]))
+                                  (:resources out)
+                                  ;; a return may be partial: what it kept counts too
+                                  (holding book wallet)))]))
           edges)))
 
 (defn- subtree [runs root-id]
@@ -113,7 +116,7 @@
                          shares))
     (throw (ex-info "split shares must map roles (keywords) to positive fractions"
                     {:type ::invalid-shares :shares shares})))
-  (when (> (reduce + (vals shares)) 1)
+  (when (> (reduce + (map rationalize (vals shares))) 1)
     (throw (ex-info "split shares must sum to at most 1"
                     {:type ::shares-exceed-grant :shares shares})))
   (into {}
