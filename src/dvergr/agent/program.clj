@@ -2024,6 +2024,8 @@
                  (cond-> {:task task :from :resume
                           :settlement (or (:run/settlement-policy old) :automatic)}
                    parent (assoc :parent-run parent)
+                   ;; the successor plays the part its predecessor did
+                   (:run/role old) (assoc :role (:run/role old))
                    (seq remaining) (assoc :resources remaining))
                  nil nil
                  {:id new-id :snapshots (not-empty (:world/systems data))

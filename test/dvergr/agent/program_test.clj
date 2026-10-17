@@ -2256,3 +2256,95 @@
         (deliver release-parent true)
         (deliver parent-runtime [::closed nil])
         (close-resource-test-room! room conn)))))
+
+(defn- ledger-runs!
+  "Durable Runs `ids` under `parent` with `role`, in `room`."
+  [room specs]
+  (let [trigger (d/message :test :_runs "ledger" nil {:role :user})]
+    (d/post! room trigger)
+    (doseq [{:keys [id parent role]} specs]
+      (run/start! room :test trigger nil
+                  (cond-> {:id id :kind :agent-task}
+                    parent (assoc :parent parent)
+                    role (assoc :provenance {:run/role role}))))))
+
+(deftest spend-follows-the-ledger-through-a-resume
+  ;; a successor resumes its predecessor and takes over its wallet: it is
+  ;; granted from the predecessor's wallet and returns to the parent
+  (let [[room conn] (resource-test-room :budget-resume)
+        [r p s] (repeatedly 3 random-uuid)
+        md #(hash-map resource/microdollars %)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources (md 100M)})
+      (ledger-runs! room [{:id r} {:id p :parent r :role :candidate}
+                          {:id s :parent r :role :candidate}])
+      (resource/allocate-run! room r nil (md 100M))
+      (resource/allocate-run! room p r (md 100M))
+      (resource/consume! room p {:id (random-uuid) :resources (md 20M)})
+      (resource/allocate-run! room s p (md 80M))
+      (resource/consume! room s {:id (random-uuid) :resources (md 10M)})
+      (resource/return! room s r (md 70M))
+      (is (= (md 20M) (budget/spend-of room p)) "the predecessor spent what it consumed")
+      (is (= (md 10M) (budget/spend-of room s)))
+      (is (= {} (budget/spend-of room r)) "the parent consumed nothing")
+      (is (= {:candidate (md 30M)} (budget/spend-by-role room r)))
+      (finally
+        (doseq [id [s p r]] (run/finish! id :completed))
+        (close-resource-test-room! room conn)))))
+
+(deftest spend-is-read-from-one-snapshot-of-the-ledger
+  (let [[room conn] (resource-test-room :budget-snapshot)
+        [r c] (repeatedly 2 random-uuid)
+        md #(hash-map resource/microdollars %)
+        runs run/runs
+        returned? (atom false)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources (md 100M)})
+      (ledger-runs! room [{:id r} {:id c :parent r :role :judge}])
+      (resource/allocate-run! room r nil (md 100M))
+      (resource/allocate-run! room c r (md 80M))
+      (testing "a child returning while the subtree is read changes nothing"
+        (with-redefs [run/runs (fn [& args]
+                                 (when (compare-and-set! returned? false true)
+                                   (resource/return! room c r (md 60M)))
+                                 (apply runs args))]
+          (is (= {} (budget/spend-by-role room r))))
+        (is @returned?))
+      (testing "a ledger read that fails is not an empty wallet"
+        (with-redefs [kontor.resource/balance (fn [& _] (throw (ex-info "ledger unavailable" {})))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ledger unavailable"
+                                (budget/spend-by-role room r)))))
+      (finally
+        (doseq [id [c r]] (run/finish! id :completed))
+        (close-resource-test-room! room conn)))))
+
+(deftest a-sandbox-reads-spend-of-its-own-subtree-only
+  (let [[room conn] (resource-test-room :budget-sandbox)
+        [r a b] (repeatedly 3 random-uuid)
+        md #(hash-map resource/microdollars %)
+        sum-in (fn [ceiling code]
+                 (let [sci-ctx (sandbox/fork-for-session (:ctx room))]
+                   (agent-ns/add-programming-ns! sci-ctx (:id room) (:ctx room) ceiling)
+                   (binding [ec/*execution-context* (:ctx room)]
+                     (sandbox/eval-code sci-ctx (str "(require '[dvergr.agent :as agent]) " code)))))]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources (md 100M)})
+      (ledger-runs! room [{:id r} {:id a :parent r :role :candidate} {:id b :parent r :role :judge}])
+      (resource/allocate-run! room r nil (md 100M))
+      (resource/allocate-run! room a r (md 40M))
+      (resource/allocate-run! room b r (md 40M))
+      (resource/consume! room r {:id (random-uuid) :resources (md 5M)})
+      (resource/consume! room a {:id (random-uuid) :resources (md 7M)})
+      (resource/consume! room b {:id (random-uuid) :resources (md 9M)})
+      (is (= {:unassigned (md 5M) :candidate (md 7M) :judge (md 9M)}
+             (:value (sum-in {:parent-run r} "(agent/spend-by-role)")))
+          "the current Run and its descendants")
+      (is (= {:candidate (md 7M)} (:value (sum-in {:parent-run a} "(agent/spend-by-role)")))
+          "a child sees neither its parent nor its sibling")
+      (is (not (:success (sum-in {:parent-run a} (str "(agent/spend-by-role #uuid \"" r "\")"))))
+          "no other subtree can be named")
+      (is (not (:success (sum-in nil "(agent/spend-by-role)")))
+          "without a current Run there is no subtree")
+      (finally
+        (doseq [id [a b r]] (run/finish! id :completed))
+        (close-resource-test-room! room conn)))))
