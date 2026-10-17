@@ -142,9 +142,10 @@
 (defn ctx-fork?
   "True when the fork holds its OWN forked execution context (`:isolation
    :ctx`) — i.e. it has real branches to merge. `:none` forks share the
-   parent ctx."
+   parent ctx, which may itself already be forked. The canonical ForkHandle,
+   not the context's ancestry, distinguishes the two isolation modes."
   [fork]
-  (boolean (some-> fork :ctx :parent-ctx)))
+  (boolean (d/fork-handle fork)))
 
 (defn fork!
   "Fork `room` into an isolated `:ctx` branch — its own Geschichte workspace
