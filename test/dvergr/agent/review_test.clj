@@ -9,6 +9,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.agent.review :as review]
+            [dvergr.agent.workflow]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [org.replikativ.spindel.core :as sp]
@@ -316,7 +317,8 @@
                         (not (and deny-merge? (= :room/merge (:op request))))))
         state #(binding [ec/*execution-context* (:ctx fork)] (dvergr.rooms.forks/state-token fork))
         before (state)
-        reviewer (review/model-reviewer dmn parent (:id fork) spec {:principal/delegation {:id "delegation-1"}})]
+        reviewer (review/model-reviewer dmn parent (:id fork) spec {:principal/delegation {:id "delegation-1"}
+                                                                    :principal/delegation-scope {:paths ["wiki/"]}})]
     (with-redefs [providers/ensure-initialized! (constantly nil)
                   chat-agent/messages->api-format (fn [messages _ _] messages)
                   model-chat/chat
@@ -409,17 +411,21 @@
                                     :deny-merge? true)))))
 
 (deftest failed-checks-never-call-the-model-and-revoke-the-token
-  (let [[parent world] (room-with-fork "rv-model-check-fails" {} {"schedules.edn" "{}"})
-        spec (assoc-in wiki-only [:review/reviewer :model] "claude-haiku-4-5")
-        mint principal/mint-run-token!
-        token (atom nil)]
-    (with-redefs [principal/mint-run-token! (fn [opts] (reset! token (mint opts)))
-                  model-chat/chat (fn [& _] (throw (AssertionError. "model must not be called")))]
-      (let [reviewer (review/model-reviewer *daemon* parent (fork-id world) spec {})
-            rv (review/review! parent (fork-id world) spec :reviewer reviewer)]
-        (is (= :escalated (:review/decision rv)))
-        (is (empty? (run/runs parent)))
-        (is (nil? (principal/run-token-principal @token)))))))
+  (doseq [scoped? [false true]]
+    (let [[parent world] (room-with-fork (str "rv-model-check-fails-" scoped?) {} {"schedules.edn" "{}"})
+          spec (assoc-in wiki-only [:review/reviewer :model] "claude-haiku-4-5")
+          mint principal/mint-run-token!
+          token (atom nil)
+          caller (cond-> {:principal/delegation "grant"}
+                   scoped? (assoc :principal/delegation-scope {:paths ["wiki/"]}))]
+      (with-redefs [principal/mint-run-token! (fn [opts] (reset! token (mint opts)))
+                    model-chat/chat (fn [& _] (throw (AssertionError. "model must not be called")))]
+        (let [reviewer (review/model-reviewer *daemon* parent (fork-id world) spec caller)
+              rv (review/review! parent (fork-id world) spec :reviewer reviewer)]
+          (is (= :escalated (:review/decision rv)))
+          (is (empty? (run/runs parent)))
+          (is (= scoped? (some? @token)) "only scoped delegation creates a reviewer principal")
+          (is (nil? (principal/run-token-principal @token))))))))
 
 (deftest an-exhausted-model-reviewer-discards-its-world
   (let [rv (model-review! "rv-model-exhausted" "" :exhaust? true :propose? true)]
@@ -640,3 +646,51 @@
                 (.join caller 10000)
                 (program/cancel! room parent)
                 (deref parent 10000 nil)))))))))
+
+(deftest settlement-enforces-trusted-delegation-on-actual-file-changes
+  (doseq [[suffix declared changed expected]
+          [["narrow" ["wiki/" "docs/"] "docs/outside.md" :escalated]
+           ["root-outside" ["/"] "docs/outside.md" :escalated]
+           ["root-inside" ["/"] "wiki/allowed.md" :merged]
+           ["boundary" ["/"] "wiki-escape/outside.md" :escalated]]]
+    (let [[parent _] (room-with-fork (str "scoped-" suffix) {"docs/base.md" "Base"} {})
+          scope {:paths [(if (= "boundary" suffix) "wiki" "wiki/")]}
+          token (principal/mint-run-token! {:actor :caller :room (name (:id parent)) :tools #{}
+                                            :claims {:principal/delegation "narrow-grant"
+                                                     :principal/delegation-scope scope}})
+          caller (principal/run-token-principal token)
+          requests (atom [])
+          dmn (assoc-in *daemon* [:config :auth :authorize]
+                        (fn [p request]
+                          (when (= :merge (:action request)) (swap! requests conj [p request]))
+                          (or (not= :merge (:action request))
+                              (and (= :reviewer (:principal/actor p))
+                                   (= "narrow-grant" (get-in request [:args :principal/delegation]))
+                                   (= scope (get-in request [:args :principal/delegation-scope]))))))]
+      (try
+        (with-redefs [dvergr.agent.workflow/candidates
+                      (fn [_]
+                        {:team (roster/make-agent (roster/make-roster {:id :scope/test})
+                                                  {:id :echo :prompt "Echo" :tools #{} :program {:kind :echo}})
+                         :ids [:echo]})]
+          (let [started (dvergr.agent.workflow/start
+                         parent {:task "prepare" :principal caller :daemon dmn
+                                 :workflow/writes {:repo declared}
+                                 :review {:review/checks [] :review/on-pass :merge}})
+                rs (binding [ec/*execution-context* (:ctx started)] @(:spin started))
+                world (get-in (first rs) [:run/result :run/world])
+                _ (op :room/write {:room (name world) :files {changed {:text "Scoped change"}}})
+                [row] ((:finish started) rs)
+                rv (:decision row)]
+            (is (= expected (:review/decision rv)) suffix)
+            (is (= (assoc scope :kb {}) (get-in rv [:review/effective-policy :review/write-scope])))
+            (is (= {:repo declared} (get-in rv [:review/effective-policy :review/declared-writes])))
+            (is (= scope (get-in rv [:review/effective-policy :review/delegation-scope])))
+            (is (= scope (:review/delegation-scope rv)))
+            (is (= (assoc scope :kb {}) (:review/write-scope rv)))
+            (is (= (if (= :merged expected) {"/wiki/allowed.md" "Scoped change"} {})
+                   (catalog/read-tree parent "/wiki")))
+            (is (= {"/docs/base.md" "Base"} (catalog/read-tree parent "/docs")))
+            (when (= :merged expected)
+              (is (some #(= :reviewer (get-in % [0 :principal/actor])) @requests)))))
+        (finally (principal/revoke-run-token! token))))))

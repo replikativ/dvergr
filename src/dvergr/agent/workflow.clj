@@ -15,6 +15,7 @@
    Without a verifier of the task's own, an attempt is scored by completion:
    a reviewer chooses by the diff and the bill."
   (:require [clojure.string :as str]
+            [clojure.set :as set]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.evaluators :as evaluators]
@@ -157,17 +158,20 @@
   [room world opts run-id]
   (let [daemon (or (:daemon opts) {:execution-ctx (:ctx room)})
         caller (:principal opts)
-        token (when (:principal/delegation caller)
+        claims (select-keys caller [:principal/delegation :principal/delegation-scope])
+        scoped? (and (:principal/delegation caller) (map? (:principal/delegation-scope caller)))
+        grant-args (when scoped? claims)
+        token (when scoped?
                 (principal/mint-run-token!
                  {:actor :reviewer :room world
                   :tools #{"room_merge" "room_discard"}
-                  :claims (select-keys caller [:principal/delegation])}))
+                  :claims claims}))
         delegated (when token (principal/run-token-principal token))
         choose (fn [op]
                  (some (fn [p]
                          (when p
                            (try
-                             ((requiring-resolve 'dvergr.ops/authorize!) daemon p op {:room world})
+                             ((requiring-resolve 'dvergr.ops/authorize!) daemon p op (merge {:room world} grant-args))
                              p (catch Throwable _ nil))))
                        [caller delegated]))
         merge-p (choose :room/merge) discard-p (choose :room/discard)]
@@ -181,7 +185,7 @@
                              (and (:parent-run opts) (run/cancel-requested? (:parent-run opts))))
                      (throw (ex-info "Settlement cancelled before decision" {})))
                    ((requiring-resolve 'dvergr.ops/invoke) daemon
-                                                           (case op :room/merge merge-p :room/discard discard-p nil) op args))))}))
+                                                           (case op :room/merge merge-p :room/discard discard-p nil) op (merge args grant-args)))))}))
 
 (defn effective-policy
   "Bundle review is a request. The host adds the declared write scope and
@@ -192,17 +196,42 @@
                  (update :review/on-pass #(if (= :merge %) :merge :propose))
                  (update :review/on-fail #(if (= :discard %) :discard :escalate)))
         writes (:workflow/writes opts)
-        paths (vec (:repo writes))
-        kb (vec (for [[system kinds] (if (set? (:kb writes))
-                                       (map #(vector % #{:wiki/atom :wiki/overview :wiki/index}) (:kb writes))
-                                       (:kb writes))]
-                  [:diff/only-kb-pages {:system system :kinds (set kinds)}]))
+        delegation (:principal/delegation-scope (:principal opts))
+        scoped? (and (:principal/delegation (:principal opts)) (map? delegation))
+        normalize (fn [p]
+                    (when (string? p)
+                      (let [p (str/replace p #"^/+" "")]
+                        (when (and (not (str/blank? p))
+                                   (not-any? #{"." ".."} (str/split p #"/"))) p))))
+        within? (fn [p parent]
+                  (or (= p parent)
+                      (str/starts-with? p (str (str/replace parent #"/+$" "") "/"))))
+        ;; A broad bundle prefix is attenuated to the delegated prefix. Neither
+        ;; a root nor an empty bundle path can grant anything beyond it.
+        paths (vec (distinct
+                    (when scoped?
+                      (for [raw (:repo writes)
+                            :when (string? raw)
+                            grant (:paths delegation)
+                            :let [g (normalize grant) p (normalize raw)]
+                            :when (and g (or (str/blank? (str/replace raw #"^/+" ""))
+                                             (and p (or (within? p g) (within? g p)))))]
+                        (if (and p (within? p g)) p g)))))
+        declared-kb (if (set? (:kb writes))
+                      (zipmap (:kb writes) (repeat #{:wiki/atom :wiki/overview :wiki/index}))
+                      (:kb writes))
+        kb-scope (into {} (when scoped?
+                            (for [[system kinds] declared-kb
+                                  :let [allowed (set/intersection (set kinds) (set (get-in delegation [:kb system])))]
+                                  :when (seq allowed)]
+                              [system allowed])))
+        kb (mapv (fn [[system kinds]] [:diff/only-kb-pages {:system system :kinds kinds}]) kb-scope)
         scope? (or (seq paths) (seq kb))
         downgrades (cond-> []
                      (and (= :merge (:review/on-pass spec)) (not (:merge? auth)))
                      (conj {:key :review/on-pass :from :merge :to :propose :reason "No principal authorized for room/merge"})
                      (and (= :merge (:review/on-pass spec)) (not scope?))
-                     (conj {:key :review/on-pass :from :merge :to :propose :reason "Workflow declares no writes scope"})
+                     (conj {:key :review/on-pass :from :merge :to :propose :reason "No writes within delegated scope"})
                      (and (= :discard (:review/on-fail spec)) (not (:discard? auth)))
                      (conj {:key :review/on-fail :from :discard :to :escalate :reason "No principal authorized for room/discard"}))
         ;; only-paths also forbids file changes for KB-only workflows.
@@ -210,6 +239,9 @@
                                       (:review/checks spec))))]
     (reduce (fn [p {:keys [key to]}] (assoc p key to))
             (assoc spec :review/checks checks :review/settlement? true
+                   :review/declared-writes writes
+                   :review/delegation-scope delegation
+                   :review/write-scope {:paths paths :kb kb-scope}
                    :review/downgrades downgrades
                    :review/host-checks (vec (concat [:fork/review-tier [:diff/only-paths paths]] kb)))
             downgrades)))
@@ -234,6 +266,15 @@
                  :from (or (:budget-dollars reviewer) 0.50) :to budget
                  :reason "Bounded by caller budget cap and remaining Run wallet"})))
     policy))
+
+(defn- intent-policy [room opts result]
+  (let [world (get-in result [:run/result :run/world])
+        auth (authority room (if (keyword? world) (subs (str world) 1) (str world)) opts (:run/id result))]
+    (try
+      (let [policy (effective-policy opts auth)]
+        (try (bounded-reviewer-spec room opts policy)
+             (catch Throwable _ policy)))
+      (finally ((:close auth))))))
 
 (defn- settle!
   [room opts result]
@@ -340,14 +381,30 @@
               (max 1 (or (:parallelism opts) 4))))
      :finish (fn [results]
                (binding [ec/*execution-context* ctx]
-                 (mapv (fn [r]
-                         (let [world (get-in r [:run/result :run/world])
-                               decision (settle-on-worker! room opts r)]
-                           (cond-> {:attempt (:attempt r)
-                                    :world world
-                                    :review (review world)}
-                             (:review opts) (assoc :decision decision))))
-                       results)))}))
+                 ;; All completed attempts must survive a crash in the first review.
+                 (let [intents (when (:review opts)
+                                 (mapv (fn [r]
+                                         (let [policy (intent-policy room opts r)]
+                                           ((review-fn "intent!") room (:run/id r)
+                                                                  (get-in r [:run/result :run/world]) policy)
+                                           policy)) results))]
+                   (try
+                     (mapv (fn [r]
+                             (let [world (get-in r [:run/result :run/world])
+                                   decision (settle-on-worker! room opts r)]
+                               (cond-> {:attempt (:attempt r)
+                                        :world world
+                                        :review (review world)}
+                                 (:review opts) (assoc :decision decision))))
+                           results)
+                     (catch Throwable t
+                       (when (:review opts)
+                         (Thread/interrupted)
+                         (doseq [[r policy] (map vector results intents)]
+                           ((review-fn "failure!") room (:run/id r)
+                                                   (get-in r [:run/result :run/world]) policy
+                                                   (str "Settlement interrupted: " (ex-message t)))))
+                       (throw t))))))}))
 
 (defn attempt!
   "Run `task` `attempts` times for each of `models` on forks of `room` and

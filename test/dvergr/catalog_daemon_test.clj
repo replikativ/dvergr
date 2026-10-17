@@ -535,7 +535,8 @@
         reviewer-calls (atom 0)
         workers (atom [])
         pending (atom [])
-        caller (assoc dvergr.principal/local-principal :principal/delegation "wiki-delegation")
+        caller (assoc dvergr.principal/local-principal :principal/delegation "wiki-delegation"
+                      :principal/delegation-scope {:paths ["wiki/"]})
         make-reviewer review/model-reviewer]
     (catalog/seed! r (gen/documents (gen/world 1)))
     (resource/mint! r {:id (random-uuid) :resources {resource/microdollars 2000000M}})
@@ -603,7 +604,10 @@
     (with-redefs [providers/ensure-initialized! (constantly nil)
                   chat-agent/messages->api-format (fn [messages _ _] messages)
                   model-chat/chat (wiki-writer (atom 0))]
-      (let [done (run-job {:workflow "bundle-review/notes" :models ["claude-haiku-4-5"]})
+      (let [done (run-job {:workflow "bundle-review/notes" :models ["claude-haiku-4-5"]}
+                          (assoc dvergr.principal/local-principal
+                                 :principal/delegation "notes-delegation"
+                                 :principal/delegation-scope {:paths ["wiki/"]}))
             [record] (ops/invoke *daemon* dvergr.principal/local-principal :review/list {:room room})]
         (is (= "completed" (:status done)) (pr-str done))
         (is (= "escalated" (:decision record)))

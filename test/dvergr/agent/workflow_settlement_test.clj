@@ -28,7 +28,9 @@
        (finally (d/close-room! ~room)))))
 
 (defn- opts [room]
-  {:task "prepare" :attempts 1 :principal principal/local-principal
+  {:task "prepare" :attempts 1 :principal (assoc principal/local-principal
+                                                 :principal/delegation "test-grant"
+                                                 :principal/delegation-scope {:paths ["wiki/"]})
    :daemon {:execution-ctx (:ctx room)}
    :workflow/writes {:repo ["wiki/"]}
    :review {:review/checks [] :review/on-pass :propose}})
@@ -38,7 +40,8 @@
 
 (deftest hostile-policy-cannot-grant-merge-or-remove-host-checks
   (with-room [room]
-    (let [caller {:principal/id :restricted :principal/kind :human}
+    (let [caller {:principal/id :restricted :principal/kind :human
+                  :principal/delegation "unscoped-grant"}
           daemon {:execution-ctx (:ctx room)
                   :config {:auth {:authorize (fn [_ request] (not= :merge (:action request)))}}}
           [row] (workflow/attempt! room (assoc (opts room) :principal caller :daemon daemon
@@ -127,7 +130,7 @@
                 (jobs/start! room {:kind :workflow}
                              (fn [id]
                                (let [s (workflow/start room
-                                                       (-> (opts room) (assoc :parent-run id)
+                                                       (-> (opts room) (assoc :parent-run id :attempts 4)
                                                            (assoc-in [:review :review/on-pass] :merge)
                                                            (assoc-in [:review :review/reviewer] {:instructions "Check"})
                                                            (assoc :reviewer (fn [_]
@@ -144,12 +147,16 @@
           (deliver release true)
           (is (= :cancelled (:status cancelled)))))
       (is (zero? @merge-calls))
-      (is (= :escalated (:review/decision (first (review/reviews room)))))
+      (is (= 4 (count (review/reviews room))))
+      (is (every? #(= :escalated (:review/decision %)) (review/reviews room)))
+      (is (= 4 (count (filter #(= :review/escalated (get-in % [:metadata :kind])) (d/messages room)))))
       (is (empty? (filter #(= :settlement (:run/kind %)) (run/active-runs (:id room))))))))
 
 (deftest host-scope-is-independent-of-bundle-checks-and-actions
   (let [policy (workflow/effective-policy
-                {:workflow/writes {:repo ["wiki/"] :kb {:knowledge #{:wiki/atom}}}
+                {:principal {:principal/delegation "grant"
+                             :principal/delegation-scope {:paths ["wiki/"] :kb {:knowledge #{:wiki/atom}}}}
+                 :workflow/writes {:repo ["wiki/"] :kb {:knowledge #{:wiki/atom}}}
                  :review {:review/checks [] :review/on-pass :merge :review/on-fail :discard}}
                 {:merge? true :discard? false})]
     (is (= [:fork/review-tier [:diff/only-paths ["wiki/"]]
@@ -175,7 +182,8 @@
 
 (deftest delegated-reviewer-cannot-use-standing-agent-authority
   (with-room [room]
-    (let [caller {:principal/id :restricted :principal/kind :human}
+    (let [caller {:principal/id :restricted :principal/kind :human
+                  :principal/delegation "unscoped-grant"}
           daemon {:execution-ctx (:ctx room)
                   :config {:auth {:authorize (fn [p request]
                                                (or (= :agent (:principal/kind p))
@@ -217,3 +225,22 @@
       (finally
         (deliver release true)
         (d/close-room! room)))))
+
+(deftest scope-intersection-attenuates-paths-and-kb-kinds
+  (let [declared {:repo ["/" "" "docs/"]
+                  :kb {:knowledge #{:wiki/atom :wiki/index} :other #{:wiki/atom}}}
+        delegated {:paths ["wiki/"] :kb {:knowledge #{:wiki/atom :wiki/overview}}}
+        policy (workflow/effective-policy
+                {:principal {:principal/delegation "grant" :principal/delegation-scope delegated}
+                 :workflow/writes declared :review {:review/on-pass :merge}}
+                {:merge? true})]
+    (is (= {:paths ["wiki/"] :kb {:knowledge #{:wiki/atom}}} (:review/write-scope policy)))
+    (is (= declared (:review/declared-writes policy)))
+    (is (= delegated (:review/delegation-scope policy)))
+    (is (= :merge (:review/on-pass policy))))
+  (let [policy (workflow/effective-policy
+                {:principal {:principal/delegation "grant" :principal/delegation-scope {:paths ["wiki/"]}}
+                 :workflow/writes {:repo ["docs/"]} :review {:review/on-pass :merge}}
+                {:merge? true})]
+    (is (= :propose (:review/on-pass policy)))
+    (is (= {:paths [] :kb {}} (:review/write-scope policy)))))
