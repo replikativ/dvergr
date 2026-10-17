@@ -16,7 +16,8 @@
 
    Also the primitive the jitsi frame pipeline uses (screen-content
    descriptions → knowledge bases)."
-  (:require [dvergr.model.chat :as chat]
+  (:require [dvergr.model.provider-errors :as provider-errors]
+            [dvergr.model.chat :as chat]
             [dvergr.model.registry :as registry]
             [dvergr.model.providers :as providers]
             [clojure.string :as str]
@@ -25,15 +26,35 @@
 
 (defn- system-env [key] (System/getenv key))
 
+(defn- safe-message [message]
+  (provider-errors/sanitize-message message [] {:max-length 1024 :truncate-marker? false}))
+
+(defn- safe-error [error model]
+  (let [chain (take 20 (take-while some? (iterate ex-cause error)))
+        reason (some #(when (:status (ex-data %)) (ex-data %)) chain)
+        data (merge (select-keys (ex-data error) [:type :status :message :model :config-key :provider])
+                    (select-keys reason [:status :message]) {:model model})
+        ;; Even allowlisted values must be scalar; never stringify request maps.
+        data (into {} (keep (fn [[k v]]
+                              (cond
+                                (string? v) [k (safe-message v)]
+                                (keyword? v) [k (keyword (safe-message (subs (str v) 1)))]
+                                (or (number? v) (boolean? v) (nil? v)) [k v])) data))]
+    (ex-info (safe-message
+              (str "Vision describe failed: " (ex-message error)
+                   (when reason (str " (HTTP " (:status data) "): " (:message data)))))
+             data)))
+
 (defn- model-id [model]
   (registry/ensure-models-loaded!)
   (let [configured (or model (not-empty (system-env "DVERGR_VISION_MODEL"))
                        (registry/get-default :vision-model))
         fail! (fn [reason]
                 (throw (ex-info
-                        (str "Configure :defaults :vision-model in models.edn or DVERGR_VISION_MODEL "
-                             "(or pass :model): " reason)
-                        {:type ::configuration :config-key :vision-model :model configured})))
+                        (safe-message
+                         (str "Configure :defaults :vision-model in models.edn or DVERGR_VISION_MODEL "
+                              "(or pass :model): " reason))
+                        {:type ::configuration :config-key :vision-model :model (some-> configured safe-message)})))
         _ (when (str/blank? configured) (fail! "an image-capable model is required"))
         mid (registry/resolve-alias configured)
         _ (registry/assert-capability! mid :vision)
@@ -42,13 +63,14 @@
         provider (or (providers/get-provider provider-key)
                      (fail! (str "provider " provider-key " is not registered; configure its credentials")))
         base-url (get-in provider [:config :base-url])
-        host (some-> base-url java.net.URI. .getHost str/lower-case)
+        host (try (some-> base-url java.net.URI. .getHost str/lower-case)
+                  (catch Exception _ (fail! "invalid provider :base-url")))
         route-provider (cond
                          (= host "api.fireworks.ai") :fireworks
                          (= host "api.openai.com") :openai
                          (= host "api.anthropic.com") :anthropic)]
     (when (and route-provider (not= provider-key route-provider))
-      (fail! (str mid " belongs to " provider-key " but its provider routes to " base-url
+      (fail! (str mid " belongs to " provider-key " but its provider routes to " (provider-errors/diagnostic-url base-url)
                   "; correct the provider :base-url / OPENAI_BASE_URL or choose a model served there")))
     mid))
 
@@ -72,7 +94,8 @@
 (defn- call-model [messages opts]
   (let [mid (registry/resolve-alias (:model opts))
         _ (registry/assert-capability! mid :vision)
-        r (chat/chat messages (assoc opts :model mid))]
+        r (try (chat/chat messages (assoc opts :model mid))
+               (catch Exception e (throw (safe-error e mid))))]
     (when *on-response* (*on-response* r))
     r))
 
@@ -82,25 +105,14 @@
    opts: :prompt (default: detailed description + OCR), :model, :max-tokens.
    Defaults to Fireworks Kimi K3; :model, DVERGR_VISION_MODEL, then the registry
    :vision-model default take precedence. Provider failures carry :status and
-   :message in ex-data, including after retries are exhausted."
+   :message in sanitized ex-data, including after retries are exhausted."
   [^bytes bytes mime & [{:keys [prompt model max-tokens]}]]
   (let [mid (model-id model)
         messages [(image-message (->data-url bytes mime) (or prompt default-prompt))]
-        content (try
-                  (:content (call-model messages
-                                        {:model mid
-                                         :model-config-key (if model :model "DVERGR_VISION_MODEL")
-                                         :max-tokens (or max-tokens 1024)}))
-                  (catch clojure.lang.ExceptionInfo e
-                    ;; Retry exhaustion wraps the provider error as its cause.
-                    (if-let [reason (some #(when (:status (ex-data %)) (ex-data %))
-                                          (take-while some? (iterate ex-cause e)))]
-                      (throw (ex-info (str "Vision describe failed: " (.getMessage e)
-                                           " (HTTP " (:status reason) "): " (:message reason))
-                                      (merge (ex-data e) (select-keys reason [:status :message])
-                                             {:model mid})
-                                      e))
-                      (throw e))))]
+        content (:content (call-model messages
+                                      {:model mid
+                                       :model-config-key (if model :model "DVERGR_VISION_MODEL")
+                                       :max-tokens (or max-tokens 1024)}))]
     (when (str/blank? content)
       (throw (ex-info "Vision describe returned no text" {:model mid})))
     content))

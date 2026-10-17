@@ -18,29 +18,14 @@
 
    The sibling `dvergr.audio.tts` (voice OUT for call participation)
    lands with the jitsi voice-bot work."
-  (:require [hato.client :as hc]
+  (:require [dvergr.model.provider-errors :as provider-errors]
+            [hato.client :as hc]
             [jsonista.core :as json]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [taoensso.telemere :as tel])
   (:import [java.nio.file Files Path]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]))
-
-(defn- failure-message
-  ([message] (failure-message message []))
-  ([message secrets]
-   (let [redacted (reduce (fn [s secret]
-                            (if (str/blank? secret) s (str/replace s secret "[REDACTED]")))
-                          (str message) secrets)
-         redacted (-> redacted
-                      (str/replace #"(?i)(authorization[\"']?\s*(?::|=|\s)\s*[\"']?)[^\r\n\"'}]+" "$1[REDACTED]")
-                      (str/replace #"(?i)\bbearer\s+[^\s\"',;}]+" "Bearer [REDACTED]")
-                      (str/replace #"(?i)((?:api[_ -]?key|access[_-]?token|refresh[_-]?token|token|secret)[\"']?\s*[:=]\s*[\"']?)[^\s&\"',;}]+" "$1[REDACTED]")
-                      (str/replace #"(?i)([?&][^=&#\s]*(?:key|token|secret|signature|auth)[^=&#\s]*=)[^&#\s\"']*" "$1[REDACTED]")
-                      (str/replace #"\b(?:sk|gsk|fw)_[A-Za-z0-9_-]+|\bsk-[A-Za-z0-9_-]+" "[REDACTED]"))]
-     (if (> (count redacted) 2048)
-       (str (subs redacted 0 2034) "...[truncated]")
-       redacted))))
 
 (defonce ^:private native-model (atom nil))
 
@@ -108,7 +93,7 @@
             (throw (ex-info (str "HTTP " (:status resp) ": " (:body resp))
                             {:status (:status resp)}))))
         (catch Exception e
-          (throw (ex-info (failure-message (.getMessage e) [key])
+          (throw (ex-info (provider-errors/sanitize-message (.getMessage e) [key])
                           (select-keys (ex-data e) [:status]))))))))
 
 (defn- transcribe-one [bytes mime ext]
@@ -119,7 +104,7 @@
                      (catch Exception e
                        {:failure {:backend (:name backend)
                                   :status (or (:status (ex-data e)) :error)
-                                  :message (failure-message (or (.getMessage e) (str (class e))))}}))]
+                                  :message (provider-errors/sanitize-message (or (.getMessage e) (str (class e))))}}))]
         (if-let [failure (:failure result)]
           (do (tel/log! {:level :warn :id ::backend-failed :data failure})
               (recur remaining (conj attempts failure) silence?))
@@ -168,7 +153,7 @@
       (delete-chunk-path! path)
       (catch Exception e
         (tel/log! {:level :warn :id ::cleanup-failed
-                   :data {:path (str path) :message (failure-message (.getMessage e))}})))))
+                   :data {:path (str path) :message (provider-errors/sanitize-message (.getMessage e))}})))))
 
 (defn- transcribe-chunks [bytes _ext {:keys [max-bytes seconds]}]
   (when-not (and (integer? max-bytes) (<= 46 max-bytes Integer/MAX_VALUE)
@@ -192,7 +177,7 @@
                                            "-ac" "1" "-ar" "16000" "-f" "s16le"
                                            (.getAbsolutePath output))]
           (when-not (zero? exit)
-            (throw (ex-info (failure-message (str "ffmpeg audio decoding failed: " (str/trim err)))
+            (throw (ex-info (provider-errors/sanitize-message (str "ffmpeg audio decoding failed: " (str/trim err)))
                             {:tool :ffmpeg :status exit}))))
         (with-open [stream (java.io.FileInputStream. output)]
           (loop [offset 0, chunks []]

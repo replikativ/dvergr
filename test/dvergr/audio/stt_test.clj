@@ -4,6 +4,7 @@
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [dvergr.audio.stt :as stt]
+            [dvergr.model.provider-errors :as provider-errors]
             [hato.client :as hc]
             [taoensso.telemere :as tel]))
 
@@ -248,3 +249,10 @@
     (is (= 1 (count logs)))
     (is (= "token=[REDACTED]" (get-in (first logs) [:data :message])))
     (is (not (str/includes? (pr-str signals) "cleanup-secret")))))
+
+(deftest provider-diagnostics-strip-url-credentials
+  (let [message "Failed https://USER:PASSWORD@example.com/v1?api_key=QUERY#FRAGMENT X-Api-Key: HEADER"
+        sanitized (provider-errors/sanitize-message message)]
+    (is (str/includes? sanitized "https://example.com/v1"))
+    (doseq [secret ["USER" "PASSWORD" "QUERY" "FRAGMENT" "HEADER"]]
+      (is (not (str/includes? sanitized secret))))))

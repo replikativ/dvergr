@@ -1,6 +1,7 @@
 (ns dvergr.model.retired-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [clojure.edn :as edn]
+            [clojure.string :as str]
             [clojure.java.io :as io]
             [dvergr.media.vision :as vision]
             [dvergr.model.api.openai :as openai]
@@ -176,3 +177,70 @@
              (vision/extract (byte-array [1]) "image/png" {:schema "total"})))
       (is (= (fireworks "kimi-k3") (:model @request)))
       (is (= "image_url" (get-in @request [:messages 0 :content 0 :type]))))))
+
+(defn- assert-no-secrets [error secrets]
+  (is (instance? clojure.lang.ExceptionInfo error))
+  (doseq [cause (take-while some? (iterate ex-cause error))
+          exposed [(ex-message cause) (pr-str (ex-data cause))]
+          secret secrets]
+    (is (not (str/includes? exposed secret))))
+  (is (nil? (ex-cause error)))
+  (is (<= (count (ex-message error)) 1024)))
+
+(deftest vision-errors-expose-only-sanitized-diagnostics
+  (let [secrets ["sk-SENTINEL_KEY" "SENTINEL_API" "SENTINEL_BEARER"
+                 "SENTINEL_AUTH" "SENTINEL_SPACED_KEY" "SENTINEL_QUERY" "SENTINEL_USER"
+                 "SENTINEL_PASSWORD" "SENTINEL_HEADER" "SENTINEL_REQUEST"
+                 "gsk_SENTINEL_GROQ" "SENTINEL_REFRESH" "SENTINEL_SECRET"]
+        message (str "Image rejected sk-SENTINEL_KEY api_key=SENTINEL_API, "
+                     "gsk_SENTINEL_GROQ refresh_token=SENTINEL_REFRESH secret=SENTINEL_SECRET, "
+                     "API key: SENTINEL_SPACED_KEY, Bearer SENTINEL_BEARER; Authorization: Basic SENTINEL_AUTH\n"
+                     "https://SENTINEL_USER:SENTINEL_PASSWORD@example.com/v1?access_token=SENTINEL_QUERY")
+        provider-error (ex-info message {:status 400 :message message
+                                         :headers {"x-secret" "SENTINEL_HEADER"}
+                                         :request {:body "SENTINEL_REQUEST"}}
+                                (Exception. "SENTINEL_REQUEST"))]
+    (doseq [error [provider-error
+                   (ex-info message {:type :retry-exhausted :provider :fireworks
+                                     :config-key "DVERGR_VISION_MODEL"
+                                     :headers {"secret" "SENTINEL_HEADER"}
+                                     :request "SENTINEL_REQUEST"}
+                            provider-error)
+                   (ex-info message {:message message :model {:request "SENTINEL_REQUEST"}})
+                   (Exception. message)]]
+      (with-redefs [chat/chat (fn [& _] (throw error))]
+        (let [caught (try (vision/describe (byte-array [1]) "image/png")
+                          (catch Exception e e))]
+          (assert-no-secrets caught secrets)
+          (is (every? #{:type :status :message :model :config-key :provider}
+                      (keys (ex-data caught))))
+          (when (:status (ex-data caught))
+            (is (= 400 (:status (ex-data caught))))
+            (is (str/includes? (:message (ex-data caught)) "Image rejected"))))))
+    (with-redefs [chat/chat (fn [& _] (throw (ex-info (apply str (repeat 3000 "x"))
+                                                      {:message (apply str (repeat 3000 "y"))})))]
+      (let [caught (try (vision/describe (byte-array [1]) "image/png")
+                        (catch Exception e e))]
+        (is (= 1024 (count (ex-message caught))))
+        (is (= 1024 (count (:message (ex-data caught)))))))))
+
+(deftest vision-routing-diagnostic-omits-url-credentials
+  (let [url (str "https://SENTINEL_USER:SENTINEL_PASSWORD@api.fireworks.ai:8443/inference/v1"
+                 "?api_key=SENTINEL_QUERY#SENTINEL_FRAGMENT")]
+    (with-redefs [providers/providers (atom {:openai (openai/create {:api-key "test" :base-url url} {})})
+                  gateway/request! (fn [_] (throw (AssertionError. "must fail before HTTP")))]
+      (doseq [invoke [#(vision/describe (byte-array [1]) "image/png" {:model "gpt-5.4-mini"})
+                      #(vision/extract (byte-array [1]) "image/png" {:model "gpt-5.4-mini" :schema "total"})]]
+        (let [caught (try (invoke) (catch Exception e e))]
+          (assert-no-secrets caught ["SENTINEL_USER" "SENTINEL_PASSWORD" "SENTINEL_QUERY" "SENTINEL_FRAGMENT"])
+          (is (str/includes? (ex-message caught) "https://api.fireworks.ai:8443/inference/v1"))
+          (is (not (str/includes? (ex-message caught) "?"))))))))
+
+(deftest vision-routing-errors-are-bounded-and-hide-invalid-urls
+  (doseq [url ["https://user:SENTINEL_PASSWORD@api.fireworks.ai/bad path?token=SENTINEL_QUERY"
+               (str "https://api.fireworks.ai/" (apply str (repeat 2000 "x")))]]
+    (with-redefs [providers/providers (atom {:openai (assoc-in (openai/create {:api-key "test"} {}) [:config :base-url] url)})
+                  gateway/request! (fn [_] (throw (AssertionError. "must fail before HTTP")))]
+      (let [caught (try (vision/describe (byte-array [1]) "image/png" {:model "gpt-5.4-mini"})
+                        (catch Exception e e))]
+        (assert-no-secrets caught ["SENTINEL_PASSWORD" "SENTINEL_QUERY"])))))
