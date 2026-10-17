@@ -18,6 +18,39 @@
                    (for [i (range 4)] {:attempt/id (keyword (str "b" i)) :attempt/elapsed-ms 40000
                                        :attempt/checks {:answer-present true :bu (< i 1) :gegenkonto (< i 2)}})))})
 
+(deftest unreported-and-mixed-resources-remain-unknown-in-rows-and-markdown
+  (let [unknown {:microdollars 0 :priced? false :tokens {}}
+        known {:microdollars 20 :priced? true :tokens {:input 10 :output 2 :cache-read 3}}
+        result {:scorecard {:scorecard/entries
+                            [{:attempt/id :a :candidate/id :mixed :passed? true :reward 1.0 :spend known}
+                             {:attempt/id :b :candidate/id :mixed :passed? false :reward 0.0 :spend unknown}
+                             {:attempt/id :c :candidate/id :zero :passed? true :reward 1.0
+                              :spend {:microdollars 0 :priced? true :tokens {:input 0 :output 0}}}]}}
+        rows (into {} (map (juxt :candidate identity)) (report/rows result))
+        md (report/markdown {:title "Unknown usage" :result result})]
+    (is (nil? (:notional-total (rows :mixed))))
+    (is (nil? (:notional-per-attempt (rows :mixed))))
+    (is (nil? (:notional-per-pass (rows :mixed))))
+    (is (nil? (:tokens-per-attempt (rows :mixed))))
+    (is (nil? (:cache-share (rows :mixed))))
+    (is (= 0 (:notional-total (rows :zero))))
+    (is (= 0 (:tokens-per-attempt (rows :zero))))
+    (is (str/includes? md "| mixed | 2 | 1 (50%) |"))
+    (is (str/includes? md "| mixed | – | – | – | – | – | – | – | – |"))
+    (is (str/includes? md "never as measured zero"))
+    (testing "a missing cache split in one otherwise reported attempt is unknown"
+      (let [r (report/rows {:scorecard {:scorecard/entries
+                                        [{:candidate/id :a :spend known}
+                                         {:candidate/id :a :spend (update known :tokens dissoc :cache-read)}]}})]
+        (is (nil? (:cache-share (first r))))))
+    (testing "an unreported judge is present but not priced at zero"
+      (let [r (assoc result :receipts [{:attempt/id :a :attempt/metrics {:judge-spend unknown}}])
+            row (first (filter #(= :mixed (:candidate %)) (report/rows r)))
+            md (report/markdown {:result r})]
+        (is (:judge-recorded? row))
+        (is (nil? (:judge-notional-total row)))
+        (is (str/includes? md "| **judge, all** | – | – | |"))))))
+
 (deftest the-frontier-and-where-answers-fail
   (let [rs (into {} (map (juxt :candidate identity)) (report/rows result))]
     (is (= [4 3] ((juxt :n :passes) (rs :luna))))

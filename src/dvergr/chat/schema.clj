@@ -898,6 +898,21 @@
     :db/cardinality :db.cardinality/one
     :db/doc "What the Attempt's model calls cost, in microdollars (0 when unpriced)"}
 
+   {:db/ident :attempt/spend-priced?
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one
+    :db/doc "Whether the exact receipt records a complete measured bill; false is not a zero-cost claim"}
+
+   {:db/ident :attempt/usage-reported?
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one
+    :db/doc "Whether both input and output token counts were reported, including explicit zeros"}
+
+   {:db/ident :attempt/notional-priced?
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one
+    :db/doc "Whether list-price cost is recorded completely, independently of billed cost"}
+
    {:db/ident :attempt/notional-microdollars
     :db/valueType :db.type/long
     :db/cardinality :db.cardinality/one

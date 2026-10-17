@@ -413,7 +413,9 @@
         {:rooms (mapv :slug (experiment-rooms daemon))
          :experiments (vec (mapcat :experiments ps))
          :running (vec (mapcat :running ps))
-         :microdollars (reduce + 0 (keep :microdollars ps))}))))
+         :microdollars (when (every? #(some? (:microdollars %)) ps) (reduce + 0 (map :microdollars ps)))
+         :priced? (every? :priced? ps)
+         :unpriced-attempts (reduce + 0 (map #(or (:unpriced-attempts %) 0) ps))}))))
 
 (defn- only-room [daemon room]
   (or (some->> room (live-room daemon))

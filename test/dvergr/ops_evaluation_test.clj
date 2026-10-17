@@ -7,6 +7,7 @@
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.roster :as roster]
+            [dvergr.agent.spend :as spend]
             [dvergr.discourse :as d]
             [dvergr.ops :as ops]
             [dvergr.room.registry :as rreg]
@@ -27,6 +28,72 @@
     :verifier {:id :ops-test/exact :version 1 :basis "ops-evaluation-test:v1"}
     :limits {:timeout-ms 2000 :cancel-timeout-ms 1000}
     :world {:isolation :ctx :settlement :discard}}))
+
+(deftest model-breakdowns-never-present-folded-partial-usage-as-complete
+  (let [leaf {:microdollars 10 :priced? true :tokens {:input 5 :output 1}}
+        known (assoc leaf :by-model {"m" leaf})
+        unreported {:microdollars 0 :priced? false :tokens {}}]
+    (doseq [unknown [(assoc unreported :by-model {})
+                     (assoc unreported :by-model {"m" unreported})]]
+      (let [raw [known unknown]
+            data (@#'ops/spend-data (spend/total raw) raw)]
+        (is (nil? (:microdollars data)))
+        (is (false? (:usage-reported? data)))
+        (is (false? (:model-attribution-complete? data)))
+        (is (= {} (:by-model data)))))
+    (let [other (assoc leaf :tokens {:input 3} :by-model {"m" (assoc leaf :tokens {:input 3})})
+          data (@#'ops/spend-data (spend/total [known other]) [known other])]
+      (is (false? (:usage-reported? data)))
+      (is (= {} (:by-model data)))))
+  (testing "missing model attribution stays incomplete even when billed cost is zero"
+    (doseq [extra [{:notional-microdollars 100}
+                   {:tokens {:input 0 :output 0 :reasoning 7}}
+                   {:tokens {:input 0 :output 0 :cache-read 3}}]]
+      (let [recorded (merge {:microdollars 0 :priced? true
+                             :tokens {:input 0 :output 0} :by-model {}} extra)
+            data (@#'ops/spend-data recorded)]
+        (is (= 0 (:microdollars data)))
+        (is (= (get extra :notional-microdollars 0) (:notional-microdollars data)))
+        (is (false? (:model-attribution-complete? data)))
+        (is (= {} (:by-model data)))))))
+
+(deftest unreported-spend-is-unknown-without-changing-certified-scorecard-identities
+  (let [team (-> (roster/make-roster {:id :ops-test/unknown-team})
+                 (roster/make-agent {:id :alpha :program {:kind :echo}}))
+        evaluator (evaluation/make-evaluator
+                   {:id :ops-test/exact :version 1 :basis "ops-evaluation-test:v1"
+                    :observe (fn [{:keys [default]}]
+                               (assoc default :spend {:microdollars 0 :tokens {} :by-model {} :priced? false}))
+                    :verify (fn [_ _] {:checks {:exact? true} :reward 1.0})})
+        definition (experiment/make-experiment
+                    {:id :ops-test/unknown
+                     :dataset (experiment/make-dataset {:id :ops-test/unknown-tasks
+                                                        :environments [(environment :ops-test/unknown-task "task")]})
+                     :candidates [(roster/agent team :alpha)]})
+        room (d/make-room {:id :ops-evaluation-unknown :store (memory/make)})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (rreg/register! room)
+        (let [{:keys [scorecard]} @(experiment/run room team definition {(:ref evaluator) evaluator})
+              original-id (:scorecard/content-id scorecard)
+              original-summary (:scorecard/summary scorecard)
+              detail (@#'ops/scorecard-data scorecard)
+              row (first (:leaderboard detail))
+              progress (experiment/progress room)]
+          (is (some? original-id))
+          (is (= 0 (get-in original-summary [0 :microdollars-per-attempt])) "historical canonical summary is not rewritten")
+          (is (nil? (:microdollars-per-attempt row)))
+          (is (nil? (:microdollars-per-pass row)))
+          (is (nil? (:notional-microdollars-per-attempt row)))
+          (is (false? (get-in row [:spend :priced?])))
+          (is (false? (get-in row [:spend :usage-reported?])))
+          (is (nil? (:microdollars progress)))
+          (is (= 1 (:unpriced-attempts progress)))
+          (is (nil? (get-in progress [:experiments 0 :candidates 0 :microdollars])))
+          (is (= scorecard (experiment/validate-scorecard scorecard)))
+          (is (= original-id (:scorecard/content-id scorecard)))
+          (is (= original-summary (:scorecard/summary scorecard)))))
+      (finally (d/close-room! room)))))
 
 (deftest runs-attempts-and-scorecards-are-readable-through-the-ops-spec
   (let [team (-> (roster/make-roster {:id :ops-test/team})

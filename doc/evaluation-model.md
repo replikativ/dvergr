@@ -306,6 +306,19 @@ arena commands debit their own units (`dvergr.agent.arenas.renewal`).
 | Tracks | a grant at hire, model spend debited per call, the remainder returned | tokens x price; stops the Run on budget |
 | Idempotence | each debit's id is derived from its charge scope (the Run and model step) and its ordinal there, so a retried step debits once | not conserved; only capped by the wallet when one is bound |
 
+Presentation distinguishes a recorded zero from an unknown cost or token
+dimension. `dvergr.agent.measurements/summarize` checks individual recorded
+spends before aggregation: one unpriced/missing amount makes the group's cost
+and cost-per-attempt/pass unknown; one missing token dimension makes that
+dimension unknown. Reported tokens can still be known when pricing is not.
+Reports render unknown values as a dash, including judge totals. Typed Attempt
+projections carry `:attempt/spend-priced?`, `:attempt/notional-priced?` and
+`:attempt/usage-reported?` (the
+latter means both input and output counts, including explicit zeros). Legacy
+rows without these flags still reconstruct their exact payload. These are read
+models: stored receipts, Scorecard summaries, validation and content identities
+are unchanged.
+
 A protocol Run's model calls (a tau2 conversation's, the candidate's and the
 customer's alike) are debited from the Run's wallet too, in the charge scope
 `[:protocol run-id]`: the protocol worker binds the wallet, and
