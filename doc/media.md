@@ -19,8 +19,45 @@ backends, first success wins:
 | `:native` | `DVERGR_ASR_MODEL_DIR` + Moonshine on the classpath | in-process, no python; streaming-capable |
 | `:local` | `python3` + `faster_whisper` | `scripts/transcribe.py` (`DVERGR_WHISPER_SCRIPT` / `DVERGR_WHISPER_MODEL` override) |
 
-A blank result (silence / noise) is treated as *no speech* — the caller gets
-`nil`, not an empty message.
+Without `:chunk`, `transcribe` returns a string, or `nil` for a successful
+blank transcript (silence / noise). Backend failures fall through to the next
+backend and are logged with `:backend`, `:status` and `:message`. If every
+available backend fails, it throws `ex-info` with ordered data, for example:
+
+```clojure
+{:attempts [{:backend :groq :status 429 :message "HTTP 429: rate limited"}
+            {:backend :local :status 1 :message "missing faster_whisper"}]}
+```
+
+HTTP statuses and local process exit codes are numbers; other exceptions use
+`:status :error`. Unconfigured backends are skipped, so no available backend
+produces `{:attempts []}`. A successful blank transcript still returns `nil`
+when the other backends fail.
+
+Chunking is opt-in and requires `ffmpeg` on PATH:
+
+```clojure
+(stt/transcribe {:bytes audio-bytes :mime "audio/mp4"
+                 :chunk {:max-bytes 20000000 :seconds 600}})
+;; => {:text "[0.0s] first part\n[600.0s] second part"
+;;     :chunks [{:start-seconds 0.0 :end-seconds 600.0 :text "first part"}
+;;              {:start-seconds 600.0 :end-seconds 720.5 :text "second part"}]}
+```
+
+Audio is decoded into mono 16 kHz PCM and split into WAV uploads, each bounded
+by both `:max-bytes` (including the 44-byte WAV header) and `:seconds`. Both
+bounds are required; max-bytes must be an integer from 46 to 2147483647 and
+seconds must be finite and at least one sample (1/16000 second). Boundaries
+are seconds from the start of the decoded audio, contiguous and without overlap;
+the last chunk may be shorter. Chunks are transcribed sequentially, with backend
+fallback for each. Text is joined with newlines and `[<start-seconds>s]` offsets.
+Silent chunks have `:text nil` and remain in `:chunks` but are omitted from the
+joined text, which is `nil` when all chunks are silent. A failed chunk throws
+with `:attempts` plus `:chunk {:start-seconds … :end-seconds …}`; no partial
+transcript is returned. Missing ffmpeg and decoding errors throw clear
+`ex-info` errors with `:tool :ffmpeg`. Temporary audio files are deleted on
+success and failure. Chunking is off by default, preserving the string/nil
+return shape for existing callers.
 
 ### Where you speak
 
