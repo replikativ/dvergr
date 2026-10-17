@@ -80,6 +80,27 @@
           (is (= 4 (count pages)))
           (is (= pages (:pages (v4/kb->pages @conn {})))))))))
 
+(deftest suffixed-paths-do-not-overwrite-a-third-pages-natural-path
+  (doseq [third-id [99 110]]
+    (with-kb
+      (fn [conn]
+        (let [uuid #uuid "7df40fa7-5dd1-47d8-9897-641341f2be8d"
+              title (str "River-" uuid)
+              natural (str "/wiki/atoms/river-" uuid ".md")]
+          (d/transact conn [{:db/id 109 :S.Page/title "River!" :S.Page/kind :wiki/atom :entity/uuid uuid}
+                            {:db/id third-id :S.Page/title title :S.Page/kind :wiki/atom}
+                            {:db/id 107 :block/content (str "<p>[[River]] [[River!]] [[" title "]]</p>")}])
+          (let [pages (:pages (v4/kb->pages @conn {}))
+                disambiguated (str "/wiki/atoms/river-" uuid "-2.md")
+                overview (pages "/wiki/overviews/overview.md")]
+            (is (= 5 (count pages)))
+            (is (str/includes? (pages natural) (str "# " title)))
+            (is (str/includes? (pages disambiguated) "# River!"))
+            (is (some #(str/includes? % "The river flows west") (vals pages)))
+            (is (str/includes? overview (str "[" title "](" natural ")")))
+            (is (str/includes? overview (str "[River!](" disambiguated ")")))
+            (is (= pages (:pages (v4/kb->pages @conn {}))))))))))
+
 (deftest html-is-walked-as-markdown
   (let [render #'v4/html-markdown]
     (is (= "## Claim\nText **bold** and *italic*.\n\n- `code`\n- [link](/x)"
@@ -168,4 +189,21 @@
                     (v4/kb->pages @conn {:resolve-source (fn [ref]
                                                            (when (= "dh://archive/charter" ref)
                                                              (resolve-source "charter")))}))]
+        (is (= 1.0 (:reward result)) (pr-str result))))))
+
+(deftest bare-sources-citations-resolve-through-a-successful-section
+  (with-kb
+    (fn [conn]
+      (d/transact conn
+                  (into [[:db/retract 100 :S.Page/source "charter#History"]
+                         [:db/add 100 :S.Page/source "dh://archive/charter#History"]]
+                        (for [block fixture :when (#{104 105 106} (:db/id block))]
+                          (update block :block/content str/replace "charter" "dh://archive/charter"))))
+      (let [projected (v4/kb->pages @conn {:resolve-source (fn [ref]
+                                                             (when (= "dh://archive/charter#History" ref)
+                                                               (resolve-source "charter")))})
+            result (v4/score-structure projected)]
+        (is (str/includes? (get-in projected [:pages "/wiki/atoms/river.md"])
+                           "**Sources:** [dh://archive/charter](/docs/charter.md)"))
+        (is (= #{"/docs/charter.md"} (set (keys (:sources projected)))))
         (is (= 1.0 (:reward result)) (pr-str result))))))

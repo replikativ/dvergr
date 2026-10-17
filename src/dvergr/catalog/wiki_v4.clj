@@ -136,17 +136,32 @@
                             (str "/wiki/" (if (= :wiki/atom (get e (:kind a))) "atoms/" "overviews/")
                                  (slug (get e (:title a))) ".md")))
         collisions (frequencies (map (comp base-path val) pages))
-        paths (into {} (for [[id e] pages
-                             :let [base (base-path e)]]
-                         [id (if (= 1 (collisions base)) base
-                                 (str (subs base 0 (- (count base) 3)) "-"
-                                      (or (get e (:page-uuid a))
-                                          (java.util.UUID/nameUUIDFromBytes (.getBytes (str id) "UTF-8"))) ".md"))]))
+        ;; Reserve natural paths before allocating suffixes, including later pages.
+        paths (reduce (fn [paths [id e]]
+                        (let [base (base-path e)
+                              stem (str (subs base 0 (- (count base) 3)) "-"
+                                        (or (get e (:page-uuid a))
+                                            (java.util.UUID/nameUUIDFromBytes (.getBytes (str id) "UTF-8"))))
+                              occupied (into (set (keys collisions)) (vals paths))
+                              path (if (= 1 (collisions base)) base
+                                       (first (remove occupied
+                                                      (cons (str stem ".md")
+                                                            (map #(str stem "-" % ".md") (iterate inc 2))))))]
+                          (assoc paths id path)))
+                      {} pages)
         titles (into {} (for [[id e] pages] [(get e (:title a)) (paths id)]))
         children (update-vals (group-by #(get (val %) (:parent a)) entities)
                               #(sort-by (fn [[id e]] [(get e (:order a) "") (str id)]) %))
         refs (sort (distinct (mapcat #(let [v (get % (:source a))] (if (string? v) [v] v)) (vals pages))))
         resolved (into {} (for [r (distinct (concat refs (map #(first (str/split % #"#" 2)) refs))) :let [doc (when resolve-source (resolve-source r))] :when doc] [r doc]))
+        ;; A resolved section also identifies its document; explicit results take precedence.
+        resolved (merge (reduce (fn [aliases ref]
+                                  (if-let [doc (resolved ref)]
+                                    (let [bare (first (str/split ref #"#" 2))]
+                                      (if (contains? aliases bare) aliases (assoc aliases bare doc)))
+                                    aliases))
+                                {} refs)
+                        resolved)
         source-link (fn [ref display]
                       (let [[doc section] (str/split ref #"#" 2)]
                         (if-let [{:keys [path]} (or (resolved ref) (resolved doc))]
