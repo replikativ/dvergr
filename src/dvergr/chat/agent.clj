@@ -293,6 +293,8 @@
 
           ;; Extract from new response format
           {:keys [content tool-calls usage stop-reason reasoning]} response
+          ;; Charge and attribute the execution id returned by model.chat.
+          model (or (:model response) model)
           _ (tel/log! {:level :info :id :agent/llm-response
                        :data {:stop-reason stop-reason
                               :tool-calls (mapv :name tool-calls)

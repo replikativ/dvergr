@@ -23,6 +23,8 @@
 
 (use-fixtures :each
   (fn [f]
+    ;; Keep the global loaded flag consistent with the registry we restore.
+    (registry/ensure-models-loaded!)
     (with-redefs [registry/registry (atom @registry/registry)
                   registry/aliases (atom @registry/aliases)
                   providers/ensure-initialized! (constantly nil)
