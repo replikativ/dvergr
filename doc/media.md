@@ -105,9 +105,11 @@ backends:
 `dvergr.media.vision` describes and extracts from images via a vision LLM,
 routed through `dvergr.model.chat/chat` (so it gets provider/key resolution and
 429/5xx retry). Configure per-call `:model`, `DVERGR_VISION_MODEL`, or
-`:defaults :vision-model` in models.edn, in that precedence order; there is no
-implicit default. The registered provider must serve the chosen image-capable
-model. See [provider-setup.md](provider-setup.md).
+`:defaults :vision-model` in models.edn, in that precedence order. The bundled
+default is Fireworks `accounts/fireworks/models/kimi-k3`; K3 and
+`glm-5p3-flash` accept images. The registered provider must serve the chosen
+image-capable model; known routing mismatches fail before HTTP with configuration
+guidance. See [provider-setup.md](provider-setup.md).
 
 ### `vision/describe` — OCR + scene description
 
@@ -119,7 +121,9 @@ model. See [provider-setup.md](provider-setup.md).
 Returns free text: a detailed description with any visible text transcribed
 verbatim. In the sandbox the path is read through the chat-ctx's muschel FS, so
 workspace files and mounted drives (e.g. `/drive`) both work — bytes never enter
-the SCI sandbox, only the extracted text comes back.
+the SCI sandbox, only the extracted text comes back. Failed or empty descriptions
+throw. Provider failures include `:status` (HTTP status), `:message` (the provider
+message), and `:model` in ex-data, including when retries are exhausted.
 
 ### `vision/extract` — structured data (invoices, receipts → JSON)
 

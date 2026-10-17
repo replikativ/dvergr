@@ -34,7 +34,7 @@
                         (str "Configure :defaults :vision-model in models.edn or DVERGR_VISION_MODEL "
                              "(or pass :model): " reason)
                         {:type ::configuration :config-key :vision-model :model configured})))
-        _ (when (str/blank? configured) (fail! "an explicit image-capable model is required"))
+        _ (when (str/blank? configured) (fail! "an image-capable model is required"))
         mid (registry/resolve-alias configured)
         _ (registry/assert-capability! mid :vision)
         _ (providers/ensure-initialized!)
@@ -80,15 +80,29 @@
   "Describe image bytes → text. Throws on failure so frame intake can report it.
    Routes through dvergr.model.chat/chat with a base64 image_url content part.
    opts: :prompt (default: detailed description + OCR), :model, :max-tokens.
-   Model must be explicit: :model, DVERGR_VISION_MODEL, or :defaults :vision-model."
+   Defaults to Fireworks Kimi K3; :model, DVERGR_VISION_MODEL, then the registry
+   :vision-model default take precedence. Provider failures carry :status and
+   :message in ex-data, including after retries are exhausted."
   [^bytes bytes mime & [{:keys [prompt model max-tokens]}]]
-  (let [messages [(image-message (->data-url bytes mime) (or prompt default-prompt))]
-        content (:content (call-model messages
-                                      {:model (model-id model)
-                                       :model-config-key (if model :model "DVERGR_VISION_MODEL")
-                                       :max-tokens (or max-tokens 1024)}))]
+  (let [mid (model-id model)
+        messages [(image-message (->data-url bytes mime) (or prompt default-prompt))]
+        content (try
+                  (:content (call-model messages
+                                        {:model mid
+                                         :model-config-key (if model :model "DVERGR_VISION_MODEL")
+                                         :max-tokens (or max-tokens 1024)}))
+                  (catch clojure.lang.ExceptionInfo e
+                    ;; Retry exhaustion wraps the provider error as its cause.
+                    (if-let [reason (some #(when (:status (ex-data %)) (ex-data %))
+                                          (take-while some? (iterate ex-cause e)))]
+                      (throw (ex-info (str "Vision describe failed: " (.getMessage e)
+                                           " (HTTP " (:status reason) "): " (:message reason))
+                                      (merge (ex-data e) (select-keys reason [:status :message])
+                                             {:model mid})
+                                      e))
+                      (throw e))))]
     (when (str/blank? content)
-      (throw (ex-info "Vision describe returned no text" {:model (model-id model)})))
+      (throw (ex-info "Vision describe returned no text" {:model mid})))
     content))
 
 ;; ── Structured extraction ────────────────────────────────────────────────

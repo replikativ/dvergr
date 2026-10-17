@@ -72,9 +72,12 @@ quirks; `resources/models.edn` adds Fireworks models, and `(registry/refresh-fro
   that pins no model and gets Fireworks as its provider runs `minimax-m3`
   (`providers/default-spec`); the registry's `:compaction-model` default and the `minimax`
   alias are `minimax-m3`.
-- Vision requires explicit `:defaults :vision-model` in models.edn or
-  `DVERGR_VISION_MODEL` (per-call `:model` overrides both), with a provider URL
-  that serves the selected image-capable model.
+- Vision defaults to Fireworks `accounts/fireworks/models/kimi-k3`; K3 and
+  `glm-5p3-flash` accept images. Per-call `:model` overrides `DVERGR_VISION_MODEL`,
+  which overrides `:defaults :vision-model` in models.edn. The registered provider
+  must serve the selected model; known routing mismatches fail before HTTP with
+  configuration guidance. `vision/describe` throws provider failures with
+  `:status` (HTTP status) and `:message` (provider message) in ex-data.
 - API: `claude-sonnet-4-6`, `claude-opus-4-7`, `claude-haiku-4-5`, `gpt-5.6-*`.
 
 Claude Code CLI candidates call tools natively over MCP when they work in a room (room workflows;
