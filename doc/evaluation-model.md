@@ -52,6 +52,20 @@ any mutation of Attempts and Scorecards.
 
 So `evaluate` is most of `attempt!`.
 
+Hosts that own a job or close a room join its physical cleanup off the engine
+drain. `dvergr.agent.evaluation/cleanup-group` identifies one operation;
+pass it as `:cleanup-group` to `evaluate`, settle or cancel the owning
+evaluation, then join
+`dvergr.agent.evaluation/await-cleanups-for!` before returning the parent
+wallet or tearing down its resources. The group covers queued admission,
+late-admitted Runs and their physical completion, as well as detached
+certification. Cancelling the evaluation Spin does not close this boundary:
+admission finishes without interruption, its arriving Run is cancelled, and
+the barrier remains until Run cleanup and resource return complete. A timeout
+or cleanup error throws; it is not evidence that resources are safe to release.
+The group identifies an operation, not a permanently closed scope: do not
+start another evaluation in that group concurrently with its final join.
+
 ### Two planes
 
 One separation in the existing code makes the rest compositional.

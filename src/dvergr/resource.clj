@@ -382,17 +382,28 @@
    included); plus its enforced output limit `max-output` (reasoning
    included) at the highest output price; all doubled for what the registry
    does not model (service tiers). Prices are USD per million
-   tokens, so microdollars per token. nil when no reliable bound exists: no
-   output limit, no input or output price, or content whose cost its size
-   does not bound (`unbounded-content?`; `body`, the request, is checked)."
+   tokens, so microdollars per token. Explicitly zero effective rates across
+   all price bands have a zero monetary bound even without an output cap
+   (native subscriptions). Dispatch admission still applies. nil when no
+   reliable bound exists: missing/invalid prices, or a priced request without
+   an output limit or with content whose cost its size does not bound."
   [model-def body body-bytes max-output]
-  (let [{:keys [input output cache-write cache-write-1h]} (registry/highest-pricing model-def)]
-    (when (and (number? input) (number? output) (pos-int? max-output) (pos-int? body-bytes)
-               (not (unbounded-content? body)))
-      (let [in-price (apply max (filter number? [input cache-write cache-write-1h]))
-            in-tokens (+ body-bytes dispatch-overhead-tokens (* image-tokens (image-count body)))]
-        (.setScale (bigdec (* 2 (+ (* in-tokens in-price) (* max-output output))))
-                   0 java.math.RoundingMode/CEILING)))))
+  (let [bands (remove nil? [(:pricing model-def) (get-in model-def [:long-context :pricing])])
+        valid-rate? #(and (number? %) (Double/isFinite (double %)) (not (neg? %)))]
+    (when (and (map? (:pricing model-def))
+               (valid-rate? (get-in model-def [:pricing :input]))
+               (valid-rate? (get-in model-def [:pricing :output]))
+               (every? map? bands) (every? valid-rate? (mapcat vals bands)))
+      (let [{:keys [input output cache-read cache-write cache-write-1h] :as rates}
+            (registry/highest-pricing model-def)]
+        (when (and (number? input) (number? output))
+          (if (every? zero? (vals rates))
+            0M
+            (when (and (pos-int? max-output) (pos-int? body-bytes) (not (unbounded-content? body)))
+              (let [in-price (apply max (filter number? [input cache-read cache-write cache-write-1h]))
+                    in-tokens (+ body-bytes dispatch-overhead-tokens (* image-tokens (image-count body)))]
+                (.setScale (bigdec (* 2 (+ (* in-tokens in-price) (* max-output output))))
+                           0 java.math.RoundingMode/CEILING)))))))))
 
 (defn funded-grant?
   "Does a child's grant `resources` fund provider calls: money to pay them
@@ -423,18 +434,19 @@
 (defn reserve-dispatch!
   "Before a governed dispatch that has a paying wallet: move its bound
    (`*dispatch-bound*`) from that wallet into a reservation of its own; the
-   ledger refuses what the wallet cannot cover. A dispatch without a bound,
-   or without a model call to settle it (`*dispatches*`), is refused."
+   ledger refuses what the wallet cannot cover. A known zero bound needs no
+   monetary reservation, but still needs its model-call scope and consumes
+   admission at the gateway. An unknown/invalid bound is refused."
   []
   (when-let [payer (when *model-scope* (current-payer))]
     (let [amount *dispatch-bound*]
-      (when-not (and amount (pos? amount))
+      (when-not (and (number? amount) (Double/isFinite (double amount)) (not (neg? amount)))
         (throw (ex-info "A funded model dispatch needs a bound on its cost: a priced model, an output limit, no remote content"
                         {:type ::unbounded-dispatch})))
       (when-not *dispatches*
         (throw (ex-info "A funded model dispatch must be made by a model call that settles it"
                         {:type ::unsettled-dispatch})))
-      (reserve! payer amount))))
+      (when (pos? amount) (reserve! payer amount)))))
 
 (defn- move! [payer reservation kind id destination amount]
   (when (pos? amount)

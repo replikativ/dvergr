@@ -304,7 +304,13 @@ child context, and live settlement capability come from the canonical handle
 `dvergr.discourse`), and are not recreated in Dvergr. `settle!` decides
 once: failure or cancellation discards; `:deferred` holds the world until the
 host releases it; `:waiting` and `:review` retain it; `:discard` drops it;
-otherwise it merges. A failed merge is ordinary review only while the canonical
+otherwise it merges. Automatic
+settlement drains the fork's work, refuses a dirty parent, commits pending
+workspace edits, and rechecks current merge permissions before adopting those
+commits. Binary contents, modes and deletions therefore settle with the Run,
+not just changes the agent explicitly committed. A pinned review-state merge
+keeps its separate guard: preparing different contents would invalidate its pin.
+A failed merge is ordinary review only while the canonical
 handle is still open. Failure after substrate mutation begins remains fenced
 and registered as `:recovery-required` (`:settlement-incomplete`); it is not a
 fresh review/adoption capability. Fully merged substrate whose later cleanup
@@ -477,6 +483,19 @@ systems from Spindel's internal settlement payload. Failed compensation is
 returned as explicit recovery state with the durable receipt still attached;
 `dvergr.discourse/retry-settlement-abort!` repairs that durable intent before
 the still-open capability can receive a new decision.
+
+Affine possession is not a current grant on the merge targets. Product adopters
+must check human decision authority and current originating-room grants before
+journaling a merge. `dvergr.system.rooms/assert-fork-merge-permitted!` supplies
+the room-grant preflight for a fixed partition leaf; partition even a singleton
+world before using it. Call it in the trusted `prepare!` callback with the
+actual leaf handle and origin slug resolved from the adopter's durable room
+identity, not caller-supplied descriptor ancestry. It checks only that leaf,
+refuses unavailable protected deltas, and leaves discard/commit-only recovery
+possible after revocation. This preflight is not atomic with an independent
+grant writer. `dvergr.system.rooms/registry-system-for` resolves runtime system
+names through the canonical registry rules so a product can separately enforce
+its human per-target permissions without duplicating those naming rules.
 
 The durable half belongs to the adopter and is not in this repository: store the
 descriptor as a GC root, index its systems, journal per-system settlement, and

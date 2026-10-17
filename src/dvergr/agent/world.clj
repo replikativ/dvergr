@@ -6,6 +6,7 @@
    second axis from execution: a completed program may be merged, retained for
    review, or discarded without rewriting its execution outcome."
   (:require [dvergr.discourse :as d]
+            [dvergr.rooms.forks :as forks]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]))
 
@@ -140,7 +141,8 @@
 
        :else
        (try
-         (d/merge-room (:parent world) (:work world))
+         (d/merge-room (:parent world) (:work world)
+                       {:guard (forks/workspace-merge-guard (:parent world) (:work world))})
          {:status :merged}
          (catch Throwable t
            (if (and (= :dvergr.discourse/already-settled (:type (ex-data t)))

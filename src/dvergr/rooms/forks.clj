@@ -13,6 +13,7 @@
             [dvergr.agent.run :as agent-run]
             [dvergr.discourse :as d]
             [dvergr.substrate.geschichte :as git]
+            [dvergr.system.rooms :as srooms]
             [geschichte.repo :as repo]
             [clojure.string :as str]
             [hasch.core :as hasch]
@@ -141,9 +142,10 @@
 (defn ctx-fork?
   "True when the fork holds its OWN forked execution context (`:isolation
    :ctx`) — i.e. it has real branches to merge. `:none` forks share the
-   parent ctx."
+   parent ctx, which may itself already be forked. The canonical ForkHandle,
+   not the context's ancestry, distinguishes the two isolation modes."
   [fork]
-  (boolean (some-> fork :ctx :parent-ctx)))
+  (boolean (d/fork-handle fork)))
 
 (defn fork!
   "Fork `room` into an isolated `:ctx` branch — its own Geschichte workspace
@@ -341,6 +343,25 @@
   (refuse-dirty-parent! parent)
   (commit-workspace! fork (str "Work of fork " (name (:id fork)))))
 
+(defn workspace-merge-guard
+  "A `discourse/merge-room` guard for unpinned workspace settlement.
+   Runs after the fork's work is drained: refuse a dirty parent, commit the
+   quiescent fork, then recheck live merge permissions against those commits.
+   Hold the parent's workspace lock through preparation and substrate merge.
+   Pinned review-state guards remain separate: they must not alter their input."
+  [parent fork]
+  (fn [merge-substrate!]
+    (let [workspace (binding [ec/*execution-context* (:ctx parent)] (git/current-workspace))
+          settle! (fn []
+                    (prepare-workspaces! parent fork)
+                    (when (d/fork-handle fork)
+                      (srooms/assert-merge-permitted!
+                       (or (some-> fork :meta deref :origin-slug) (:slug parent)) (:ctx fork)))
+                    (merge-substrate!))]
+      (if workspace
+        (locking (git/workspace-lock (:conn workspace)) (settle!))
+        (settle!)))))
+
 (defn uncommitted
   "What `room`'s workspace holds that is not committed, exactly: one entry per
    changed path from the repository's structured status (`repo/status-entries`;
@@ -425,8 +446,7 @@
         (if expect-state
           (do (refuse-dirty-parent! parent)
               (d/merge-room parent fork {:guard (pinned fork expect-state)}))
-          (do (prepare-workspaces! parent fork)
-              (d/merge-room parent fork)))
+          (d/merge-room parent fork {:guard (workspace-merge-guard parent fork)}))
         (when run-id
           (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :merged :review-approved))
         {:ok? true :parent-slug (:slug parent) :parent-id (:id parent)})
