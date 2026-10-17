@@ -249,28 +249,28 @@ snapshot. Built-in OpenAI rate fields are a separately documented dated
 snapshot in `model/registry.clj`; `resources/models.edn` is a distinct curated
 registry.
 
-**Vision models** carry `:vision` in `:capabilities`. `dvergr.media.vision`
-(image describe/extract) requires an explicitly configured model: per-call
-`:model`, then `DVERGR_VISION_MODEL`, then `:defaults {:vision-model "…"}` in
-models.edn (in that order). There is no bundled vision default. For example,
-`gpt-5.4-mini` needs an OpenAI provider with `OPENAI_API_KEY` and an OpenAI
-endpoint. If `OPENAI_BASE_URL` points at Fireworks, correct that routing before
-using an OpenAI vision model. None of the served bundled Fireworks models is
-marked image-capable. Missing configuration, missing providers, and known
-provider/endpoint mismatches fail before HTTP, naming `:vision-model` and
-`DVERGR_VISION_MODEL`. Unknown custom proxy URLs must serve the selected model;
-they cannot be validated locally. `LLM_CALL_MODEL` defaults to Fireworks
-`accounts/fireworks/models/minimax-m3`.
+**Vision models** carry `:vision` in `:capabilities`. Fireworks Kimi K3 and
+GLM 5.3 Flash accept image input. `dvergr.media.vision` (image describe/extract)
+selects per-call `:model`, then `DVERGR_VISION_MODEL`, then
+`:defaults {:vision-model "…"}` in models.edn, in that order. The bundled default
+is `accounts/fireworks/models/kimi-k3`. It works with `FIREWORKS_API_KEY`, or
+`OPENAI_API_KEY` plus `OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1`.
+Explicit configuration overrides the default. For example, `gpt-5.4-mini` needs
+an OpenAI provider with `OPENAI_API_KEY` and an OpenAI endpoint. Missing providers
+and known provider/endpoint mismatches fail before HTTP with an actionable error
+naming `:vision-model` and `DVERGR_VISION_MODEL`. Unknown custom proxy URLs must
+serve the selected model; they cannot be validated locally. `LLM_CALL_MODEL`
+defaults to Fireworks `accounts/fireworks/models/minimax-m3`.
 
 Retired ids remain in the registry with `:retired true` and `:successor`.
 Alias resolution follows successors and emits one warning naming the retired
-id and the resolved id per resolution. Kimi K2.6 and K2.5 resolve to Kimi K3,
-GLM 5.2 to GLM 5.3, and MiniMax M2.7 to MiniMax M3. K3 is text-only in this
-registry; vision calls reject it before sending images. Set an image-capable
-`DVERGR_VISION_MODEL` instead. A provider's 404 "Model not found" error names
-the resolved model and its source config key (`:model` for direct calls).
-`vision/describe` throws on failed or empty descriptions so screen intake can
-report a failure instead of silently dropping a frame.
+id and the resolved id per resolution. Kimi K2.6 and K2.5 resolve to image-capable
+Kimi K3, GLM 5.2 to GLM 5.3, and MiniMax M2.7 to MiniMax M3. A provider's 404
+"Model not found" error names the resolved model and its source config key
+(`:model` for direct calls). `vision/describe` throws on failed or empty
+descriptions so screen intake can report a failure instead of silently dropping
+a frame. Provider errors carry `:status` (HTTP status), `:message` (the provider's
+message), and `:model` in ex-data, including after retry exhaustion.
 
 Some Fireworks models leak their tool-call envelope into content (Kimi, GLM);
 their `:quirks` (`:kimi-tool-id-format?`, `:glm-tool-format?`) turn on the
