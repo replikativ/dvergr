@@ -20,6 +20,7 @@
             [dvergr.agent.evaluators :as evaluators]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.roster :as roster]
+            [dvergr.agent.program :as program]
             [dvergr.model.providers :as providers]
             [dvergr.model.registry :as registry]
             [dvergr.room.registry :as rreg]
@@ -92,7 +93,8 @@
    {:id (or environment-id (keyword "workflow" (str "task-" (subs (str (hasch/uuid task)) 0 8))))
     :task task
     :verifier (let [ref (evaluation/evaluator-ref (or evaluator completion-evaluator))]
-                {:id (:verifier/id ref) :version (:verifier/version ref)})
+                (cond-> {:id (:verifier/id ref) :version (:verifier/version ref)}
+                  (:verifier/basis ref) (assoc :basis (:verifier/basis ref))))
     :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000
              :on-timeout :verdict}
     :world (cond-> {:isolation :ctx :settlement :review}
@@ -127,6 +129,23 @@
                :state state}
         (seq uncommitted) (assoc :uncommitted uncommitted)))))
 
+(defn- settle!
+  [room opts result]
+  (let [world (get-in result [:run/result :run/world])
+        run-id (:run/id result)]
+    (when-let [w (and world (rreg/lookup world))]
+      (forks/commit-workspace! w (str "Attempt " run-id))
+      (when (= :review (get-in result [:run/result :run/settlement-status]))
+        (when-let [spec (:review opts)]
+          (let [review! (requiring-resolve 'dvergr.agent.review/review!)
+                reviewer (or (:reviewer opts)
+                             (when (:review/reviewer spec)
+                               ((requiring-resolve 'dvergr.agent.review/model-reviewer)
+                                (:daemon opts) room world spec (:principal opts))))]
+            (review! room world spec :run-id run-id :reviewer reviewer)))
+        (when-let [hook (:on-settlement opts)]
+          (hook {:room room :world world :run-id run-id :result (:run/result result)}))))))
+
 (defn start
   "Start `task` `attempts` times for each of `models` on forks of `room`.
    Returns `{:spin s :ctx c :finish f}`: `s` yields the evaluations (deref or
@@ -138,7 +157,11 @@
    a child of the daemon's, so evaluating in the latter loses every wakeup.
 
    At most `:parallelism` attempts (default 4) run at once. With `:parent-run`
-   every attempt's Run is that Run's child (a job, `dvergr.jobs`)."
+   every attempt's Run is that Run's child (a job, `dvergr.jobs`).
+   `:review` is a review spec; `:daemon` and `:principal` configure its model
+   reviewer (or supply `:reviewer`). `:on-settlement` is a host callback of
+   `{:room :world :run-id :result}`, called on a worker after commitment of a
+   world settled :review. Finish waits for these decisions at the boundary."
   [room {:keys [task attempts] :as opts}]
   (when (str/blank? (str task))
     (throw (ex-info "A workflow attempt needs a task" {:type ::no-task})))
@@ -163,12 +186,7 @@
                (binding [ec/*execution-context* ctx]
                  (mapv (fn [r]
                          (let [world (get-in r [:run/result :run/world])]
-                           ;; The attempt's files, committed in its world: what
-                           ;; the review shows and a merge adopts.
-                           (when-let [w (and world (rreg/lookup world))]
-                             (forks/commit-workspace!
-                              w (str "Attempt " (get-in r [:attempt :attempt/receipt :attempt/run-id]
-                                                        (name world)))))
+                           (program/on-worker! room #(settle! room opts r))
                            {:attempt (:attempt r)
                             :world world
                             :review (review world)}))
@@ -179,8 +197,8 @@
    block until all are certified. Call at a boundary (not inside a Spin).
 
    Returns `[{:attempt certified-Attempt :world world-id :review review-map}]`,
-   the retained worlds still open: adopt one with `forks/merge!`, drop the rest
-   with `forks/discard!`."
+   with worlds retained unless a review spec or settlement hook decided them.
+   Adopt an open world with `forks/merge!`, drop it with `forks/discard!`."
   [room opts]
   (let [{:keys [spin ctx finish]} (start room opts)]
     (finish (binding [ec/*execution-context* ctx] @spin))))

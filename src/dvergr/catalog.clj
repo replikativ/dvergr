@@ -114,6 +114,7 @@
     {:task ((:task wf) params)
      :profile (:profile wf)
      :evaluator ((:evaluator wf) params gold)
+     :review (:review wf)
      :environment-id (keyword "catalog" (str (namespace (:id wf)) "-" (name (:id wf))
                                              (when benchmark? "-bench")))}))
 

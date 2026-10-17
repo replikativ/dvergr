@@ -9,6 +9,11 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.agent.experiment.runner :as runner]
+            [dvergr.agent.review :as review]
+            [dvergr.agent.run :as run]
+            [dvergr.catalog.room :as room-wf]
+            [dvergr.discourse :as d]
+            [org.replikativ.spindel.engine.core :as ec]
             [dvergr.catalog :as catalog]
             [dvergr.catalog.wiki-gen :as gen]
             [dvergr.catalog.wiki-v4 :as v4]
@@ -19,6 +24,7 @@
             [dvergr.ops :as ops]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.rooms.forks :as forks]
+            [dvergr.resource :as resource]
             [dvergr.substrate.paths :as paths]
             [dvergr.system.db :as sdb]))
 
@@ -60,13 +66,15 @@
           {:content "Wrote the wiki." :tool-calls nil
            :usage {:input-tokens 1200 :output-tokens 20} :stop-reason :end-turn})))))
 
-(defn- run-job [args]
-  (let [started (ops/invoke *daemon* dvergr.principal/local-principal :catalog/start args)]
-    (loop [n 0]
-      (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status {:job (:id started) :wait-ms 20000})]
-        (if (or (not= "running" (:status st)) (< 6 n))
-          (assoc st :room (:room started) :mode (:mode started))
-          (recur (inc n)))))))
+(defn- run-job
+  ([args] (run-job args dvergr.principal/local-principal))
+  ([args principal]
+   (let [started (ops/invoke *daemon* principal :catalog/start args)]
+     (loop [n 0]
+       (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status {:job (:id started) :wait-ms 20000})]
+         (if (or (not= "running" (:status st)) (< 6 n))
+           (assoc st :room (:room started) :mode (:mode started))
+           (recur (inc n))))))))
 
 (deftest the-wiki-benchmark-runs-scores-and-adopts-on-a-durable-room
   (let [calls (atom 0)]
@@ -516,3 +524,86 @@
                 detail (ops/invoke *daemon* dvergr.principal/local-principal :scorecard/detail {:room "ledger" :id (:id sc)})]
             (is (= 1.0 (get-in detail [:leaderboard 0 :reward-mean])) (pr-str detail))
             (is (= 2 (get-in detail [:leaderboard 0 :attempts])))))))))
+
+(deftest settlement-reviews-catalog-attempts-on-a-worker
+  (let [op #(ops/invoke *daemon* dvergr.principal/local-principal %1 %2)
+        room (:id (op :room/create {:slug "auto-review"}))
+        r (ops/resolve-room *daemon* room)
+        spec {:review/checks [:fork/review-tier [:diff/only-paths ["wiki/"]] :wiki/v4]
+              :review/reviewer {:model "claude-haiku-4-5" :instructions "Check the evidence."}}
+        pages (atom (v4/reference-wiki (gen/world 1)))
+        reviewer-calls (atom 0)
+        workers (atom [])
+        pending (atom [])
+        caller (assoc dvergr.principal/local-principal :principal/delegation "wiki-delegation")
+        make-reviewer review/model-reviewer]
+    (catalog/seed! r (gen/documents (gen/world 1)))
+    (resource/mint! r {:id (random-uuid) :resources {resource/microdollars 2000000M}})
+    (with-redefs [catalog/workflows (assoc-in catalog/workflows [:wiki/v4 :review] spec)
+                  providers/ensure-initialized! (constantly nil)
+                  chat-agent/messages->api-format (fn [messages _ _] messages)
+                  review/model-reviewer
+                  (fn [daemon room world spec caller]
+                    (swap! workers conj {:delegation (:principal/delegation caller)
+                                         :spin ec/*spin-id* :thread (.getName (Thread/currentThread))})
+                    (make-reviewer daemon room world spec caller))
+                  model-chat/chat
+                  (fn [messages opts]
+                    (if (str/includes? (str (:model opts)) "haiku")
+                      (do
+                        (swap! reviewer-calls inc)
+                        (swap! pending conj (some #(= :review (:run/settlement-status %)) (run/runs r)))
+                        {:content "{:review/verdict :approve :review/reasons [] :review/concerns []}"
+                         :tool-calls nil :usage {:input-tokens 100 :output-tokens 20}
+                         :stop-reason :end-turn})
+                      (if (not-any? #(= :tool-result (or (:role %) (:message/role %))) messages)
+                        {:content ""
+                         :tool-calls (mapv (fn [[path text]]
+                                             {:id (str (random-uuid)) :name "write_file"
+                                              :input {:path path :content text}}) @pages)
+                         :usage {:input-tokens 100 :output-tokens 100} :stop-reason :tool-use}
+                        {:content "Done." :tool-calls nil
+                         :usage {:input-tokens 100 :output-tokens 10} :stop-reason :end-turn})))]
+      (let [good (run-job {:workflow "wiki/v4" :room room :models ["claude-sonnet-4-5"]} caller)
+            [merged] (op :review/list {:room room})]
+        (is (= "completed" (:status good)) (pr-str good))
+        (is (= "merged" (:decision merged)))
+        (is (= @pages (catalog/read-tree r "/wiki")))
+        (is (= :merged (:run/settlement-status (run/run r (java.util.UUID/fromString (:run merged))))))
+        (reset! pages {"/wiki/index.md" "# Broken wiki without links or front matter"})
+        (let [bad (run-job {:workflow "wiki/v4" :room room :models ["claude-sonnet-4-5"]} caller)
+              records (op :review/list {:room room})
+              escalated (first (filter #(= "escalated" (:decision %)) records))]
+          (is (= "completed" (:status bad)) (pr-str bad))
+          (is (= #{"merged" "escalated"} (set (map :decision records))))
+          (is (= 2 (count (review/reviews r))))
+          (is (= :review (:run/settlement-status (run/run r (java.util.UUID/fromString (:run escalated))))))
+          (is (some #(and (= :review/escalated (get-in % [:metadata :kind]))
+                          (= (:id escalated) (str (get-in % [:metadata :object :id]))))
+                    (d/messages r)))
+          (is (= 1 @reviewer-calls) "failed deterministic checks do not ask the model")
+          (is (= [true] @pending) "the candidate stays in review until the decision")
+          (is (= 2 (count @workers)))
+          (is (every? #(and (= "wiki-delegation" (:delegation %)) (nil? (:spin %))
+                            (str/starts-with? (:thread %) "dvergr-agent-native-")) @workers))
+          (is (every? #(= :discarded (:run/settlement-status %))
+                      (filter #(= :reviewer (:run/actor %)) (run/runs r)))))))))
+
+(deftest a-room-bundle-carries-its-review-policy-into-settlement
+  (let [room (:id (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:slug "bundle-review"}))
+        r (ops/resolve-room *daemon* room)
+        spec {:review/checks [[:diff/only-paths ["wiki/"]]] :review/on-pass :propose}]
+    (catalog/seed! r {"/workflows/notes/workflow.edn"
+                      (pr-str {:title "Notes" :task "Write notes" :review spec})
+                      "/workflows/notes/checker.clj"
+                      "(ns check) (defn check [_] {:checks {:done? true} :reward 1.0})"
+                      "/workflows/notes/fixtures/docs/brief.md" "Prepare wiki notes."})
+    (is (= spec (:review (room-wf/plan (room-wf/read-bundle r "notes") {}))))
+    (with-redefs [providers/ensure-initialized! (constantly nil)
+                  chat-agent/messages->api-format (fn [messages _ _] messages)
+                  model-chat/chat (wiki-writer (atom 0))]
+      (let [done (run-job {:workflow "bundle-review/notes" :models ["claude-haiku-4-5"]})
+            [record] (ops/invoke *daemon* dvergr.principal/local-principal :review/list {:room room})]
+        (is (= "completed" (:status done)) (pr-str done))
+        (is (= "escalated" (:decision record)))
+        (is (some #(str/includes? % "left to a person") (:reasons record)))))))

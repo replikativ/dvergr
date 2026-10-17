@@ -278,6 +278,20 @@
            (.cancel task false))))
      worker)))
 
+(defn on-worker!
+  "Call `f` on a supervised native worker in `room`, and await its result.
+   A boundary operation: never call from a Spin."
+  [room f]
+  (when ec/*spin-id*
+    (throw (ex-info "A worker boundary cannot block a Spin" {:type ::worker-boundary})))
+  (let [outcome (promise)
+        worker (start-worker! (make-supervisor (:ctx room))
+                              #(deliver outcome (try {:value (f)}
+                                                     (catch Throwable t {:error t}))))]
+    (.get ^FutureTask (:task worker))
+    (let [{:keys [value error]} @outcome]
+      (if error (throw error) value))))
+
 (defn- cancel-supervisor! [supervisor]
   (let [[tasks cancel-children]
         (locking supervisor

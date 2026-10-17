@@ -371,5 +371,24 @@ receives the token or the merge capability. `review!` revokes the token after th
 decision, also when checks fail; the callback is for one `review!` invocation.
 The principal has no discard permission in its tool pins.
 
-Next: starting the review from workflow settlement, and the reviewer benchmark
-(generated good and damaged updates: does it approve the good and escalate the bad?).
+Declare the spec under `:review` in a catalog workflow map or the bundle's
+`workflow.edn`. `catalog/plan` and `catalog.room/plan` carry it into
+`workflow/start`; `catalog_start` also accepts a room bundle as `<room>/<name>`
+(on its source room by default). A workflow without a spec retains its world
+for manual review as before. Benchmarks still discard their worlds.
+
+After each attempt settles `:review`, workflow finish commits its workspace and
+runs `review!` with the work Run's `:run-id` on a supervised native worker
+(`program/on-worker!`, using `start-worker!`). Finish waits at the boundary;
+review never blocks a Spin. The Run stays `:review` on escalation; merge and
+discard update its durable settlement status through the existing fork operations.
+When the spec names `:review/reviewer`, `model-reviewer` constructs the callback
+from `:model`, `:instructions` and optional `:timeout-ms`. Catalog jobs supply the
+daemon and invoking principal, including its `:principal/delegation` claim.
+Host callers of `workflow/start` supply `:daemon` and `:principal` (or an explicit
+`:reviewer` callback). The host-only `:on-settlement` callback receives
+`{:room :world :run-id :result}` on the same worker after review, for general
+settlement work. Its world may already have been merged or discarded.
+
+Next: the reviewer benchmark (generated good and damaged updates: does it approve
+the good and escalate the bad?).
