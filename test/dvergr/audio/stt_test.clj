@@ -1,5 +1,6 @@
 (ns dvergr.audio.stt-test
   (:require [clojure.test :refer [deftest is testing]]
+            [dvergr.test-support :as test-support]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [dvergr.audio.stt :as stt]
@@ -79,7 +80,7 @@
 
 (deftest generated-wav-chunking
   (if-not (ffmpeg?)
-    (println "SKIP ffmpeg chunking: ffmpeg is not on PATH")
+    (test-support/skip! "ffmpeg chunking: ffmpeg is not on PATH")
     (let [wav (short-wav)
           calls (atom [])]
       (with-redefs [stt/backends [{:name :test}]
