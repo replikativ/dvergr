@@ -1,6 +1,7 @@
 (ns dvergr.agent.program-test
   (:require [clojure.test :refer [deftest is testing]]
             [datahike.api :as dh]
+            [dvergr.agent.budget :as budget]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
@@ -2173,3 +2174,85 @@
           "its budget in microdollars, two admissions per model step")
       (is (resource/funded-grant? (:resources @hired)))
       (finally (d/close-room! room)))))
+
+(deftest split-divides-a-grant-among-roles
+  (is (= {:candidate {"microUSD" 500M "model-dispatch" 5M}
+          :judge {"microUSD" 333M "model-dispatch" 3M}}
+         (budget/split {"microUSD" 1000M "model-dispatch" 10M} {:candidate 1/2 :judge 1/3}))
+      "amounts round down; what is left stays with the parent")
+  (is (= {:candidate {"microUSD" 100M}}
+         (budget/split {"microUSD" 1000M "model-dispatch" 1M} {:candidate 0.1}))
+      "a coordinate that rounds to nothing is left out")
+  (is (= {} (budget/split {"microUSD" 1M} {:tiny 1/10})))
+  (is (thrown? clojure.lang.ExceptionInfo (budget/split {"microUSD" 1M} {:a 3/4 :b 1/2})))
+  (is (thrown? clojure.lang.ExceptionInfo (budget/split {"microUSD" 1M} {"a" 1/2})))
+  (is (thrown? clojure.lang.ExceptionInfo (budget/split {"microUSD" 1M} {:a 0}))))
+
+(deftest spend-sums-by-role-over-a-subtree
+  (let [[room conn] (resource-test-room :program-roles)
+        team (-> (roster/make-roster {:id :role-team})
+                 (roster/make-agent {:id :parent :program {:kind :scripted :reply :unused}})
+                 (roster/make-agent {:id :worker :program {:kind :scripted :delay-ms 400 :reply :done}}))
+        parent-runtime (promise)
+        release-parent (promise)
+        status-key (keyword "dvergr.agent.program" "status")
+        value-key (keyword "dvergr.agent.program" "value")
+        execute @#'program/execute-program
+        execute-program
+        (fn [control-room work-room run-id chat-id agent task trigger supervisor]
+          (if (= :parent (:agent/id agent))
+            (sp/spin
+             (deliver parent-runtime [supervisor work-room])
+             (sp/await (comb/sleep 100))
+             (deref release-parent 10000 nil)
+             {status-key :completed value-key :parent-done})
+            (execute control-room work-room run-id chat-id agent task trigger supervisor)))
+        consume! (fn [run-id amount]
+                   (resource/consume! room run-id {:id (random-uuid)
+                                                   :resources {resource/microdollars amount}}))]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 1000M}})
+      (with-redefs-fn
+        {#'program/execute-program execute-program}
+        (fn []
+          (binding [ec/*execution-context* (:ctx room)]
+            (let [parent (program/hire! room team :parent
+                                        {:task :coordinate :resources {resource/microdollars 1000M}})
+                  parent-id (program/run-id parent)
+                  [supervisor parent-work] (deref parent-runtime 5000 [::timeout nil])
+                  grants (budget/split {resource/microdollars 1000M} {:candidate 1/2 :judge 1/4})
+                  child (fn [role]
+                          (binding [ec/*execution-context* (:ctx parent-work)]
+                            (#'program/with-owned-child!
+                             supervisor
+                             #(program/hire-in! room parent-work team :worker
+                                                {:task role :parent-run parent-id :role role
+                                                 :resources (get grants role)}))))
+                  candidate (child :candidate)
+                  judge (child :judge)]
+              (is (not= ::timeout supervisor))
+              (consume! (program/run-id candidate) 120M)
+              (consume! (program/run-id judge) 30M)
+              (consume! parent-id 7M)
+              (is (= :candidate (:run/role (run/run room (program/run-id candidate))))
+                  "the role is part of the durable Run")
+              (testing "while the children still hold their grants"
+                (is (= {:candidate {resource/microdollars 120M}
+                        :judge {resource/microdollars 30M}
+                        :unassigned {resource/microdollars 7M}}
+                       (budget/spend-by-role room parent-id))))
+              (binding [ec/*execution-context* (:ctx parent-work)]
+                (deref candidate 5000 ::timeout)
+                (deref judge 5000 ::timeout))
+              (deliver release-parent true)
+              (is (= :parent-done (:run/value (deref parent 10000 ::timeout))))
+              (testing "after every wallet returned what it left"
+                (is (= {:candidate {resource/microdollars 120M}
+                        :judge {resource/microdollars 30M}
+                        :unassigned {resource/microdollars 7M}}
+                       (budget/spend-by-role room parent-id)))
+                (is (= {resource/microdollars 843M} (resource/balance room))))))))
+      (finally
+        (deliver release-parent true)
+        (deliver parent-runtime [::closed nil])
+        (close-resource-test-room! room conn)))))

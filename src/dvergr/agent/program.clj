@@ -1206,7 +1206,7 @@
     (execute-deterministic-program run-id agent task)))
 
 (def ^:private hire-option-keys
-  #{:task :from :parent-run :settlement :resources :limits})
+  #{:task :from :parent-run :settlement :resources :limits :role})
 
 (defn- validate-program!
   [{:keys [kind delay-ms max-model-steps budget-dollars auto-compact? compaction-model]
@@ -1265,7 +1265,7 @@
     program))
 
 (defn- validate-hire!
-  [roster agent-ref {:keys [task from parent-run resources limits] :as opts}]
+  [roster agent-ref {:keys [task from parent-run resources limits role] :as opts}]
   (when-let [unknown (seq (remove hire-option-keys (keys opts)))]
     (throw (ex-info "Unknown hire! options"
                     {:type ::unknown-hire-options
@@ -1280,6 +1280,9 @@
   (when (and parent-run (not (uuid? parent-run)))
     (throw (ex-info "hire! :parent-run must be a UUID"
                     {:type ::invalid-parent-run :parent-run parent-run})))
+  (when (and (contains? opts :role) (not (keyword? role)))
+    (throw (ex-info "hire! :role must be a keyword"
+                    {:type ::invalid-role :role role})))
   (when (and (some? resources)
              (not (and (map? resources)
                        (seq resources)
@@ -1715,7 +1718,7 @@
    is already durable at that point so a setup failure remains causally valid.
    This entry point is deliberately absent from the SCI surface."
   [control-room world-parent roster agent-ref
-   {:keys [task from parent-run settlement resources limits]
+   {:keys [task from parent-run settlement resources limits role]
     :or {from :repl settlement :automatic}
     :as raw-opts}
    prepare-world! & [protocol {resume-from :resume snapshots :snapshots preset-id :id
@@ -1774,7 +1777,10 @@
                             :run/settlement-status :open}
                      (= :llm (get-in agent [:agent/program :kind]))
                      (assoc :run/chat-id chat-id)
-                     (:roster/id roster) (assoc :run/roster (:roster/id roster)))]
+                     (:roster/id roster) (assoc :run/roster (:roster/id roster))
+                     ;; the part the Run plays for its parent, which its spend
+                     ;; is summed under (`dvergr.agent.budget/spend-by-role`)
+                     role (assoc :run/role role))]
     ;; Reserve durable Run ownership before any trigger effect. Teardown either
     ;; fences us out here or includes this Run in its fixed drain set; it can
     ;; never miss an orphan trigger between posting and admission.

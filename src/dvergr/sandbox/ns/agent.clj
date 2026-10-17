@@ -205,6 +205,7 @@
    [:from {:optional true} :keyword]
    [:parent-run {:optional true} :uuid]
    [:settlement {:optional true} [:enum :automatic :review :discard]]
+   [:role {:optional true} :keyword]
    [:resources {:optional true}
     [:map-of {:min 1} [:or :string :keyword] [:and 'number? 'pos?]]]
    [:limits {:optional true}
@@ -697,7 +698,14 @@
                                control-room (control-room! work-room)]
                            (if-let [run-id (:parent-run agent-program-ceiling)]
                              (run-balance* control-room run-id)
-                             (room-balance* control-room))))]
+                             (room-balance* control-room))))
+        ;; the current Run's subtree only, as `inspect`: no parent or sibling
+        spend-by-role-fn (fn []
+                           (let [run-id (or (:parent-run agent-program-ceiling)
+                                            (throw (ex-info "spend-by-role needs a current Run"
+                                                            {:type ::no-current-run})))]
+                             ((requiring-resolve 'dvergr.agent.budget/spend-by-role)
+                              (control-room! (room!)) run-id)))]
     (sci/add-namespace!
      sci-ctx 'dvergr.agent
      (doc/with-docs
@@ -727,6 +735,9 @@
         'cancel!      (gated effects (fn [handle] {:effect :run/cancel :resource {:run (str (or (:run/id handle) handle))}})
                              cancel-fn)
         'balance      balance-fn
+        'split        (fn [resources shares]
+                        ((requiring-resolve 'dvergr.agent.budget/split) resources shares))
+        'spend-by-role spend-by-role-fn
         'run-id       (via-var run-id*)
         'result-spin  result-spin-fn
         'owned-result-spin owned-result-spin-fn}
@@ -745,13 +756,15 @@
            experiment   [([spec]) "Create a portable full-factorial ExperimentDef. Requires a DatasetDef and a non-empty vector of AgentDefs; repetitions default to one. Candidates bind exact AgentDef content. Concurrency and admission ceilings remain host policy."]
            experiment-ref [([experiment]) "Return the stable logical/version/content reference for one exact ExperimentDef. Running and trusted scoring remain host-owned capabilities."]
            room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
-           hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (dvergr.agent/hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it). Unknown keys are rejected."]
+           hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (dvergr.agent/hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it); :role, a keyword naming the part the child plays (:candidate, :judge, ...), which its spend is summed under (see `split`). Unknown keys are rejected."]
            run-experiment! [([roster experiment] [roster experiment opts]) "Run an ExperimentDef as a sub-experiment of the current Run: a job Run (its child) whose cells are attempts in worlds forked from the current Room/world, scored only by verifiers this host offers (see `offered`), certified with this Run's records. Candidates are held to the same program ceiling as `hire!`. Returns a Spin resolving to {:job uuid :status :completed|:failed|:cancelled :scorecard ScorecardDef (when completed) :error string}. Cancelling the current Run cancels it. opts: :parallelism (default 1)."]
            offered      [([]) "The verifier and world-setup refs this host offers to experiments: {:evaluators [ref ...] :world-setups [ref ...]}."]
            observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
            inspect      [([] [opts]) "Inspect the current Run and its structural descendants as one bounded snapshot of Runs, frontier, correlated messages, semantic activities, failures, and conserved balances. Inside a hired agent this cannot see parent or sibling Runs, and inspection without an ambient Run fails closed. A durable semantic receipt identifies the inspection. Options: :run-limit, :message-limit, :content-limit, :content-budget, :detail-limit."]
            cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
            balance      [([]) "Return the conserved resource vector available to the current Run, or the Room root at top level."]
+           split        [([resources shares]) "Divide a resource vector among roles: (dvergr.agent/split (dvergr.agent/balance) {:candidate 1/2 :judge 1/4}) returns {role grant}, each a :resources map for `hire!` with that :role. Shares are positive fractions summing to at most 1; amounts round down, and what is left stays with the current Run."]
+           spend-by-role [([]) "What the current Run and its descendants consumed, summed by each Run's :role (:unassigned without one): {role resource-vector}, read from the ledger."]
            run-id       [([handle]) "Return the durable Run UUID represented by a RunHandle."]
            result-spin  [([handle]) "Return a passive Spindel observer Spin for a RunHandle. On resolution the current Run durably records the child as a causal input. Multiple observers may await it; cancelling an observer does not cancel the Run. The Spin resolves to the result map {:run/id uuid :run/status :completed|:waiting|:cancelled|:failed :run/value … :run/world … :run/settlement-status …} (plus :run/output/:run/reason/:run/error/:run/metrics as applicable)."]
            owned-result-spin [([handle]) "Return an ownership-coupled result Spin. On resolution the current Run durably records the child as a causal input. Cancelling this observer also cancels the underlying Run; use only when the observer owns that child execution. Resolves to the same result map as `result-spin`."]}
@@ -777,6 +790,8 @@
                             [:=> [:cat InspectOpts] Observation]]
           'cancel!         [:=> [:cat [:or :uuid RunHandle]] :boolean]
           'balance         [:=> [:cat] Balance]
+          'split           [:=> [:cat Balance [:map-of :keyword 'number?]] [:map-of :keyword Balance]]
+          'spend-by-role   [:=> [:cat] [:map-of :keyword Balance]]
           'run-id          [:=> [:cat RunHandle] :uuid]
           'result-spin     [:=> [:cat RunHandle] :any]
           'owned-result-spin [:=> [:cat RunHandle] :any]})))))

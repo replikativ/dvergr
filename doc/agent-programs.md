@@ -331,7 +331,10 @@ calls: microdollars and model dispatch admissions
 child's calls are admitted from its own grant and each dispatch reserves a bound
 of its cost before it leaves (`dvergr.resource/reserve-dispatch!`), so the
 parent's grant bounds what the child can spend; what it leaves returns to the
-parent. Provider calls made from the Run's own sandbox (`llm/call`), and model
+parent. A child may be hired with a `:role` (`:candidate`, `:judge`, ...): `split`
+divides a grant among roles, and `spend-by-role` sums what the current Run's
+subtree consumed by role (`dvergr.agent.budget`). Provider calls made from the
+Run's own sandbox (`llm/call`), and model
 candidates of an experiment it runs, stay closed. A top-level Room REPL has no
 such program-kind ceiling.
 

@@ -86,7 +86,7 @@
   #{:run/roster :run/agent-version :run/program-kind
     :run/interpreter-version :run/agent-def-hash :run/chat-id
     :run/world :run/isolation :run/settlement-policy
-    :run/settlement-status :run/settlement-reason})
+    :run/settlement-status :run/settlement-reason :run/role})
 
 (defn- public-entry [entry]
   (:run entry))
