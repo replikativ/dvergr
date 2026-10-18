@@ -9,6 +9,7 @@
             [dvergr.resource :as resource]
             [dvergr.rooms.forks :as forks]
             [kontor.resource :as kontor]
+            [org.replikativ.spindel.effects.savepoint :as savepoint]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]))
 
@@ -35,6 +36,13 @@
                                                ;; resuming: the systems as the
                                                ;; savepoint recorded them
                                                :snapshots snapshots
+                                               ;; Hiring starts an independent computation,
+                                               ;; not a continuation of the parent's session.
+                                               :state-updates
+                                               (savepoint/independent-fork-state
+                                                (savepoint/derive-seed
+                                                 (savepoint/seed (:ctx parent))
+                                                 :dvergr/run run-id))
                                               ;; A hired agent receives the
                                               ;; durable substrate of its
                                               ;; parent world, but constructs

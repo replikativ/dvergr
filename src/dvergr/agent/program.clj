@@ -55,7 +55,7 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 8)
+(def interpreter-version 9)
 
 (def ^:private default-max-model-steps 32)
 
@@ -951,20 +951,19 @@
        (continue!)))))
 
 (defn- install-turn-savepoints!
-  "Make LLM Runs in `work-room` resumable: its world (and every fork of it)
-   persists their turn savepoints, under a savepoint session of the world
-   (persisting needs one). A nested Run's world inherits its parent's session;
-   only a world without one opens its own. Returns the session opened, to close
-   with the Run, or nil."
+  "Own an independent session for this Run. Its ordinary savepoint forks share
+   it, but hired Runs open their own; all funded worlds must settle before
+   their owning Run returns its wallet. LLM turn savepoints are persisted by
+   the installed handler."
   [control-room work-room]
   (let [world (:ctx work-room)
         table {:conversation/turn turn-savepoint-handler}]
-    (if (savepoint/session world)
-      (do (savepoint/install-handlers! world table) nil)
-      ;; the session's forks spend the Run's budget, on the one ledger
-      (savepoint/open! world (cond-> {:handlers table :purpose :run}
-                               (satisfies? room-store/PResourceStore (:store control-room))
-                               (assoc :authority (authority/authority control-room)))))))
+    ;; world/open! masks inherited session state at fork creation. Opening must
+    ;; fail rather than silently reuse another computation's cleanup owner.
+    (savepoint/open! world (cond-> {:handlers table :purpose :run
+                                    :seed (savepoint/seed world)}
+                             (satisfies? room-store/PResourceStore (:store control-room))
+                             (assoc :authority (authority/authority control-room))))))
 
 (defn- close-session-reconciled!
   "Financial cleanup is an ownership fence, not a best-effort timeout.
@@ -1932,20 +1931,23 @@
                      (contains? host-options :delegation-policy)
                      (assoc :delegation-policy (:delegation-policy host-options)))
         session-close (atom nil)
-        _ (when (and (= :llm (get-in agent [:agent/program :kind])) (:store control-room))
-            (when-let [session (install-turn-savepoints! control-room work-room)]
-              (let [close-session! #(close-session-reconciled! session)]
-                (try
+        close-owned-session! #(when-let [close! @session-close] (close!))
+        _ (when (:store control-room)
+            (try
+              (when-let [session (install-turn-savepoints! control-room work-room)]
+                (let [close-session! #(close-session-reconciled! session)]
+                  (reset! session-close close-session!)
                   (when on-world (on-world work-room session))
-                  (catch Throwable t
-                    ;; Not admitted: the world and its session were never the
-                    ;; Run's. Drop them and keep the setup error.
-                    (try (close-session!) (catch Throwable _ nil))
-                    (try ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
-                         (catch Throwable _ nil))
-                    (throw t)))
-                (reset! session-close close-session!)
-                (register-cleanup! supervisor close-session!))))
+                  (register-cleanup! supervisor close-session!)))
+              (catch Throwable t
+                ;; Creation-time masking guarantees this cannot be the parent
+                ;; Session, even when installation failed partway through.
+                (when-let [session (savepoint/session (:ctx work-room))]
+                  (close-session-reconciled! session))
+                (try ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
+                     (catch Throwable cleanup-error
+                       (.addSuppressed t cleanup-error)))
+                (throw t))))
         allocation-state
         (atom (if (seq resources) :not-started :not-requested))
         ;; Private Run facts are still Room messages, but never addressed to an
@@ -1977,8 +1979,7 @@
       (catch Throwable t
         ;; Drop the world the Run never owned, by its own policy (a deferred
         ;; world refuses a plain discard), and keep the admission error.
-        (when-let [close-session! @session-close]
-          (try (close-session!) (catch Throwable _ nil)))
+        (close-owned-session!)
         (try ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
              (catch Throwable _ nil))
         (throw t)))
@@ -1993,6 +1994,7 @@
     (try
       (d/post! control-room trigger)
       (catch Throwable t
+        (close-owned-session!)
         (let [{:keys [result finish-opts]}
               (settlement-result
                run-world
@@ -2016,6 +2018,7 @@
           ;; before publishing the failed Run; hire! retains its synchronous
           ;; admission-failure contract without leaking a committed grant.
           (when (seq resources) (reset! allocation-state :uncertain))
+          (close-owned-session!)
           (return-unused-resources! control-room id grantor allocation-state)
           (let [{:keys [status reason]} (world/settle! run-world :failed)]
             (run/finish! id :failed {:reason :resource-allocation-failed
@@ -2029,9 +2032,10 @@
       (try
         (run/claim-resume! control-room predecessor id)
         (catch Throwable t
+          (close-owned-session!)
+          (return-unused-resources! control-room id grantor allocation-state)
           ;; the claim write may have committed although it reported an error
           (run/withdraw-resume-claim! control-room predecessor id)
-          (return-unused-resources! control-room id grantor allocation-state)
           (let [{:keys [status reason]} (settle-unadmitted! run-world)]
             (run/finish-durably! id :failed (cond-> {:reason :resume-claim-failed :error t}
                                               status (assoc :settlement-status status
@@ -2145,11 +2149,12 @@
           ;; Not admitted to the watcher: nothing executed, and nothing waits.
           (when @finalizing?
             (throw t))
+          (close-owned-session!)
+          (return-unused-resources! control-room id grantor allocation-state)
           (when-let [predecessor (:from resume-from)]
             ;; First, and whatever fails after: the predecessor is as it was
             ;; before the claim.
             (run/withdraw-resume-claim! control-room predecessor id))
-          (return-unused-resources! control-room id grantor allocation-state)
           (let [{:keys [status reason]} (settle-unadmitted! run-world)]
             (run/finish-durably! id :failed (cond-> {:reason :spawn-failed :error t}
                                               status (assoc :settlement-status status
