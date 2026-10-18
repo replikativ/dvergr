@@ -249,7 +249,8 @@
     (if state
       (do
         (when (or (not= (:fork-id ctx) (:fork-id state))
-                  (= :unfunded (:kind state)))
+                  (= :unfunded (:kind state))
+                  (contains? #{:pending :refused} (:funding state)))
           (throw (ex-info "World has no owned spending authority"
                           {:type ::unfunded-world :fork-id (:fork-id ctx)})))
         (let [room (or (get @ledger-rooms (:room-id state))

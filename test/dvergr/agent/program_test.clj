@@ -30,6 +30,7 @@
             [kontor.governance :as kontor-governance]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.effects.await :refer [await]]
+            [org.replikativ.spindel.effects.savepoint :as savepoint]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.spin.core :as spin-core]
@@ -1328,6 +1329,41 @@
                   "cancellation may win before or after the worker acknowledges step two")
               (is (uuid? (get-in result [:run/metrics :prompt-id])))))))
       (finally
+        (d/close-room! room)))))
+
+(deftest session-recovery-retains-supervisor-until-close-acknowledges
+  (let [room (test-room :program-session-recovery)
+        supervisor (binding [ec/*execution-context* (:ctx room)]
+                     (#'program/make-supervisor (:ctx room)))
+        attempts (atom 0)
+        second-attempt (promise)
+        first-error (ex-info "refund unavailable" {})]
+    (try
+      (with-redefs [savepoint/close!
+                    (fn [_]
+                      (fn [resolve reject]
+                        (if (= 1 (swap! attempts inc))
+                          (reject first-error)
+                          (deliver second-attempt resolve))))]
+        (binding [ec/*execution-context* (:ctx room)]
+          (#'program/register-cleanup!
+           supervisor #(#'program/close-session-reconciled! {:id ::session}))
+          (#'program/mark-cleanup-safe! supervisor)
+          (#'program/seal-supervisor! supervisor)
+          (let [ack (deref second-attempt 5000 ::timeout)]
+            (is (fn? ack))
+            (is (= 2 @attempts) "a rejected close retries")
+            (is (false? (:quiesced? @(:state supervisor))))
+            (is (= :running (:cleanup-phase @(:state supervisor))))
+            (is (= 1 (count (:workers @(:state supervisor))))
+                "the cleanup lease retains the session and fences wallet return")
+            (when (fn? ack) (ack :closed))
+            (is (.await ^java.util.concurrent.CountDownLatch
+                 (:quiesced-latch supervisor) 5000
+                        java.util.concurrent.TimeUnit/MILLISECONDS))
+            (is (nil? (:cleanup-error @(:state supervisor)))))))
+      (finally
+        (when-let [ack (deref second-attempt 1000 nil)] (ack :closed))
         (d/close-room! room)))))
 
 (deftest llm-cleanup-failure-retains-collected-metrics

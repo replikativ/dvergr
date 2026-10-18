@@ -966,6 +966,34 @@
                                (satisfies? room-store/PResourceStore (:store control-room))
                                (assoc :authority (authority/authority control-room)))))))
 
+(defn- close-session-reconciled!
+  "Financial cleanup is an ownership fence, not a best-effort timeout.
+   Keep the session and its live recovery handles reachable until close has
+   acknowledged success. Never start a second close while the first is still
+   in flight; a slow callback is not evidence that the operation failed."
+  [session]
+  (loop [delay-ms 25]
+    (let [done (promise)
+          _ (try
+              ((savepoint/close! session)
+               (fn [_] (deliver done {:closed? true}))
+               (fn [error] (deliver done {:error error})))
+              (catch Throwable error
+                (deliver done {:error error})))
+          ;; Cleanup workers are never cancelled with execution workers. A
+          ;; failed close retains this worker lease while the scope owns the
+          ;; unreturned funds; no terminal Run or parent refund can overtake it.
+          {:keys [closed? error]} @done]
+      (if closed?
+        :closed
+        (do
+          (tel/log! {:level :warn :id ::session-cleanup-recovery
+                     :data {:session/id (:id session)
+                            :retry-ms delay-ms :error (ex-message error)}}
+                    "Savepoint cleanup failed; retaining Run ownership for recovery")
+          (Thread/sleep delay-ms)
+          (recur (min 1000 (* 2 delay-ms))))))))
+
 (defn- turn-savepoint!
   "Publish the gap after model step `step` of Run `run-id` as a savepoint in
    the work world (where its systems are, so the portable form records their
@@ -1906,11 +1934,7 @@
         session-close (atom nil)
         _ (when (and (= :llm (get-in agent [:agent/program :kind])) (:store control-room))
             (when-let [session (install-turn-savepoints! control-room work-room)]
-              (let [close-session!
-                    #(let [done (promise)]
-                       ((savepoint/close! session) (fn [_] (deliver done :closed))
-                                                   (fn [e] (deliver done e)))
-                       (deref done 10000 :timeout))]
+              (let [close-session! #(close-session-reconciled! session)]
                 (try
                   (when on-world (on-world work-room session))
                   (catch Throwable t
