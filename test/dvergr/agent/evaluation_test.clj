@@ -920,23 +920,32 @@
 
 (deftest admission-and-execution-share-one-budget
   (let [entered (promise) release (promise)
+        deadlines (atom [])
         room (d/make-room {:id :evaluation-shared-deadline
                            :store (->BlockingStartStore (memory/make) entered release)})
         team (roster/make-agent (roster/make-roster)
-                                {:id :candidate :program {:kind :scripted :delay-ms 800 :reply "late"}})
+                                {:id :candidate :program {:kind :scripted :delay-ms 60000 :reply "late"}})
         env (definition :test/shared-deadline
-              {:limits {:timeout-ms 1000 :cancel-timeout-ms 2000}})]
+              {:limits {:timeout-ms 60000 :cancel-timeout-ms 5000}})]
     (try
       (binding [ec/*execution-context* (:ctx room)]
-        (let [result (future @(evaluation/evaluate room team :candidate env exact-evaluator))]
-          (is (uuid? (deref entered 2000 ::timeout)))
-          (Thread/sleep 500)
-          (deliver release true)
-          (let [attempt (deref result 5000 ::timeout)]
-            (is (not= ::timeout attempt))
-            (is (true? (get-in attempt [:attempt-receipt :attempt/metrics :timed-out?])))
-            (is (not= :completed (get-in attempt [:run/result :run/status]))))
-          (is (empty? (run/active-runs (:id room))))))
+        (with-redefs-fn
+          {#'evaluation/remaining-ms
+           (fn [deadline]
+             ;; Admission has time; once it completes the same deadline is
+             ;; exhausted. No race between wall-clock sleep and CI scheduling.
+             (if (= 1 (count (swap! deadlines conj deadline))) 60000 0))}
+          (fn []
+            (let [result (future @(evaluation/evaluate room team :candidate env exact-evaluator))]
+              (is (uuid? (deref entered 10000 ::timeout)))
+              (deliver release true)
+              (let [attempt (deref result 10000 ::timeout)]
+                (is (not= ::timeout attempt))
+                (is (true? (get-in attempt [:attempt-receipt :attempt/metrics :timed-out?])))
+                (is (not= :completed (get-in attempt [:run/result :run/status]))))
+              (is (<= 2 (count @deadlines)))
+              (is (apply = @deadlines) "execution must not start a fresh deadline")
+              (is (empty? (run/active-runs (:id room))))))))
       (finally
         (deliver release true)
         (d/close-room! room)))))
