@@ -121,6 +121,7 @@
    before retrying. Authentication headers are never returned in errors or
    telemetry by this layer."
   [request]
+  (resource/require-model-scope!)
   (let [request (governed-client request)
         {authorized :request auth :auth} (authorize request)
         response (dispatch! authorized)]

@@ -258,10 +258,29 @@
             (throw (ex-info "World's resource ledger is unavailable"
                             {:type ::resource-store-unavailable :room-id (:room-id state)})))
           (case (:kind state)
-            :run (spend-wallet room (:run-id state))
+            :run {:room room :run-id (:run-id state) :wallet (:wallet state)}
             :world {:room room :wallet (:wallet state)}
             (throw (ex-info "Unknown world funding state" {:type ::invalid-world-wallet})))))
       bound)))
+
+(defn- monetary-payer []
+  (when-let [{:keys [room run-id] :as payer} (current-payer)]
+    ;; Identity does not depend on the money coordinate: admission-only Runs
+    ;; still own a payer, but monetary accounting remains opt-in.
+    (if run-id (spend-wallet room run-id) payer)))
+
+(defn require-model-scope!
+  "A dispatch-governed context cannot lose governance on another thread.
+   Money-only legacy Runs keep their accounting without admission enforcement;
+   an explicitly unfunded speculative child is not a legacy Run."
+  []
+  (when-let [state (some-> ec/*execution-context* (rtp/get-state [:dvergr/wallet]))]
+    (let [{:keys [room run-id]} (current-payer)
+          funded? (or (= :world (:kind state))
+                      (and run-id (model-scope room run-id)))]
+      (when (and funded? (nil? *model-scope*))
+        (throw (ex-info "Funded world dispatch requires a host model-call scope"
+                        {:type ::missing-model-scope :fork-id (:fork-id ec/*execution-context*)}))))))
 
 (defn- world-charge
   "Where a charge made now goes, and the ordinal of its debit.
@@ -277,7 +296,7 @@
   (let [bound *spend-wallet*
         ctx ec/*execution-context*
         state (some-> ctx (rtp/get-state [:dvergr/wallet]))
-        payer (current-payer)]
+        payer (monetary-payer)]
     (cond
       (and payer (= :world (:kind state)))
       {:payer payer
@@ -479,7 +498,8 @@
    monetary reservation, but still needs its model-call scope and consumes
    admission at the gateway. An unknown/invalid bound is refused."
   []
-  (when-let [payer (when *model-scope* (current-payer))]
+  (require-model-scope!)
+  (when-let [payer (when *model-scope* (monetary-payer))]
     (let [amount *dispatch-bound*]
       (when-not (and (number? amount) (Double/isFinite (double amount)) (not (neg? amount)))
         (throw (ex-info "A funded model dispatch needs a bound on its cost: a priced model, an output limit, no remote content"
@@ -640,6 +660,7 @@
    an admission pays for an egress, not for a result, so unlike a spend debit
    (`charge-spend!`) its id is fresh on purpose."
   []
+  (require-model-scope!)
   (when-let [{:keys [room run-id cancel?]} *model-scope*]
     (when (or (.isInterrupted (Thread/currentThread)) (and cancel? (cancel?)))
       (throw (java.util.concurrent.CancellationException. "Model admission cancelled")))

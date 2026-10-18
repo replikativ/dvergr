@@ -11,6 +11,7 @@
             [dvergr.chat.context :as chat-context]
             [dvergr.chat.schema :as chat-schema]
             [dvergr.model.providers :as providers]
+            [dvergr.model.gateway :as gateway]
             [dvergr.discourse :as d]
             [dvergr.resource :as resource]
             [dvergr.resource.authority :as authority]
@@ -86,6 +87,12 @@
         scope (open-scope auth)]
     (try
       (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10M}})
+      (let [unfunded (:child-ctx (cps #(world-scope/fork! scope root nil %1 %2)))]
+        (binding [ec/*execution-context* unfunded
+                  resource/*spend-wallet* (resource/spending (resource/room-spend-wallet room) [:room-child])]
+          (is (thrown? clojure.lang.ExceptionInfo (resource/charge-spend! 1M))))
+        (is (thrown? clojure.lang.ExceptionInfo (authority/wallet-of room unfunded)))
+        (is (= 10M (get (resource/balance room) resource/microdollars))))
       (let [parent (:child-ctx (cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2)))
             account (authority/wallet-of room parent)
             nested (open-scope auth)]
@@ -161,6 +168,146 @@
           (run/finish! run-id :completed))
         (kontor-governance/ungovern! conn)
         (d/close-room! room)))))
+
+(deftest admission-only-run-does-not-fall-back-to-a-foreign-model-scope
+  (let [[room conn] (ledger-room)
+        parent (random-uuid)
+        child (random-uuid)]
+    (try
+      (resource/install-unit! room {:symbol resource/model-dispatches :name "admission" :precision 0})
+      (resource/mint! room {:id (random-uuid) :resources {resource/model-dispatches 3M}})
+      (let [trigger (d/message :test :_runs "admission-only" nil {:role :user})]
+        (d/post! room trigger)
+        (doseq [id [parent child]] (run/start! room :test trigger nil {:id id})))
+      (resource/allocate-run! room parent nil {resource/model-dispatches 2M})
+      (resource/allocate-run! room child nil {resource/model-dispatches 1M})
+      (let [world (run-world/open! room child :discard)]
+        (try
+          (binding [ec/*execution-context* (:ctx (:work world))
+                    resource/*model-scope* (resource/model-scope room parent)]
+            (resource/admit-model-dispatch!)
+            (is (nil? (resource/charge-spend! 1M)) "no monetary coordinate still means recording-only"))
+          (is (= {resource/model-dispatches 2M} (resource/run-balance room parent)))
+          (is (= {} (resource/run-balance room child)))
+          (binding [ec/*execution-context* (:ctx (:work world))
+                    resource/*model-scope* nil]
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"host model-call scope"
+                                  (resource/admit-model-dispatch!)))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"host model-call scope"
+                                  (resource/reserve-dispatch!)))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"host model-call scope"
+                                  (gateway/request! {}))))
+          (finally (run-world/settle! world :cancelled))))
+      (finally
+        (doseq [id [child parent]] (run/finish! id :completed))
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))
+
+(deftest legacy-money-only-runs-retain-native-gateway-accounting
+  (let [[room conn] (ledger-room)
+        id (random-uuid)
+        called (atom 0)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10M}})
+      (let [trigger (d/message :test :_runs "legacy-money-only" nil {:role :user})]
+        (d/post! room trigger)
+        (run/start! room :test trigger nil {:id id}))
+      (resource/allocate-run! room id nil {resource/microdollars 10M})
+      (let [world (run-world/open! room id :discard)]
+        (try
+          (binding [ec/*execution-context* (:ctx (:work world))
+                    resource/*model-scope* (resource/model-scope room id)
+                    resource/*spend-wallet* (resource/spending (resource/spend-wallet room id) [:legacy id])
+                    gateway/*request-fn* (fn [_] (swap! called inc) {:status 200})]
+            (is (nil? resource/*model-scope*))
+            (is (= 200 (:status (gateway/request!
+                                 {:url "https://model.test/responses" :method :post
+                                  :credentials (gateway/static-credentials :test {} #{"https://model.test"})}))))
+            (is (= 1M (:charged (resource/charge-spend! 1M)))))
+          (is (= 1 @called))
+          (is (= {resource/microdollars 9M} (resource/run-balance room id)))
+          (finally (run-world/settle! world :cancelled))))
+      (finally
+        (run/finish! id :completed)
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))
+
+(deftest escrow-arrival-never-overwrites-an-owned-wallet
+  (doseq [empty? [true false]]
+    (let [[room conn] (ledger-room)
+          root (context/create-execution-context)
+          auth (authority/authority room)
+          scope (open-scope auth)
+          key (random-uuid)]
+      (try
+        (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10M}})
+        (let [source (:child-ctx (cps #(world-scope/fork! scope root {:grant {resource/microdollars 2M}} %1 %2)))
+              arrival (:child-ctx (cps #(world-scope/fork! scope root {:grant {resource/microdollars 3M}} %1 %2)))
+              wallet (authority/wallet-of room arrival)]
+          (when empty? (binding [ec/*execution-context* source] (resource/charge-spend! 2M)))
+          (world-scope/escrow! auth source key)
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unfunded world"
+                                (world-scope/claim! auth key arrival)))
+          (is (= wallet (authority/wallet-of room arrival)))
+          (is (= 3M (usd room wallet)))
+          ;; The rejected claim did not consume the escrow either.
+          (let [unfunded (:child-ctx (cps #(world-scope/fork! scope root nil %1 %2)))]
+            (world-scope/claim! auth key unfunded))
+          (close-scope scope)
+          (is (= (if empty? 8M 10M) (get (resource/balance room) resource/microdollars))))
+        (finally
+          (close-scope scope)
+          (context/stop-context! root)
+          (kontor-governance/ungovern! conn)
+          (d/close-room! room))))))
+
+(deftest committed-grants-with-lost-acknowledgements-are-reconciled
+  (doseq [copy? [false true]]
+    (let [[room conn] (ledger-room)
+          root (context/create-execution-context)
+          grants (atom 0)
+          lost? (atom false)
+          armed? (atom false)
+          st (:store room)
+          ;; Intercept the actual protocol implementation. with-redefs on the
+          ;; protocol Var does not intercept compiled interface dispatch.
+          fault-store (reify room-store/PResourceStore
+                        (-open-resource-wallet! [_ spec] (room-store/-open-resource-wallet! st spec))
+                        (-install-resource-unit! [_ spec] (room-store/-install-resource-unit! st spec))
+                        (-allocate-resource-wallet! [_ wallet transfer]
+                          (room-store/-allocate-resource-wallet! st wallet transfer))
+                        (-resource-balance [_ account] (room-store/-resource-balance st account))
+                        (-resource-receipt [_ id] (room-store/-resource-receipt st id))
+                        (-transfer-resources! [_ command]
+                          (let [result (room-store/-transfer-resources! st command)]
+                            (when (and @armed? (= :grant (:kind command))
+                                       (= (if copy? 2 1) (swap! grants inc))
+                                       (compare-and-set! lost? false true))
+                              (throw (ex-info "committed grant acknowledgement lost" {})))
+                            result)))
+          auth (authority/authority (assoc room :store fault-store))
+          scope (open-scope auth)]
+      (try
+        (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10M}})
+        (let [parent (when copy?
+                       (:child-ctx (cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2))))
+              children
+              (do
+                (reset! armed? true)
+                (if copy?
+                  (cps #(world-scope/copy! scope parent 2 {:split? true} %1 %2))
+                  [(cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2))]))]
+          (is @lost?)
+          (is (= (if copy? 3 2) @grants) "the exact committed command was replayed once")
+          (is (= (if copy? [2M 2M] [4M])
+                 (mapv #(usd room (authority/wallet-of room (:child-ctx %))) children)))
+          (close-scope scope)
+          (is (= 10M (get (resource/balance room) resource/microdollars))))
+        (finally
+          (close-scope scope)
+          (context/stop-context! root)
+          (kontor-governance/ungovern! conn)
+          (d/close-room! room))))))
 
 (deftest a-scope-fork-moves-ledger-budget
   (let [[room conn] (ledger-room)

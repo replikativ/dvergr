@@ -47,9 +47,17 @@
     ;; duplicated authority (Run allocations have their own atomic path)
     (store/-open-resource-wallet! (store! room) (cond-> {:id wallet-id :name (str "world " (:fork-id ctx))}
                                                   owner (assoc :owner owner)))
-    (store/-transfer-resources! (store! room)
-                                {:id transfer-id :kind :grant :source source :destination account
-                                 :resources resources :effective-date (java.util.Date.)})
+    (let [command {:id transfer-id :kind :grant :source source :destination account
+                   :resources resources :effective-date (java.util.Date.)}]
+      (try
+        (store/-transfer-resources! (store! room) command)
+        (catch Throwable error
+          ;; A committed grant can lose its acknowledgement. Replaying the
+          ;; exact command asks the ledger to verify identity, never moves it
+          ;; twice, and only then exposes the child's owned wallet.
+          (if (store/-resource-receipt (store! room) transfer-id)
+            (store/-transfer-resources! (store! room) command)
+            (throw error)))))
     (rtp/swap-state! ctx [:dvergr/wallet] (constantly {:kind :world :fork-id (:fork-id ctx)
                                                        :account account :wallet wallet-id :room-id (:id room) :from source}))
     account))
@@ -105,6 +113,11 @@
           claimed (stable-id :dvergr/claim key)]
       (when (store/-resource-receipt (store! room) claimed)
         (throw (ex-info "The escrow was claimed already" {:type ::claimed :key key})))
+      ;; Arrival installs a new wallet, never replaces a still-owned one.
+      (let [{:keys [kind fork-id account]} (rtp/get-state context [:dvergr/wallet])]
+        (when (and (= fork-id (:fork-id context)) account (contains? #{:world :run} kind))
+          (throw (ex-info "Escrow arrival must be an unfunded world"
+                          {:type ::funded-arrival :fork-id fork-id}))))
       (let [left (remaining room escrow)]
         (if left
           (do (open-funded-wallet! room context (stable-id :dvergr/world-wallet (:fork-id context))
