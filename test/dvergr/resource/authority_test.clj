@@ -5,6 +5,8 @@
             [datahike.api :as dh]
             [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
+            [dvergr.agent.run :as run]
+            [dvergr.agent.world :as run-world]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as chat-context]
             [dvergr.chat.schema :as chat-schema]
@@ -76,6 +78,89 @@
 
 (defn- usd [room account]
   (get (room-store/-resource-balance (:store room) account) resource/microdollars 0M))
+
+(deftest an-unfunded-descendant-cannot-spend-or-return-its-ancestors-wallet
+  (let [[room conn] (ledger-room)
+        root (context/create-execution-context)
+        auth (authority/authority room)
+        scope (open-scope auth)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10M}})
+      (let [parent (:child-ctx (cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2)))
+            account (authority/wallet-of room parent)
+            nested (open-scope auth)]
+        (try
+          (let [child (:child-ctx (cps #(world-scope/fork! nested parent nil %1 %2)))]
+            (binding [ec/*execution-context* child
+                      resource/*spend-wallet* (resource/spending (resource/room-spend-wallet room) [:unfunded])]
+              (is (thrown? clojure.lang.ExceptionInfo (resource/charge-spend! 1M))
+                  "an unfunded child must not fall back to a bound ancestor payer"))
+            (is (= 4M (usd room account)))
+            (close-scope nested)
+            (is (= 4M (usd room account)) "child cleanup cannot refund its parent's live grant"))
+          (finally (close-scope nested))))
+      (finally
+        (close-scope scope)
+        (context/stop-context! root)
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))
+
+(deftest unfunded-copies-do-not-inherit-a-live-wallet
+  (let [[room conn] (ledger-room)
+        root (context/create-execution-context)
+        auth (authority/authority room)
+        scope (open-scope auth)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10M}})
+      (let [parent (:child-ctx (cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2)))
+            account (authority/wallet-of room parent)
+            copies (cps #(world-scope/copy! scope parent 2 {:split? false} %1 %2))]
+        (doseq [{ctx :child-ctx} copies]
+          (binding [ec/*execution-context* ctx]
+            (is (thrown? clojure.lang.ExceptionInfo (resource/charge-spend! 1M))))
+          (cps (world-scope/release! scope ctx)))
+        (is (= 0M (usd room account)) "the retired source returns its own remainder after all copies settle")
+        (is (= 10M (get (resource/balance room) resource/microdollars))))
+      (finally
+        (close-scope scope)
+        (context/stop-context! root)
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))
+
+(deftest a-run-inside-a-funded-world-selects-its-own-payer
+  (let [[room conn] (ledger-room)
+        auth (authority/authority room)
+        run-id (random-uuid)]
+    (try
+      (resource/install-unit! room {:symbol resource/model-dispatches :name "admission" :precision 0})
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 20M resource/model-dispatches 10M}})
+      (let [parent (d/fork-room room {:isolation :ctx :clone-participants? false})]
+        (try
+          (world-scope/grant! auth (:ctx room) (:ctx parent)
+                              {resource/microdollars 5M resource/model-dispatches 2M})
+          (let [trigger (d/message :test :_runs "payer" nil {:role :user})]
+            (d/post! room trigger)
+            (run/start! room :test trigger nil {:id run-id}))
+          (resource/allocate-run! room run-id nil {resource/microdollars 8M resource/model-dispatches 3M})
+          (let [world (run-world/open! parent run-id :discard room)
+                parent-account (authority/wallet-of room (:ctx parent))]
+            (try
+              (binding [ec/*execution-context* (:ctx (:work world))
+                        resource/*spend-wallet* (resource/spending (resource/spend-wallet room run-id) [:nested run-id])
+                        resource/*model-scope* (resource/model-scope room run-id)]
+                (is (= 2M (:charged (resource/charge-spend! 2M))))
+                (resource/admit-model-dispatch!))
+              (is (= {resource/microdollars 6M resource/model-dispatches 2M} (resource/run-balance room run-id)))
+              (is (= {resource/microdollars 5M resource/model-dispatches 2M} (resource/balance room parent-account)))
+              (finally (run-world/settle! world :cancelled))))
+          (finally
+            (world-scope/return! auth (:ctx parent))
+            (d/discard parent))))
+      (finally
+        (when (some #(= run-id (:run/id %)) (run/active-runs))
+          (run/finish! run-id :completed))
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))
 
 (deftest a-scope-fork-moves-ledger-budget
   (let [[room conn] (ledger-room)
