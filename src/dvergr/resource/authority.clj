@@ -56,7 +56,7 @@
                :wallet wallet-id :room-id (:id room) :from return-to}]
     ;; open, then fund: a failed grant leaves an empty wallet, never
     ;; duplicated authority (Run allocations have their own atomic path)
-    (store/-open-resource-wallet! (store! room) (cond-> {:id wallet-id :name (str "world " (:fork-id ctx))}
+    (store/-open-resource-wallet! (store! room) (cond-> {:id wallet-id :purpose :world :name (str "world " (:fork-id ctx))}
                                                   owner (assoc :owner owner)))
     ;; Publish recovery ownership BEFORE the transfer can commit. This world is
     ;; not admitted yet; pending authority is never spendable.
@@ -118,7 +118,7 @@
     (let [source (wallet-of room context)
           escrow-id (stable-id :dvergr/escrow key)]
       (store/-open-resource-wallet!
-       (store! room) {:id escrow-id :name (str "escrow " key)})
+       (store! room) {:id escrow-id :purpose :escrow :name (str "escrow " key)})
       (when-let [left (remaining room source)]
         (store/-transfer-resources!
          (store! room)

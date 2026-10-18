@@ -45,6 +45,7 @@
     (try
       (dotimes [_ 2]
         (is (identical? conn (resource/install-connection! conn (:id room) chat-id)))
+        (datahike-store/make conn)
         (testing "Kontor still rejects a raw overdraft"
           (let [tx (kontor/transfer-tx-data
                     {:id (random-uuid) :kind :consume
@@ -56,7 +57,14 @@
         (testing "reinstalling Kontor did not replace Attempt protection"
           (let [id (random-uuid)]
             (is (thrown? Exception (dh/transact conn [{:attempt/id id}])))
-            (is (nil? (dh/q '[:find ?e . :in $ ?id :where [?e :attempt/id ?id]] @conn id))))))
+            (is (nil? (dh/q '[:find ?e . :in $ ?id :where [?e :attempt/id ?id]] @conn id)))))
+        (testing "purpose classification remains protected after both boot paths"
+          (is (thrown? Exception
+                       (dh/transact conn [{:db/id wallet :dvergr.resource-account/purpose :world}])))
+          (is (thrown? Exception
+                       (dh/transact conn [[:db/retract wallet :dvergr.resource-account/purpose :room]])))
+          (is (= :room (:dvergr.resource-account/purpose
+                        (dh/pull @conn [:dvergr.resource-account/purpose] wallet))))))
       (finally
         (kontor-governance/ungovern! conn)
         (d/close-room! room)))))

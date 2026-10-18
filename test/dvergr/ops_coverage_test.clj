@@ -34,6 +34,7 @@
    :-transfer-resources!        :runtime
    :-resource-balance     {:read-by #{:room/wallet}}
    :-resource-receipt     :internal
+   :-resource-read-view   :internal
    ;; attention (routing state, not a user-facing record)
    :-store-attention!     :runtime
    :-list-attention       :internal
@@ -46,7 +47,7 @@
    :-list-scorecards      {:read-by #{:scorecard/list}}})
 
 (def ^:private protocols
-  [store/PRoomStore store/PResourceStore store/PAttentionStore
+  [store/PRoomStore store/PResourceStore store/PResourceReadView store/PAttentionStore
    store/PAttemptStore store/PScorecardStore])
 
 (defn- methods-of [protocol]

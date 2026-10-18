@@ -118,7 +118,7 @@
    these operations, so they cannot mint authority or bypass the governor."
 
   (-open-resource-wallet! [this spec]
-    "Open or idempotently re-open a wallet from {:id :owner :name}.")
+    "Open or idempotently re-open a wallet from {:id :owner :name :purpose}.")
 
   (-install-resource-unit! [this spec]
     "Install or idempotently re-install one conserved resource coordinate.")
@@ -134,6 +134,13 @@
 
   (-resource-receipt [this transfer-id]
     "Return the durable transfer receipt, or nil."))
+
+(defprotocol PResourceReadView
+  "Optional immutable, eager resource-ledger snapshot for attribution.
+   Its :accounts (by UUID, with kind/purpose/run-id/balance) and :transfers
+   must describe the same point in time. Unsupported stores must not substitute
+   several live reads and silently present them as a coherent snapshot."
+  (-resource-read-view [this]))
 
 (defprotocol PAttentionStore
   "Participant-specific attention projections over immutable Room messages.
