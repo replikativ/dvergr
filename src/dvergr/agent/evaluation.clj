@@ -38,6 +38,10 @@
 (defrecord WorldSetup [ref prepare])
 (defrecord Protocol [ref run limit-keys inputs])
 
+(defn- remaining-ms [deadline-nanos]
+  ;; Ceiling avoids expiring a still-positive sub-millisecond remainder.
+  (max 0 (long (Math/ceil (/ (- deadline-nanos (System/nanoTime)) 1000000.0)))))
+
 (defonce ^:private pending-tasks (atom {}))
 
 (declare positive-timeout! start-task!)
@@ -653,8 +657,11 @@
    `:limits` may specify `:timeout-ms`, `:cancel-timeout-ms`, `:on-timeout`
    (`:fault`, the default, or `:verdict`), for an `:llm` program
    `:max-model-steps` and `:budget-dollars`, and the limit keys a protocol
-   declares. A timeout requests targeted Run cancellation and no receipt is
-   certified until the Run has physically quiesced.
+   declares. One monotonic timeout covers admission, setup, allocation and
+   execution through physical quiescence. Admission expiry is a host fault,
+   not a model-quality Attempt; a late Run remains owned until cancelled and
+   joined. Cleanup has its own grace period and may outlive the deadline.
+   Verification/certification run after quiescence, outside this timeout.
 
    Options may provide `:from` and structural `:parent-run`. `:world-parent`
    (default `room`) is the Room the attempt's world forks: a world inside
@@ -710,6 +717,7 @@
      (sp/spin
       (let [started-at (System/currentTimeMillis)
             started-nanos (System/nanoTime)
+            deadline-nanos (+ started-nanos (* 1000000 timeout-ms))
             hire-opts (cond-> {:task (:environment/task definition)
                                :from from
                                ;; Verification is a two-phase gate over this
@@ -783,18 +791,31 @@
             admission (tracked-admission
                        room cleanup-group
                        #(program/hire-prepared-in! room (or world-parent room) team agent-ref
-                                                   hire-opts prepare-world! hosted-protocol)
+                                                   hire-opts prepare-world! hosted-protocol
+                                                   {:deadline-nanos deadline-nanos})
                        #(program/cancel! room %))
+            timed-out ::timed-out
             handle (try
-                     (sp/await (blocking/blocking (:await admission)))
+                     (let [left (remaining-ms deadline-nanos)
+                           admitted (if (pos? left)
+                                      (sp/await (comb/timeout (blocking/blocking (:await admission))
+                                                              left timed-out))
+                                      timed-out)]
+                       (when (= timed-out admitted)
+                         (throw (ex-info "Environment deadline expired during admission; late Run cleanup remains owned"
+                                         {:type ::admission-timeout :timeout-ms timeout-ms
+                                          :phase :admission :cleanup/group cleanup-group})))
+                       admitted)
                      (catch Throwable error
                        ((:cancel! admission))
                        (throw error)))
-            timed-out ::timed-out
-            initial (sp/await
-                     (comb/timeout (program/owned-result-spin handle)
-                                   timeout-ms timed-out))
-            timeout? (= timed-out initial)
+            left (remaining-ms deadline-nanos)
+            initial (if (pos? left)
+                      (sp/await (comb/timeout (program/owned-result-spin handle)
+                                              left timed-out))
+                      timed-out)
+            ;; A delayed timer must not make an overdue result successful.
+            timeout? (or (= timed-out initial) (zero? (remaining-ms deadline-nanos)))
             _ (when timeout? (program/cancel! room handle))
             result (if timeout?
                      (sp/await
@@ -891,7 +912,15 @@
                  (binding [ec/*execution-context* (:ctx room)
                            ec/*spin-id* nil]
                    (try
-                     (let [_ (when (and (:capture evaluator)
+                     (let [_ (when (and timeout? (= :completed (:run/status result)))
+                               ;; The candidate may have completed late, or
+                               ;; its observer resumed late. Neither supports
+                               ;; a bounded quality verdict. Keep the durable
+                               ;; Run truthful and use this worker's existing
+                               ;; compensation path to discard its world.
+                               (throw (ex-info "Completed Run was observed beyond its execution deadline"
+                                               {:type ::overdue-completion :run/id run-id})))
+                           _ (when (and (:capture evaluator)
                                         (not (and (map? @captured)
                                                   (contains? @captured :ok))))
                                (throw (ex-info "Execution evidence capture failed"

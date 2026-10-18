@@ -140,6 +140,75 @@
   (is (= #{:input-tokens}
          (:unreported-types (#'program/model-step-usage {:unreported-types #{:input-tokens}} false)))))
 
+(deftest measured-model-failure-is-not-an-unmeasured-provider-call
+  (let [known {:used 10 :by-type {:input-tokens 500 :output-tokens 0}}]
+    (doseq [outcome [:continue :complete :error]]
+      (is (= known (#'program/completed-model-step-usage known outcome false {:kind :model}))))
+    (doseq [outcome [:cancelled ::program/worker-cancelled {::program/worker-error (Exception.)}]]
+      (is (= #{:input-tokens :output-tokens}
+             (:unreported-types (#'program/completed-model-step-usage known outcome false nil)))))
+    (doseq [failure [nil {:kind :infrastructure}]]
+      (is (= #{:input-tokens :output-tokens}
+             (:unreported-types (#'program/completed-model-step-usage known :error false failure)))))
+    (is (= #{:input-tokens :output-tokens}
+           (:unreported-types (#'program/completed-model-step-usage known :complete true nil))))
+    (is (= #{:input-tokens :output-tokens}
+           (:unreported-types
+            (#'program/completed-model-step-usage
+             (assoc known :unreported-types #{:input-tokens :output-tokens}) :error false {:kind :model}))))))
+
+(deftest expired-worker-entry-still-acknowledges-and-runs-cleanup
+  (let [room (test-room :deadline-worker)
+        called (atom 0) cleaned (atom 0)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [supervisor (assoc (#'program/make-supervisor (:ctx room))
+                                :deadline-nanos (dec (System/nanoTime)))
+              _ (#'program/register-cleanup! supervisor #(swap! cleaned inc))
+              worker (#'program/start-worker! supervisor #(swap! called inc))
+              result (deref (#'program/worker-result-spin worker) 2000 ::timeout)]
+          (is (= ::program/deadline-expired (:type (ex-data (::program/worker-error result)))))
+          (is (zero? @called) "physical entry checks expiry without waiting for an engine timer")
+          (#'program/seal-supervisor! supervisor)
+          (#'program/mark-cleanup-safe! supervisor)
+          (is (.await ^java.util.concurrent.CountDownLatch (:quiesced-latch supervisor)
+                      2000 java.util.concurrent.TimeUnit/MILLISECONDS))
+          (is (= 1 @cleaned) "cleanup is exempt from the execution deadline")
+          (is (empty? (:workers @(:state supervisor))))))
+      (finally (d/close-room! room)))))
+
+(deftest expired-allocation-cannot-enter-candidate-with-delayed-engine-timer
+  (let [[room conn] (resource-test-room :deadline-allocation)
+        entered (promise) release (promise)
+        allocate resource/allocate-run!
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :program {:kind :scripted :reply "must not run"}})]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 100M}})
+      (binding [ec/*execution-context* (:ctx room)]
+        (with-redefs [resource/allocate-run!
+                      (fn [& args] (deliver entered true) @release (apply allocate args))]
+          (let [handle (program/hire-prepared-in!
+                        room room team :candidate
+                        {:task "work" :settlement :discard :resources {resource/microdollars 100M}}
+                        (constantly nil) nil {:deadline-nanos (+ (System/nanoTime) 500000000)})]
+            (is (= true (deref entered 2000 ::timeout)))
+            ;; Deliberately no evaluation timer: the physical entry fence
+            ;; must prevent execution even when graph cancellation is late.
+            (Thread/sleep 600)
+            (deliver release true)
+            (let [result (deref handle 5000 ::timeout)]
+              (is (not= ::timeout result))
+              (is (= :failed (:run/status result)))
+              (is (= :world-setup-cancelled
+                     (:run/reason (program/observe room handle)))
+                  "expired allocation is not a model-quality verdict"))
+            (is (= {resource/microdollars 100M} (resource/balance room)))
+            (is (empty? (filter #(= :candidate (:from %)) (d/messages room)))))))
+      (finally
+        (deliver release true)
+        (close-resource-test-room! room conn)))))
+
 (deftest concurrent-cli-entries-cannot-share-one-conserved-admission
   (let [[room conn] (resource-test-room :cli-admission-race)
         id (random-uuid)]

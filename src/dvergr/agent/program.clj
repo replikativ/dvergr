@@ -109,6 +109,18 @@
 
 (declare start-worker!)
 
+(defn- deadline-expired? [supervisor]
+  (when-let [deadline (:deadline-nanos supervisor)]
+    (>= (System/nanoTime) deadline)))
+
+(defn- check-deadline! [supervisor]
+  (when (deadline-expired? supervisor)
+    (throw (ex-info "Run execution deadline expired"
+                    {:type ::deadline-expired}))))
+
+(defn- cancelled-or-expired? [supervisor run-id]
+  (or (deadline-expired? supervisor) (run/cancel-requested? run-id)))
+
 (defn- make-supervisor
   ([execution-ctx] (make-supervisor execution-ctx execution-ctx))
   ([execution-ctx worker-ctx]
@@ -209,6 +221,15 @@
                (update :cleanup-error #(or % (::worker-error result)))))))
   (advance-supervisor! supervisor))
 
+(defn- worker-stage! [supervisor worker-id kind stage started-nanos]
+  (try
+    (tel/log! {:level :debug :id ::worker-stage
+               :data {:run/id (:run-id supervisor) :worker/id worker-id :kind kind :stage stage
+                      :fork/id (:fork-id (:execution-ctx supervisor))
+                      :elapsed-ms (/ (- (System/nanoTime) started-nanos) 1000000.0)}})
+    ;; Diagnostics must never suppress result publication or a physical ack.
+    (catch Throwable _ nil)))
+
 (defn- start-worker!
   "Register and start blocking/native work under the process-local supervisor.
    Cancellation is sticky: registration and the cancellation check share the
@@ -217,6 +238,7 @@
   ([supervisor f kind]
    (let [done       (sync/deferred)
          worker-id  (random-uuid)
+         started-nanos (System/nanoTime)
          phase      (atom :new)
          result     (atom nil)
          callable   (reify Callable
@@ -230,6 +252,11 @@
                                     ;; which admitted the Run.
                                     ec/*spin-id* nil]
                             (try
+                              (worker-stage! supervisor worker-id kind :entered started-nanos)
+                              ;; Absolute deadlines are host-owned coordination,
+                              ;; not forkable AgentDef state. Check at physical
+                              ;; entry even if the engine's timer is delayed.
+                              (when (= :normal kind) (check-deadline! supervisor))
                               (reset! result (f))
                               (catch Throwable t
                                 (reset! result {::worker-error t}))
@@ -240,10 +267,12 @@
                                 (binding [ec/*execution-context*
                                           (:execution-ctx supervisor)]
                                   (try
+                                    (worker-stage! supervisor worker-id kind :publishing started-nanos)
                                     (done @result)
                                     (finally
                                       (worker-finished! supervisor worker-id kind
-                                                        @result))))))))))
+                                                        @result)
+                                      (worker-stage! supervisor worker-id kind :acknowledged started-nanos))))))))))
          task       (proxy [FutureTask] [callable]
                       (done []
                        ;; Cancellation before the executor begins means the
@@ -259,7 +288,7 @@
                                 (finally
                                   (worker-finished! supervisor worker-id kind
                                                     value))))))))
-         worker     {:id worker-id :task task :done done :kind kind}
+         worker     {:id worker-id :task task :done done :kind kind :started-nanos started-nanos}
          cancel-now?
          (locking supervisor
            (let [{:keys [sealed? cancelled?]} @(:state supervisor)]
@@ -865,6 +894,17 @@
   (cond-> (select-keys budget [:used :by-type :unreported-types])
     uncertain? (update :unreported-types (fnil into #{}) [:input-tokens :output-tokens])))
 
+(defn- completed-model-step-usage [budget outcome cancelled? failure]
+  ;; :error is also a model-quality verdict after a measured response (e.g.
+  ;; repeated empty output). Provider failures already mark the chat budget
+  ;; incomplete at the call boundary. Only explicit :model verdicts occur
+  ;; after response accounting: :error may also be an exception during that
+  ;; accounting (malformed usage). Never treat that as an acknowledged step.
+  (model-step-usage budget
+                    (or cancelled?
+                        (not (or (contains? #{:continue :complete} outcome)
+                                 (and (= :error outcome) (= :model (:kind failure))))))))
+
 (defn- execute-llm-program
   "Run a bounded Dvergr-native model/tool loop. Each blocking model round-trip
    runs under a supervised worker; this Spin retains orchestration, activity
@@ -1008,7 +1048,7 @@
                                       (resource/spending [:llm-step run-id model-step]))
                               resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
-                                      (assoc :cancel? #(run/cancel-requested? run-id)))]
+                                      (assoc :cancel? #(cancelled-or-expired? supervisor run-id)))]
                       (with-model-entry-checked supervisor run-id model-inputs [model-spec compaction]
                         (chat-agent/run-agent-turn!
                          chat-ctx
@@ -1020,7 +1060,7 @@
                           :tool-ctx tool-ctx
                           :cancel? (turn/cancel?-fn
                                     chat-ctx (:ctx work-room)
-                                    (fn [] (run/cancel-requested? run-id)))
+                                    (fn [] (cancelled-or-expired? supervisor run-id)))
                           :auto-compact? auto-compact?
                           ;; the one its inputs id names
                           :compaction-model (:model compaction)
@@ -1035,17 +1075,17 @@
                           :model-opts (cond-> {:room-id (let [id (:id work-room)]
                                                           (if (keyword? id) (subs (str id) 1) (str id)))
                                        ;; whose run token it gets (dvergr.principal)
-                                               :actor (:agent/id agent)}
+                                               :actor (:agent/id agent) :run-id run-id}
                                         (get-in agent [:agent/program :execution-mode])
                                         (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
                                                :expected-provider-policy provider-policy))})))))
                  outcome (sp/await (worker-result-spin call))
+                 _ (worker-stage! supervisor (:id call) :normal :resumed (:started-nanos call))
                  budget (chat-context/get-budget chat-ctx)]
              (update-llm-metrics!
               supervisor merge {:model-steps (inc model-step)
-                                :usage (model-step-usage budget
-                                                         (or (not (contains? #{:continue :complete} outcome))
-                                                             (run/cancel-requested? run-id)))})
+                                :usage (completed-model-step-usage budget outcome
+                                                                   (run/cancel-requested? run-id) @failure)})
              ;; posting the turn's rows is a durable write: off the drain
              (sp/await (blocking/blocking
                         #(turn/post-turn-activity! control-room (:agent/id agent) chat-ctx posted
@@ -1174,7 +1214,7 @@
                     supervisor
                     (constantly {:inputs-id (inputs-id inputs)}))
                    (let [scope (some-> (resource/model-scope control-room run-id)
-                                       (assoc :cancel? #(run/cancel-requested? run-id)))]
+                                       (assoc :cancel? #(cancelled-or-expired? supervisor run-id)))]
                      (binding [resource/*model-scope* scope
                                ;; the protocol's model calls, the candidate's
                                ;; and its driver's, are paid from the Run's
@@ -1194,7 +1234,7 @@
                            :task task
                            :limits (::limits agent)
                            :model-scope scope
-                           :cancelled? (fn [] (run/cancel-requested? run-id))})))))))
+                           :cancelled? (fn [] (cancelled-or-expired? supervisor run-id))})))))))
          outcome (sp/await (worker-result-spin call))]
      (cond
        (or (= ::worker-cancelled outcome)
@@ -1714,16 +1754,21 @@
                     (throw t)))))
              allocation (sp/await (worker-result-spin allocation-worker))]
          (when (or (= ::worker-cancelled allocation)
-                   (run/cancel-requested? id))
+                   (run/cancel-requested? id)
+                   (deadline-expired? supervisor))
            (throw (ex-info "Run cancelled during resource allocation"
                            {:type ::world-setup-cancelled :run/id id})))
          (when (worker-error? allocation)
            (throw (ex-info "Run resource allocation failed"
                            {:type ::resource-allocation-failed :run/id id}
                            (::worker-error allocation))))))
-     (when (run/cancel-requested? id)
+     ;; Setup/allocation expiry is a host failure before candidate entry,
+     ;; even in an environment that scores candidate timeouts as verdicts.
+     (when (or (run/cancel-requested? id) (deadline-expired? supervisor))
        (throw (ex-info "Run cancelled after world setup"
                        {:type ::world-setup-cancelled :run/id id})))
+     ;; Allocation may have blocked beyond the deadline after setup passed.
+     ;; Do not enter candidate execution while waiting for a timer event.
      (swap! (:state supervisor) assoc :execution-phase :candidate)
      (sp/await
       (execution-spin control-room work-room agent task trigger id chat-id
@@ -1768,7 +1813,11 @@
     :or {from :repl settlement :automatic}
     :as raw-opts}
    prepare-world! & [protocol {resume-from :resume snapshots :snapshots preset-id :id
-                               on-world :on-world resources-from :resources-from}]]
+                               on-world :on-world resources-from :resources-from
+                               deadline-nanos :deadline-nanos}]]
+  (when-not (or (nil? deadline-nanos) (integer? deadline-nanos))
+    (throw (ex-info "Run deadline must be an absolute monotonic timestamp"
+                    {:type ::invalid-deadline})))
   (when-not (or (nil? prepare-world!) (fn? prepare-world!))
     (throw (ex-info "Run world preparer must be a function"
                     {:type ::invalid-world-preparer})))
@@ -1787,7 +1836,8 @@
         run-world (world/open! world-parent id settlement control-room
                                (when snapshots {:snapshots snapshots}))
         work-room (:work run-world)
-        supervisor (make-supervisor (:ctx world-parent) (:ctx work-room))
+        supervisor (cond-> (assoc (make-supervisor (:ctx world-parent) (:ctx work-room)) :run-id id)
+                     deadline-nanos (assoc :deadline-nanos deadline-nanos))
         session-close (atom nil)
         _ (when (and (= :llm (get-in agent [:agent/program :kind])) (:store control-room))
             (when-let [session (install-turn-savepoints! control-room work-room)]

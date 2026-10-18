@@ -723,7 +723,17 @@
 
 (defn- run-claude-streaming*
   [messages opts agent]
-  (let [prompt (format-conversation messages)
+  (let [started-nanos (System/nanoTime)
+        stage! (fn [stage data]
+                 ;; Bounded metadata only: never log argv, environment, prompt,
+                 ;; response, MCP config or stderr (all can contain secrets).
+                 (try
+                   (tel/log! {:level :debug :id :claude-code/lifecycle
+                              :data (merge {:run/id (:run-id opts) :room/id (:room-id opts)
+                                            :stage stage
+                                            :elapsed-ms (/ (- (System/nanoTime) started-nanos) 1000000.0)} data)})
+                   (catch Throwable _ nil)))
+        prompt (format-conversation messages)
         system-prompt (extract-system-prompt messages opts)
         ;; otherwise the tool definitions go into the system prompt as text
         tools (when-not agent (:tools opts))
@@ -735,7 +745,9 @@
                            effective-system (assoc :system effective-system)
                            agent (assoc :agent agent))
         cmd (build-command opts-with-system)
+        _ (stage! :spawn-start {})
         process (start-process cmd)
+        _ (stage! :spawned {:pid (.pid process)})
         stdin (.getOutputStream process)
         stdout-reader (BufferedReader. (InputStreamReader. (.getInputStream process) "UTF-8"))
         stderr-reader (BufferedReader. (InputStreamReader. (.getErrorStream process) "UTF-8"))
@@ -757,6 +769,7 @@
               (when (not @monitor-done?)
                 (if (> (- (System/currentTimeMillis) @last-activity) stall-ms)
                   (do (reset! stalled? true)
+                      (stage! :watchdog-fired {:idle-ms (- (System/currentTimeMillis) @last-activity)})
                       (terminate-process! process))
                   (do (Thread/sleep 500)
                       (recur)))))
@@ -784,6 +797,7 @@
                            :data {:error (.getMessage e)}}
                           "Claude Code cancellation monitor failed")))))]
     (try
+      (stage! :watchdog-armed {:stall-timeout-ms stall-ms})
       ;; Check once synchronously so an already-cancelled request cannot feed
       ;; the subprocess before the monitor's first poll.
       (when (and cancel? (cancel?))
@@ -793,6 +807,7 @@
       (try
         (.write stdin (.getBytes prompt "UTF-8"))
         (.close stdin)
+        (stage! :stdin-complete {})
         (catch java.io.IOException e
           ;; A CLI that rejects its invocation may close stdin immediately.
           ;; Preserve its exit code and stderr instead of masking them with a
@@ -801,10 +816,11 @@
           (when (.isAlive process)
             (throw e))))
       (let [result-event (loop [line (cli-process/read-line-bounded stdout-reader stdout-remaining)
-                                result nil]
+                                result nil first-line? true]
                            (if (nil? line)
                              result
-                             (let [_ (reset! last-activity (System/currentTimeMillis))
+                             (let [_ (when first-line? (stage! :first-stdout-line {}))
+                                   _ (reset! last-activity (System/currentTimeMillis))
                                    event (parse-json-line line)]
                                (when (= "rate_limit_event" (:type event))
                                  (record-rate-limit! (:rate_limit_info event)))
@@ -815,8 +831,9 @@
                                (recur (cli-process/read-line-bounded stdout-reader stdout-remaining)
                                       (if (and event (= "result" (:type event)))
                                         event
-                                        result)))))
+                                        result) false))))
             exit-code (.waitFor process)
+            _ (stage! :process-exited {:exit-code exit-code :pid (.pid process)})
             stderr @stderr-future]
         (when @cancelled?
           (throw (CancellationException. "LLM call cancelled")))
@@ -872,10 +889,12 @@
         ;; lock, which the stderr future holds while it blocks in a read, so
         ;; with the process still alive (a callback that threw) the close
         ;; would wait for the CLI to exit by itself.
+        (stage! :cleanup-start {:pid (.pid process)})
         (terminate-process! process)
         (close-quietly! stdin)
         (close-quietly! stdout-reader)
         (close-quietly! stderr-reader)
+        (stage! :cleanup-complete {:pid (.pid process)})
         (when cancel-monitor
           (future-cancel cancel-monitor))
         (when-not (realized? stderr-future)
