@@ -44,7 +44,9 @@
           receipt (java.io.File/createTempFile "cli-lifecycle-pids" ".txt")
           before (claude/settings-snapshot)]
       (try
-        (spit script (fixture-script mode receipt))
+        ;; CI uses a relative java.io.tmpdir, while the CLI deliberately starts
+        ;; outside the checkout. Its receipt must not depend on that cwd.
+        (spit script (fixture-script mode (.getAbsolutePath receipt)))
         (claude/configure! {:cli (.getAbsolutePath script)
                             :stall-timeout-ms (if (= :parent-exit mode) 200 10000)
                             :env {"CLAUDE_CONFIG_DIR" "/tmp/dvergr-offline-cli-config"
