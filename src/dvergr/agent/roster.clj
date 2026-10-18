@@ -210,7 +210,10 @@
      {:kind :scripted :delay-ms milliseconds :reply value}
 
    An LLM program uses {:kind :llm :max-model-steps n :budget-dollars n}
-   together with AgentDef :model-policy and :tools. `:delay-ms` is optional;
+   together with AgentDef :model-policy and :tools. A pinned SCI program uses
+   {:kind :sci :source string :entrypoint qualified-symbol :args vector
+    :timeout-ms n}, with bounded portable input/output and explicit admission.
+   `:delay-ms` is optional;
    unknown program keys are rejected before a Run is admitted.
 
    Adding an identical definition is idempotent. Reusing an id with different

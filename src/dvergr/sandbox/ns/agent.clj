@@ -40,6 +40,12 @@
 (def ^:private AgentProgram
   "The program kinds `hire!` has interpreters for (validated at hire time)."
   [:multi {:dispatch :kind}
+   [:sci [:map {:closed true}
+          [:kind [:= :sci]]
+          [:source [:string {:min 1 :max 65536}]]
+          [:entrypoint 'qualified-symbol?]
+          [:args {:optional true} [:vector {:max 32} :any]]
+          [:timeout-ms [:int {:min 1 :max 600000}]]]]
    [:echo [:map {:closed true}
            [:kind [:= :echo]]
            [:delay-ms {:optional true} [:int {:min 0 :max 600000}]]]]
@@ -716,7 +722,7 @@
         'owned-result-spin owned-result-spin-fn}
        (with-schemas
          '{roster      [([] [opts]) "Create an immutable Roster value. Options may include portable :id, :defaults, :scope, and :metadata data."]
-           make-agent   [([roster spec]) "Return a NEW Roster containing `spec`. Programs are {:kind :echo :delay-ms n}, {:kind :scripted :delay-ms n :reply value}, or {:kind :llm :max-model-steps n :budget-dollars n} plus :model-policy and :tools. Pure: input unchanged."]
+           make-agent   [([roster spec]) "Return a NEW Roster containing `spec`. Programs: :echo, :scripted, bounded :llm, or pinned {:kind :sci :source string :entrypoint qualified-symbol :args vector :timeout-ms n}. SCI runs source then invokes the entrypoint with task followed by args; returns bounded portable data. SCI requires explicit program-kind admission in a restrictive host policy. Pure: input unchanged."]
            revise-agent [([roster id patch]) "Return a NEW Roster with AgentDef `id` revised and its version incremented."]
            lookup       [([roster id-or-ref]) "Resolve an AgentDef by keyword id or versioned AgentRef. A stale versioned ref is an error."]
            ref          [([agent-def]) "Return the stable {:agent/id :agent/version} reference for an AgentDef."]
@@ -732,7 +738,7 @@
            hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (dvergr.agent/hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it); :role, a keyword naming the part the child plays (:candidate, :judge, ...), which its spend is summed under (see `split`). Unknown keys are rejected."]
            run-experiment! [([roster experiment] [roster experiment opts]) "Run a child experiment in forks of the current world, using only offered verifiers/setups. Returns a Spin of {:job uuid :status keyword :scorecard ScorecardDef (when completed) :error string}. A hired parent owns it even when ignored; cancellation joins cleanup before returning resources. opts: :parallelism (default 1), :resources (explicit aggregate grant covering every candidate/case/repetition). Paid cells require funded per-cell native-provider grants; CLI/relay execution is not admitted. Verifier scope follows recursive hires; an empty scope offers nothing."]
            offered      [([]) "The verifier and world-setup refs this host offers to experiments: {:evaluators [ref ...] :world-setups [ref ...]}."]
-           delegation-policy [([]) "The host's portable child delegation bounds, or nil for a trusted legacy caller. :tools is the maximum tool set, :sandboxes enumerates exact allowed extension combinations, :providers permits LLM transports; optional :max-attempts/:max-parallelism bound each child experiment. Child definitions cannot override this policy."]
+           delegation-policy [([]) "The host's portable child delegation bounds, or nil for a trusted host caller. :tools bounds tools, :sandboxes enumerates exact extension combinations, :providers permits LLM transports. Optional :program-kinds bounds interpreters (omitted: :echo/:scripted/:llm only; :sci requires opt-in). :max-attempts/:max-parallelism bound child experiments. Children cannot override this policy."]
            current-run-id [([]) "The ambient consumer Run UUID, or nil outside a hired Run. This is host-issued scope, not a caller-selected Run identity."]
            observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
            inspect      [([] [opts]) "Inspect the current Run and its structural descendants as one bounded snapshot of Runs, frontier, correlated messages, semantic activities, failures, and conserved balances. Inside a hired agent this cannot see parent or sibling Runs, and inspection without an ambient Run fails closed. A durable semantic receipt identifies the inspection. Options: :run-limit, :message-limit, :content-limit, :content-budget, :detail-limit."]

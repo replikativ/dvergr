@@ -187,10 +187,12 @@ hidden mutable roster.
 
 See [Agent programs in the room REPL](agent-programs.md) for the API, a
 provider-free runnable example, and the state/fork contract. Besides the
-deterministic `:echo` and `:scripted` programs, `hire!` runs the `:llm` program
-kind, a bounded Dvergr-native model/tool loop, on the same boundary. Code running
-inside a paid `:llm` Run may itself hire only `:echo` and `:scripted` children
-(`child-program-authority` in `dvergr.agent.program`).
+deterministic `:echo` and `:scripted` programs, `hire!` runs pinned `:sci` source
+entrypoints and the bounded `:llm` model/tool loop on the same boundary. Scoped
+code may hire provider-free children, including `:sci` when its host explicitly
+admits that kind, or fund native model-using children from its existing conserved
+grant. The same delegated scope follows child experiments; no child funds itself
+or widens its tools, sandbox, provider or program-kind policy.
 
 ## The Room + Bus
 
