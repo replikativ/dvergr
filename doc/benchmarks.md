@@ -38,6 +38,28 @@ supervisor. Cancellation stops child work, but neither parent terminality nor
 wallet return precedes physical cleanup. Effect receipts must not print or
 dereference that observer while recording admission.
 
+### Reading child outputs
+
+`(agent/attempt-output attempt-id {:path [:files "/out/answer.edn"]})`
+reads only the `:agent/output` field deliberately published by the evaluator's
+`observe` function into immutable Attempt evidence. Nothing is public by default:
+the rest of the evidence, including private verifier fixtures, is not exposed.
+Existing evaluators need to opt in; this is not yet a generic Simmis captured-file
+adapter. Output is readable after the child world is discarded, without reopening it.
+
+An ambient consumer Run is mandatory. Exact structural ancestry in the same
+control-room store authorizes the read, independently of observation/history limits;
+parent, sibling and other-room Attempts cannot be read through this surface.
+Successful child reads record a durable `:run/caused-by` edge on the live consumer.
+Identity fields refer to the original immutable Attempt; the read creates no new
+result store or certification.
+
+Select maps/vectors with `:path` (at most 16 components). Strings support
+`:offset`/`:length` chunks of at most 16384 UTF-16 code units, returning
+`:next-offset` when more remains. Other values are bounded to 2048 nodes, depth 32,
+and 16384 scalar characters; oversized selections fail instead of silently
+truncating evidence. These string offsets are not file byte offsets.
+
 This core API does not itself enable a Simmis worker profile, research-network
 access, scheduling, crash recovery or permission to promote a proposed checker.
 

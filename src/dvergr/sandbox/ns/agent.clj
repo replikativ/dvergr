@@ -498,6 +498,7 @@
         hire-in*       (requiring-resolve 'dvergr.agent.program/hire-in!)
         observe*       (requiring-resolve 'dvergr.agent.program/observe)
         snapshot*      (requiring-resolve 'dvergr.agent.observation/snapshot)
+        read-output*   (requiring-resolve 'dvergr.agent.output/read-output)
         issue-receipt* (requiring-resolve 'dvergr.agent.observation/issue-receipt!)
         revoke-receipt* (requiring-resolve 'dvergr.agent.observation/revoke-receipt!)
         lifecycle-activity* (requiring-resolve 'dvergr.activity/lifecycle-activity)
@@ -627,6 +628,14 @@
                                   (catch Throwable error
                                     (revoke-receipt* scope-run-id receipt-id)
                                     (throw error))))))))
+        attempt-output-fn
+        (fn attempt-output-fn
+          ([id] (attempt-output-fn id {}))
+          ([id opts]
+           (let [work-room (room!)
+                 control-room (control-room! work-room)]
+             (binding [ec/*execution-context* (:ctx work-room)]
+               (read-output* control-room (:parent-run agent-program-ceiling) id opts)))))
         cancel-fn      (fn [handle-or-id]
                          ;; Run cancellation tokens are process-local. Binding
                          ;; the Room ctx keeps this boundary consistent with
@@ -688,6 +697,7 @@
                                (offered*)))
         'observe      observe-fn
         'inspect      inspect-fn
+        'attempt-output attempt-output-fn
         'cancel!      (gated effects (fn [handle] {:effect :run/cancel :resource {:run (str (or (:run/id handle) handle))}})
                              cancel-fn)
         'balance      balance-fn
@@ -717,6 +727,7 @@
            offered      [([]) "The verifier and world-setup refs this host offers to experiments: {:evaluators [ref ...] :world-setups [ref ...]}."]
            observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
            inspect      [([] [opts]) "Inspect the current Run and its structural descendants as one bounded snapshot of Runs, frontier, correlated messages, semantic activities, failures, and conserved balances. Inside a hired agent this cannot see parent or sibling Runs, and inspection without an ambient Run fails closed. A durable semantic receipt identifies the inspection. Options: :run-limit, :message-limit, :content-limit, :content-budget, :detail-limit."]
+           attempt-output [([attempt-id] [attempt-id opts]) "Read deliberately published :agent/output from a certified Attempt in the current Run subtree. Private verifier evidence is never returned. opts: :path (map keys/vector indices, at most 16), :offset/:length for string chunks (UTF-16 units; length at most 16384). Maps/collections are bounded; select a smaller path if too large. Returns immutable Attempt identity and :output, with :next-offset for further string chunks. A successful child read records a causal input; missing scope/publication fails closed."]
            cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
            balance      [([]) "Return the conserved resource vector available to the current Run, or the Room root at top level."]
            split        [([resources shares]) "Divide a resource vector among roles: (dvergr.agent/split (dvergr.agent/balance) {:candidate 1/2 :judge 1/4}) returns {role grant}, each a :resources map for `hire!` with that :role. Shares are positive fractions summing to at most 1; amounts round down, and what is left stays with the current Run."]
@@ -744,6 +755,8 @@
           'observe         [:=> [:cat [:or :uuid RunHandle]] [:maybe Run]]
           'inspect         [:function [:=> [:cat] Observation]
                             [:=> [:cat InspectOpts] Observation]]
+          'attempt-output  [:function [:=> [:cat :uuid] :map]
+                            [:=> [:cat :uuid :map] :map]]
           'cancel!         [:=> [:cat [:or :uuid RunHandle]] :boolean]
           'balance         [:=> [:cat] Balance]
           'split           [:=> [:cat Balance [:map-of :keyword 'number?]] [:map-of :keyword Balance]]

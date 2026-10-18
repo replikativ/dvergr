@@ -54,7 +54,7 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 6)
+(def interpreter-version 7)
 
 (def ^:private default-max-model-steps 32)
 
