@@ -1,5 +1,48 @@
 # Benchmarks
 
+## Experiments inside agent programs
+
+An agent can construct rosters, environments and datasets as immutable Clojure
+data and invoke `dvergr.agent/run-experiment!` from SCI. The experiment is a
+child Job Run; its candidate Runs fork the caller's current world, while Runs,
+Attempts and Scorecards remain in the control room. This is the same evaluator
+used by host-started benchmarks, not a separate agent orchestration engine.
+
+`(agent/offered)` lists the verifier and fixture references the host offers.
+The host may supply `:experiment-capabilities` to a Run: that scope replaces the
+global catalog, including when empty, and follows recursive hiring and child
+experiments. Only its portable references enter input identity; verifier
+functions and authority never enter agent-authored definitions. Writing a test
+or checker does not register it as a trusted verifier.
+
+Paid candidates require funded per-cell resources in their environments and
+an explicit aggregate grant on the call:
+
+```clojure
+(agent/run-experiment! team experiment
+  {:parallelism 1
+   :resources {"microUSD" 200000M "model-dispatch" 8M}})
+```
+
+The grant must cover all candidates × environments × repetitions. It transfers
+from the current Run into the Job, then into each candidate; unused resources
+return along those same edges. Nothing mints money or admissions. Initial paid
+child experiments admit accounted native providers, not CLI/relay execution.
+The host can tighten cell-count and parallelism ceilings; cell settlement is
+discard-only. Dispatch accounting bounds model requests, not arbitrary CPU or
+every possible business effect.
+
+The call returns an observer Spin. Await it to obtain `:job`, `:status` and
+`:scorecard`; ignoring it does not detach the work from a hired parent's
+supervisor. Cancellation stops child work, but neither parent terminality nor
+wallet return precedes physical cleanup. Effect receipts must not print or
+dereference that observer while recording admission.
+
+This core API does not itself enable a Simmis worker profile, research-network
+access, scheduling, crash recovery or permission to promote a proposed checker.
+
+## Public benchmark providers
+
 Dvergr runs public benchmarks natively, as Clojure transcriptions whose
 environment state is an immutable value. A fork is a structural share and a
 replay is a reduction, so resetting and branching an environment costs nothing.

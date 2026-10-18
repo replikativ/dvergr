@@ -76,8 +76,10 @@
    Spin's value, runs before the Run completes; `reason-of`, a fn of the
    value, the reason a completed Run records (a keyword, or nil); `settled`, a
    fn of the final status and the value (or the error), after it has settled,
-   whatever the outcome."
-  [room {:keys [kind parent ctx actor]} work & {:keys [finish settled reason-of]}]
+   whatever the outcome. `before-finish`, a host fn of job-id/status/value,
+   joins physical cleanup and returns delegated resources BEFORE the Run
+   terminalizes. It also runs when synchronous work construction fails."
+  [room {:keys [kind parent ctx actor]} work & {:keys [finish settled reason-of before-finish]}]
   (when-not (contains? kinds kind)
     (throw (ex-info "Unknown job kind" {:type ::unknown-kind :kind kind :kinds kinds})))
   (let [ctx (or ctx (:ctx room))
@@ -85,7 +87,11 @@
             (run/start! room (or actor :dvergr) (random-uuid) nil
                         (cond-> {:kind kind} parent (assoc :parent parent))))
         id (:run/id r)
-        done (promise)]
+        done (promise)
+        finish-boundary (fn [status value]
+                          (when before-finish
+                            (binding [ec/*execution-context* ctx]
+                              (before-finish id status value))))]
     (swap! live assoc id {:room room :done done})
     (try
       (let [spin (binding [ec/*execution-context* ctx] (work id))]
@@ -111,31 +117,38 @@
                                        :data {:job id :kind kind :error (ex-message t)}}
                                       "Job failed")
                             [:failed t]))))]
-              (try
-                (binding [ec/*execution-context* ctx]
-                  (run/finish! id status (cond-> {}
-                                           error (assoc :error error)
-                                           (and reason-of (= :completed status))
-                                           (merge (when-let [r (reason-of @value)] {:reason r})))))
-                (catch Throwable t
-                  (tel/log! {:level :error :id ::finish-failed
-                             :data {:job id :status status :error (ex-message t)}}
-                            "Job Run could not be finished")))
-              (when settled
-                (try (settled status (or error @value))
-                     (catch Throwable t
-                       (tel/log! {:level :warn :id ::settled-failed
-                                  :data {:job id :error (ex-message t)}}
-                                 "Job settled callback failed"))))
+              (let [boundary-error (try (finish-boundary status (or error @value)) nil
+                                        (catch Throwable t t))
+                    status (if boundary-error :failed status)
+                    error (or boundary-error error)]
+                (try
+                  (binding [ec/*execution-context* ctx]
+                    (run/finish! id status (cond-> {}
+                                             error (assoc :error error)
+                                             (and reason-of (= :completed status))
+                                             (merge (when-let [r (reason-of @value)] {:reason r})))))
+                  (catch Throwable t
+                    (tel/log! {:level :error :id ::finish-failed
+                               :data {:job id :status status :error (ex-message t)}}
+                              "Job Run could not be finished")))
+                (when settled
+                  (try (settled status (or error @value))
+                       (catch Throwable t
+                         (tel/log! {:level :warn :id ::settled-failed
+                                    :data {:job id :error (ex-message t)}}
+                                   "Job settled callback failed"))))
               ;; a waiter (`status` with wait-ms) is released once the job
               ;; has settled too: a host that then closes the job's stores
               ;; must not pull them from under `settled`
-              (swap! live dissoc id)
-              (deliver done true)))))
+                (swap! live dissoc id)
+                (deliver done true))))))
       (catch Throwable t
         ;; `work` itself failed (validation, say): the Run must not stay open.
-        (binding [ec/*execution-context* ctx]
-          (run/finish! id :failed {:error t}))
+        ;; Work construction can fail after allocating a wallet. Apply the
+        ;; same physical cleanup boundary as asynchronous completion.
+        (let [boundary-error (try (finish-boundary :failed t) nil (catch Throwable e e))]
+          (binding [ec/*execution-context* ctx]
+            (run/finish! id :failed {:error (or boundary-error t)})))
         (swap! live dissoc id)
         (deliver done true)
         (throw t)))

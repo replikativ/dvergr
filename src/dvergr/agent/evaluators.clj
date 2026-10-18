@@ -27,10 +27,13 @@
 (defn evaluator [ref] (get-in @registry [:evaluators ref]))
 
 (defn offered
-  "The refs on offer: `{:evaluators [ref ...] :world-setups [ref ...]}`."
-  []
-  {:evaluators (vec (keys (:evaluators @registry)))
-   :world-setups (vec (keys (:world-setups @registry)))})
+  "The refs on offer. An explicit host capability scope replaces (never
+   extends) the global catalog; {} offers nothing. No scope preserves the
+   ordinary host catalog for existing callers."
+  ([] (offered @registry))
+  ([scope]
+   {:evaluators (vec (keys (:evaluators scope)))
+    :world-setups (vec (keys (:world-setups scope)))}))
 (defn world-setup [ref] (get-in @registry [:world-setups ref]))
 
 (defn- environments [experiment]
@@ -40,16 +43,16 @@
   "The host capabilities `experiment` needs: `{:evaluators {ref Evaluator}
    :world-setups {ref WorldSetup}}` for its environments' refs. Throws naming
    every ref this host does not offer."
-  [experiment]
-  (let [envs (environments experiment)
-        verifier-refs (into #{} (map :environment/verifier) envs)
-        setup-refs (into #{} (keep #(get-in % [:environment/world :setup])) envs)
-        evaluators (into {} (keep (fn [r] (when-let [e (evaluator r)] [r e]))) verifier-refs)
-        setups (into {} (keep (fn [r] (when-let [s (world-setup r)] [r s]))) setup-refs)
-        missing (concat (remove evaluators verifier-refs) (remove setups setup-refs))]
-    (when (seq missing)
-      (throw (ex-info "The experiment names verifiers or world setups this host does not offer"
-                      {:type ::unknown-capability :missing (vec missing)
-                       :offered {:evaluators (vec (keys (:evaluators @registry)))
-                                 :world-setups (vec (keys (:world-setups @registry)))}})))
-    {:evaluators evaluators :world-setups setups}))
+  ([experiment] (capabilities-for experiment @registry))
+  ([experiment scope]
+   (let [envs (environments experiment)
+         verifier-refs (into #{} (map :environment/verifier) envs)
+         setup-refs (into #{} (keep #(get-in % [:environment/world :setup])) envs)
+         evaluators (select-keys (:evaluators scope) verifier-refs)
+         setups (select-keys (:world-setups scope) setup-refs)
+         missing (concat (remove evaluators verifier-refs) (remove setups setup-refs))]
+     (when (seq missing)
+       (throw (ex-info "The experiment names verifiers or world setups this host does not offer"
+                       {:type ::unknown-capability :missing (vec missing)
+                        :offered (offered scope)})))
+     {:evaluators evaluators :world-setups setups})))

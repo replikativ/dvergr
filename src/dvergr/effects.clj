@@ -188,9 +188,11 @@
 
 (defn digest
   "A short content digest of an effect's result: reads are recorded by what
-   they returned, without the body."
+   they returned, without the body. An asynchronous/runtime handle has no
+   content digest: printing IDeref invokes its computation and can block the
+   very effect whose admission is being receipted."
   [x]
-  (when (some? x)
+  (when (and (some? x) (not (instance? clojure.lang.IDeref x)))
     (let [bytes (.getBytes ^String (if (string? x) x (pr-str x)) "UTF-8")
           md (MessageDigest/getInstance "SHA-256")]
       (apply str (map #(format "%02x" %) (take 12 (.digest md bytes)))))))
