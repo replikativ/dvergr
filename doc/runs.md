@@ -337,3 +337,29 @@ from the Attempt (`dvergr.agent.evaluation`). Not built: a durable receipt log
 for every Run, retrying a failed Run (a new
 trigger or a resume starts a new Run), and replaying a Run's external effects.
 These can extend the stable Run identity without replacing it.
+
+## Explicit Claude text execution
+
+An LLM AgentDef may select `:execution-mode :text` in `:agent/program` when
+its model policy uses `:claude-code`. Dvergr keeps its SCI/model-step loop;
+the CLI only returns text and proposed tool calls. A working room and an
+installed MCP relay cannot change explicit text mode into the CLI's own agent
+loop. Omitted mode retains the existing behavior.
+
+For a finite benchmark cell, add `:single-use? true`, disable compaction with
+`:auto-compact? false`, and grant exactly one `"cli-run-admission"` resource.
+The trusted host must install and explicitly fund that unit. Initialization
+consumes the admission before model execution. Each physical entry uses a new
+atomic debit, so a duplicate entry cannot reuse an idempotent charge. These
+Runs cannot be resumed; a new task requires a new admission. The bounded model
+steps count corrective replies too. This is not internal HTTP-request accounting
+or a dollar-spend guarantee, and it does not authorize recursive provider work.
+
+Explicit text execution currently requires Linux `setsid` and procfs. The CLI
+is a trusted inference executable, not an untrusted native-code sandbox. Its
+owned process session is stopped before the provider returns; unreadable process
+state keeps cleanup pending. Processes deliberately escaping the session are not
+supported. The environment is restricted to the existing Claude authentication
+configuration plus fixed runtime variables; no agent-selected executable or
+environment is accepted. CLI identity and non-secret policy changes invalidate
+the admitted policy. Credentials are not included in public provenance.

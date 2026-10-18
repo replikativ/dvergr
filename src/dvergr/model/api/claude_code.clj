@@ -25,6 +25,8 @@
             [dvergr.chat.tool-schema :as tool-schema]
             [dvergr.substrate.paths :as paths]
             [dvergr.principal :as principal]
+            [hasch.core :as hasch]
+            [dvergr.model.cli-process :as cli-process]
             [jsonista.core :as json]
             [clojure.string :as str]
             [taoensso.telemere :as tel])
@@ -37,6 +39,10 @@
 
 (defonce ^:private settings
   (atom {:cli "claude" :system-note nil :env nil}))
+
+(def ^:dynamic *call-settings* nil)
+(def ^:dynamic *owned-session?* false)
+(defn- call-settings [] (or *call-settings* @settings))
 
 (defn configure!
   "Process-wide CLI settings, merged into the current ones:
@@ -67,20 +73,66 @@
   {"CLAUDE_CONFIG_DIR" (.getAbsolutePath (java.io.File. (str config-dir)))
    "CLAUDE_CODE_OAUTH_TOKEN" (str/trim (str token))})
 
+(defn- cli-binary []
+  (let [cli (:cli (call-settings))
+        file (if (.isAbsolute (java.io.File. cli)) (java.io.File. cli)
+                 (some #(let [f (java.io.File. % cli)] (when (.canExecute f) f))
+                       (str/split (or (System/getenv "PATH") "") #":")))
+        path (some-> file .toPath (.toRealPath (make-array java.nio.file.LinkOption 0)))]
+    (when path
+      {:path (str path)
+       :attributes (into (sorted-map)
+                         (map (fn [[k v]] [k (str v)]))
+                         (try
+                           (java.nio.file.Files/readAttributes path "unix:ino,size,lastModifiedTime,ctime"
+                                                               (make-array java.nio.file.LinkOption 0))
+                           (catch UnsupportedOperationException _
+                             (java.nio.file.Files/readAttributes path "basic:size,lastModifiedTime,creationTime"
+                                                                 (make-array java.nio.file.LinkOption 0)))))})))
+
+(defn- text-environment []
+  (let [configured (:env (call-settings))
+        allowed #{"CLAUDE_CONFIG_DIR" "CLAUDE_CODE_OAUTH_TOKEN"}]
+    (when-not (every? allowed (keys configured))
+      (throw (ex-info "Unsupported text-provider environment override" {:type ::invalid-environment})))
+    (merge {"PATH" "/usr/bin:/bin" "HOME" (or (System/getenv "HOME") (System/getProperty "user.home"))}
+           (into {} (keep #(when-let [v (System/getenv %)] [% v])) allowed)
+           configured)))
+
 (def ^:private cli-version*
   (memoize
-   (fn [cli]
+   (fn [binary owned?]
      (try
-       (let [process (.start (ProcessBuilder. ^java.util.List [cli "--version"]))
-             out (slurp (.getInputStream process))]
-         (when (zero? (.waitFor process))
-           (first (str/split (str/trim out) #"\s+"))))
+       (let [stop! (if owned? cli-process/stop-session!
+                       (fn [^Process p]
+                         (.destroyForcibly p)
+                         (.waitFor p 1000 TimeUnit/MILLISECONDS)))
+             argv [(:path binary) "--version"]
+             process (.start (doto (ProcessBuilder. ^java.util.List (if owned? (cli-process/command argv) argv))
+                               (.redirectErrorStream true)))
+             output (future (with-open [reader (java.io.InputStreamReader. (.getInputStream process))]
+                              (cli-process/read-bounded reader 4096 #(stop! process))))]
+         (try
+           (when (and (.waitFor process 2000 TimeUnit/MILLISECONDS) (zero? (.exitValue process)))
+             (let [out (deref output 1000 nil)]
+               (when out (first (str/split (str/trim out) #"\s+")))))
+           (finally (stop! process) (future-cancel output))))
        (catch Exception _ nil)))))
 
 (defn cli-version
   "Version reported by the configured CLI binary, or nil when unavailable."
+  ([] (cli-version false))
+  ([owned?]
+   (when-let [binary (cli-binary)] (cli-version* binary owned?))))
+
+(defn execution-policy
+  "Non-secret identity of the trusted CLI/text adapter. Credentials are never
+   hashed or exported. Capture at admission and compare before each call."
   []
-  (cli-version* (:cli @settings)))
+  {:version 1 :mode :text :cli-version (cli-version true)
+   :binary-id (hasch/uuid (cli-binary))
+   :environment-id (hasch/uuid (select-keys (text-environment) ["CLAUDE_CONFIG_DIR"]))
+   :settings-id (hasch/uuid (select-keys (call-settings) [:cli :system-note :stall-timeout-ms]))})
 
 ;; ============================================================================
 ;; Usage Limits
@@ -504,9 +556,11 @@
    (`:token`) is revoked when the call ends (`run-claude-streaming`). Else
    nil (the text protocol)."
   [opts]
+  (when-not (contains? #{nil :text} (:execution-mode opts))
+    (throw (ex-info "Unsupported Claude Code execution mode" {:type ::invalid-mode})))
   (let [room-id (:room-id opts)
         tool-names (vec (keep :name (:tools opts)))]
-    (when (and room-id (seq tool-names) (relay-command))
+    (when (and (not= :text (:execution-mode opts)) room-id (seq tool-names) (relay-command))
       (let [token (principal/mint-run-token! {:actor (or (:actor opts) :claude-code)
                                               :room room-id :tools tool-names})]
         (if-let [config (agent-mcp-config room-id tool-names token)]
@@ -524,7 +578,7 @@
         system (extract-system-prompt [] opts)
         effort (resolve-effort opts)
         agent (:agent opts)]
-    (cond-> [(:cli @settings) "-p"
+    (cond-> [(if (= :text (:execution-mode opts)) (:path (cli-binary)) (:cli (call-settings))) "-p"
              "--output-format" "stream-json"
              "--verbose"
              "--include-partial-messages"
@@ -574,17 +628,26 @@
    git root above it, which must never reach a model (a candidate launched
    from simmis's or dvergr's checkout saw that project's configuration)."
   ^java.io.File []
-  (let [base (if (.isDirectory (java.io.File. "/tmp")) "/tmp" (System/getProperty "java.io.tmpdir"))
+  (let [base (or (some (fn [path]
+                         (let [dir (.getCanonicalFile (java.io.File. path))]
+                           (when (and (.isDirectory dir) (.canWrite dir)
+                                      (not-any? #(.exists (java.io.File. ^java.io.File % ".git"))
+                                                (take-while some? (iterate #(.getParentFile ^java.io.File %) dir))))
+                             path)))
+                       ["/tmp" "/var/tmp" (System/getProperty "java.io.tmpdir")])
+                 (throw (ex-info "No project-free CLI working directory" {:type ::unsafe-directory})))
         d (java.io.File. (str base) "dvergr-claude-cli")]
     (.mkdirs d)
     d))
 
 (defn- start-process [cmd]
-  (let [pb (doto (ProcessBuilder. ^java.util.List cmd)
+  (let [pb (doto (ProcessBuilder. ^java.util.List (if *owned-session?* (cli-process/command cmd) cmd))
              (.redirectErrorStream false)
              (.directory (cli-work-dir)))]
-    (when-let [env (:env @settings)]
-      (.putAll (.environment pb) ^java.util.Map env))
+    (if *owned-session?*
+      (do (.clear (.environment pb)) (.putAll (.environment pb) ^java.util.Map (text-environment)))
+      (when-let [env (:env (call-settings))]
+        (.putAll (.environment pb) ^java.util.Map env)))
     (.start pb)))
 
 (defn- close-quietly! [resource]
@@ -599,15 +662,17 @@
    when a graceful destroy is ignored."
   [^Process process]
   (when process
-    (locking process
-      (when (.isAlive process)
-        (let [children (vec (iterator-seq (.iterator ^java.util.stream.Stream (.descendants (.toHandle process)))))]
-          (doseq [^java.lang.ProcessHandle c children] (.destroy c))
-          (.destroy process)
-          (when-not (.waitFor process process-exit-grace-ms TimeUnit/MILLISECONDS)
-            (.destroyForcibly process)
-            (.waitFor process process-exit-grace-ms TimeUnit/MILLISECONDS))
-          (doseq [^java.lang.ProcessHandle c children] (when (.isAlive c) (.destroyForcibly c))))))))
+    (if *owned-session?*
+      (cli-process/stop-session! process)
+      (locking process
+        (when (.isAlive process)
+          (let [children (vec (iterator-seq (.iterator ^java.util.stream.Stream (.descendants (.toHandle process)))))]
+            (doseq [^java.lang.ProcessHandle c children] (.destroy c))
+            (.destroy process)
+            (when-not (.waitFor process process-exit-grace-ms TimeUnit/MILLISECONDS)
+              (.destroyForcibly process)
+              (.waitFor process process-exit-grace-ms TimeUnit/MILLISECONDS))
+            (doseq [^java.lang.ProcessHandle c children] (when (.isAlive c) (.destroyForcibly c)))))))))
 
 (defn- parse-json-line [line]
   (when (and (string? line) (not (str/blank? line)))
@@ -627,11 +692,13 @@
         output (or (:output_tokens usage) 0)
         cache-read (or (:cache_read_input_tokens usage) 0)
         cache-creation (or (:cache_creation_input_tokens usage) 0)]
-    {:input-tokens (+ input cache-read cache-creation)
-     :output-tokens output
-     :cache-read-tokens cache-read
-     :cache-creation-tokens cache-creation
-     :raw-input-tokens input}))
+    (when (seq usage)
+      (cond-> {}
+        (contains? usage :input_tokens) (assoc :input-tokens (+ input cache-read cache-creation)
+                                               :raw-input-tokens input)
+        (contains? usage :output_tokens) (assoc :output-tokens output)
+        (contains? usage :cache_read_input_tokens) (assoc :cache-read-tokens cache-read)
+        (contains? usage :cache_creation_input_tokens) (assoc :cache-creation-tokens cache-creation)))))
 
 (declare run-claude-streaming*)
 
@@ -641,9 +708,14 @@
    into a work room calls the tools natively over MCP with a run token, which
    ends with the call, however it ends."
   [messages opts]
-  (let [agent (agent-invocation opts)]
-    (try (run-claude-streaming* messages opts agent)
-         (finally (some-> agent :token principal/revoke-run-token!)))))
+  (binding [*call-settings* (or *call-settings* @settings)
+            *owned-session?* (= :text (:execution-mode opts))]
+    (when (and (:expected-provider-policy opts)
+               (not= (:expected-provider-policy opts) (execution-policy)))
+      (throw (ex-info "Claude Code execution policy changed" {:type ::policy-drift})))
+    (let [agent (agent-invocation opts)]
+      (try (run-claude-streaming* messages opts agent)
+           (finally (some-> agent :token principal/revoke-run-token!))))))
 
 (defn- run-claude-streaming*
   [messages opts agent]
@@ -652,7 +724,7 @@
         ;; otherwise the tool definitions go into the system prompt as text
         tools (when-not agent (:tools opts))
         tools-prompt (build-tools-prompt tools)
-        note (:system-note @settings)
+        note (:system-note (call-settings))
         effective-system (some->> [system-prompt tools-prompt (when note (str "\n\n" note))]
                                   (remove nil?) seq (apply str) not-empty)
         opts-with-system (cond-> opts
@@ -666,18 +738,19 @@
         on-text (:on-text opts)
         ;; Claude can fill the OS stderr pipe before producing stdout. Drain it
         ;; from process start so neither stream can block the other.
-        stderr-future (future (slurp stderr-reader))
+        stderr-future (future (cli-process/read-bounded stderr-reader 2097152 #(terminate-process! process)))
+        stdout-remaining (volatile! 16777216)
         cancelled? (atom false)
         monitor-done? (atom false)
         cancel? (:cancel? opts)
-        stall-ms (or (:stall-timeout-ms opts) (:stall-timeout-ms @settings) default-stall-timeout-ms)
+        stall-ms (or (:stall-timeout-ms opts) (:stall-timeout-ms (call-settings)) default-stall-timeout-ms)
         last-activity (atom (System/currentTimeMillis))
         stalled? (atom false)
         stall-monitor
         (future
           (try
             (loop []
-              (when (and (not @monitor-done?) (.isAlive process))
+              (when (not @monitor-done?)
                 (if (> (- (System/currentTimeMillis) @last-activity) stall-ms)
                   (do (reset! stalled? true)
                       (terminate-process! process))
@@ -693,7 +766,7 @@
           (future
             (try
               (loop []
-                (when (and (not @monitor-done?) (.isAlive process))
+                (when (not @monitor-done?)
                   (if (cancel?)
                     (do
                       (reset! cancelled? true)
@@ -723,7 +796,7 @@
           ;; failure (or a cancellation race handled by the outer catch).
           (when (.isAlive process)
             (throw e))))
-      (let [result-event (loop [line (.readLine stdout-reader)
+      (let [result-event (loop [line (cli-process/read-line-bounded stdout-reader stdout-remaining)
                                 result nil]
                            (if (nil? line)
                              result
@@ -735,7 +808,7 @@
                                  (when on-text
                                    (when-let [text (extract-text-delta event)]
                                      (on-text text))))
-                               (recur (.readLine stdout-reader)
+                               (recur (cli-process/read-line-bounded stdout-reader stdout-remaining)
                                       (if (and event (= "result" (:type event)))
                                         event
                                         result)))))

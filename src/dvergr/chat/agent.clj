@@ -320,6 +320,7 @@
           reply-notes (:notes reply-hook)
 
           ;; Account for token usage and capture threshold warnings
+          _ (chat-ctx/mark-usage-incomplete! chat-ctx usage)
           ;; cached input (inside :input-tokens, as Codex and Claude Code
           ;; report it) is billed at its own rate, apart
           cache-read (long (or (:cache-read-tokens usage) 0))

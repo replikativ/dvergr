@@ -23,6 +23,10 @@
    This is neither a token budget nor a price. Each retry needs another unit."
   "model-dispatch")
 
+(def cli-run-admissions
+  "One bounded, non-resumable Claude text Run, not one internal HTTP request."
+  "cli-run-admission")
+
 (def ^:dynamic *model-scope*
   "Trusted process-local scope for a resource-governed model worker. Balances
    remain in Kontor's control store, never in this binding or a forked counter."

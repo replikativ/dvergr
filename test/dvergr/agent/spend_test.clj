@@ -9,6 +9,16 @@
     (assert (acct/get-model-pricing id) "the test model has a registry price")
     id))
 
+(deftest partially-reported-run-usage-stays-unknown-in-the-scorecard-projection
+  (let [result (spend/of-budget "claude-code-haiku"
+                                {:used 0 :by-type {:input-tokens 10 :output-tokens 2}
+                                 :unreported-types #{:input-tokens}})
+        measured (spend/measurements [result])]
+    (is (nil? (get-in result [:tokens :input])))
+    (is (= 2 (get-in result [:tokens :output])))
+    (is (false? (:usage-reported? measured)))
+    (is (nil? (:notional-microdollars measured)))))
+
 (deftest presentation-measurements-never-divide-partial-cost-or-usage-totals
   (let [known {:microdollars 0 :notional-microdollars 25 :priced? true :tokens {:input 10 :output 0 :cache-read 2}}
         unknown {:microdollars 0 :priced? false :tokens {}}

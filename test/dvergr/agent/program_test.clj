@@ -14,6 +14,7 @@
             [dvergr.model.chat :as model-chat]
             [dvergr.model.gateway :as gateway]
             [dvergr.model.api.openai :as openai]
+            [dvergr.model.api.claude-code :as claude-code]
             [dvergr.model.providers :as providers]
             [dvergr.agent.spend :as spend]
             [dvergr.resource :as resource]
@@ -77,6 +78,69 @@
 (defn- close-resource-test-room! [room conn]
   (kontor-governance/ungovern! conn)
   (d/close-room! room))
+
+(deftest explicit-text-policy-is-closed-and-content-addressed
+  (let [policy {:kind :llm :execution-mode :text :single-use? true :auto-compact? false}
+        agent {:agent/model-policy {:provider :claude-code :model "claude-code-haiku"}}]
+    (is (= policy (@#'program/validate-program! policy :test agent)))
+    (doseq [bad [(assoc policy :execution-mode :agent)
+                 (assoc policy :auto-compact? true)
+                 (assoc policy :single-use? false)]]
+      (is (thrown? clojure.lang.ExceptionInfo (@#'program/validate-program! bad :test agent))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (@#'program/validate-program! policy :test
+                                               {:agent/model-policy {:provider :openai :model "gpt-test"}})))))
+
+(deftest single-use-cli-run-consumes-admission-and-corrective-replies-consume-steps
+  (let [[room conn] (resource-test-room :cli-single-use)
+        calls (atom [])
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :worker :tools #{} :model-policy {:provider :claude-code :model "claude-code-haiku"}
+               :program {:kind :llm :execution-mode :text :single-use? true
+                         :max-model-steps 2 :auto-compact? false}})]
+    (try
+      (resource/install-unit! room {:symbol resource/cli-run-admissions :name "CLI Run admissions" :precision 0})
+      (resource/mint! room {:id (random-uuid) :resources {resource/cli-run-admissions 1M}})
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    providers/get-provider! (constantly (claude-code/create {}))
+                    claude-code/execution-policy (constantly {:version 1 :mode :text :cli-version "test"})
+                    model-chat/chat (fn [_ opts]
+                                      (swap! calls conj opts)
+                                      {:content "" :usage {:input-tokens 0 :output-tokens 0}
+                                       :stop-reason :end-turn})]
+        (let [handle (binding [ec/*execution-context* (:ctx room)]
+                       (program/hire! room team :worker
+                                      {:task "No hidden calls" :settlement :discard
+                                       :resources {resource/cli-run-admissions 1M}}))
+              result (binding [ec/*execution-context* (:ctx room)] @handle)]
+          (is (= :failed (:run/status result)))
+          (is (= 2 (count @calls)) (pr-str result))
+          (is (every? #(= :text (:execution-mode %)) @calls))
+          (is (= 2 (get-in result [:run/metrics :model-steps])))
+          (is (= 0M (get (resource/run-balance room (program/run-id handle)) resource/cli-run-admissions 0M)))
+          (is (= ::program/resume-denied
+                 (try (program/resume! room room (program/run-id handle)) nil
+                      (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))))
+      (finally (close-resource-test-room! room conn)))))
+
+(deftest concurrent-cli-entries-cannot-share-one-conserved-admission
+  (let [[room conn] (resource-test-room :cli-admission-race)
+        id (random-uuid)]
+    (try
+      (resource/install-unit! room {:symbol resource/cli-run-admissions :name "CLI Run admissions" :precision 0})
+      (resource/mint! room {:id (random-uuid) :resources {resource/cli-run-admissions 1M}})
+      (run/start! room :test (d/post! room (d/message :test :_runs "CLI admission fixture" nil {:role :user})) nil {:id id})
+      (resource/allocate-run! room id nil {resource/cli-run-admissions 1M})
+      (let [enter #(try (resource/consume! room id {:id (random-uuid) :resources {resource/cli-run-admissions 1M}})
+                        :admitted (catch clojure.lang.ExceptionInfo _ :refused))
+            a (future (enter)) b (future (enter))]
+        (is (= {:admitted 1 :refused 1} (frequencies [@a @b])))
+        (is (= :refused (enter)) "Crash/re-entry cannot replay a consumed physical admission"))
+      (finally
+        (when (some #(= id (:run/id %)) (run/active-runs (:id room)))
+          (run/finish! id :completed))
+        (close-resource-test-room! room conn)))))
 
 (defn- fail-terminal-store [delegate fail-terminal?]
   (reify room-store/PRoomStore

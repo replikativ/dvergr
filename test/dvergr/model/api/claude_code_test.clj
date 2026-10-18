@@ -4,6 +4,7 @@
             [dvergr.mcp.server]
             [clojure.test :refer [deftest is testing]]
             [dvergr.model.api.claude-code :as claude-code]
+            [dvergr.model.cli-process :as cli-process]
             [dvergr.model.provider]
             [dvergr.substrate.paths]
             [dvergr.model.subscription :as subscription])
@@ -21,6 +22,13 @@
     #(@#'claude-code/run-claude-streaming
       [{:role :user :content "test prompt"}]
       opts)))
+
+(deftest explicit-text-never-acquires-agent-authority
+  (with-redefs-fn {#'claude-code/relay-command (fn [] (throw (AssertionError. "No relay lookup in explicit text mode")))}
+    #(is (nil? (@#'claude-code/agent-invocation
+                {:execution-mode :text :room-id "work-room" :tools [{:name "clojure_eval"}]}))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (@#'claude-code/agent-invocation {:execution-mode :unknown}))))
 
 (deftest cli-transport-does-not-leak-claude-codes-native-harness
   (let [command (#'claude-code/build-command
@@ -51,10 +59,84 @@
       (is (= "transport ok" (:content result)))
       (is (= {:input-tokens 3
               :output-tokens 2
-              :cache-read-tokens 0
-              :cache-creation-tokens 0
               :raw-input-tokens 3}
              (:usage result))))))
+
+(deftest absent-usage-is-not-zero
+  (is (nil? (@#'claude-code/parse-result-usage {})))
+  (is (= {:output-tokens 0} (@#'claude-code/parse-result-usage {:usage {:output_tokens 0}})))
+  (is (= {:input-tokens 0 :raw-input-tokens 0}
+         (@#'claude-code/parse-result-usage {:usage {:input_tokens 0}}))))
+
+(deftest replacing-the-cli-invalidates-its-version-and-policy
+  (let [script (doto (java.io.File/createTempFile "cli-policy" ".sh") (.setExecutable true))
+        before (claude-code/settings-snapshot)]
+    (try
+      (spit script "#!/bin/sh\necho version-one\n")
+      (claude-code/configure! {:cli (.getAbsolutePath script) :env {"CLAUDE_CONFIG_DIR" "/private/first"}})
+      (let [first (claude-code/execution-policy)]
+        (spit script "#!/bin/sh\necho version-two-changed\n")
+        (let [second (claude-code/execution-policy)]
+          (is (= "version-one" (:cli-version first)))
+          (is (= "version-two-changed" (:cli-version second)))
+          (is (not= (:binary-id first) (:binary-id second)))
+          (claude-code/configure! {:env {"CLAUDE_CONFIG_DIR" "/private/second"}})
+          (is (not= (:environment-id second) (:environment-id (claude-code/execution-policy))))))
+      (finally (claude-code/restore-settings! before) (.delete script)))))
+
+(deftest version-probe-stops-its-process-session
+  (let [script (doto (java.io.File/createTempFile "cli-probe" ".sh") (.setExecutable true))
+        receipt (java.io.File/createTempFile "cli-probe-session" ".txt")
+        before (claude-code/settings-snapshot)]
+    (try
+      (spit script (str "#!/bin/sh\necho $$ > '" (.getAbsolutePath receipt) "'\nsleep 30 & wait\n"))
+      (claude-code/configure! {:cli (.getAbsolutePath script)})
+      (let [started (System/currentTimeMillis)]
+        (is (nil? (claude-code/cli-version true)))
+        (is (< (- (System/currentTimeMillis) started) 6000))
+        (is (empty? (dvergr.model.cli-process/live-members (Long/parseLong (str/trim (slurp receipt)))))))
+      (finally (claude-code/restore-settings! before) (.delete script) (.delete receipt)))))
+
+(deftest legacy-version-probe-does-not-require-linux-session-support
+  (let [script (doto (java.io.File/createTempFile "cli-portable" ".sh") (.setExecutable true))
+        before (claude-code/settings-snapshot)]
+    (try
+      (spit script "#!/bin/sh\necho portable-version\n")
+      (claude-code/configure! {:cli (.getAbsolutePath script)})
+      (with-redefs [cli-process/command (fn [_] (throw (UnsupportedOperationException. "No Linux sessions")))]
+        (is (= "portable-version" (claude-code/cli-version)))
+        (is (nil? (claude-code/cli-version true))))
+      (finally (claude-code/restore-settings! before) (.delete script)))))
+
+(deftest explicit-text-executes-the-resolved-binary-outside-sanitized-path
+  (let [script (doto (java.io.File/createTempFile "cli-outside-path" ".sh") (.setExecutable true))
+        before (claude-code/settings-snapshot)]
+    (try
+      (spit script (str "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '" result-json "'\n"))
+      (claude-code/configure! {:cli (.getAbsolutePath script) :env nil})
+      (is (= (.getCanonicalPath script)
+             (first (@#'claude-code/build-command {:execution-mode :text :model "claude-code-haiku"}))))
+      (is (= "transport ok" (:content (@#'claude-code/run-claude-streaming
+                                       [{:role :user :content "fixture"}]
+                                       {:execution-mode :text :model "claude-code-haiku"}))))
+      (finally (claude-code/restore-settings! before) (.delete script)))))
+
+(deftest explicit-text-stops-descendants-after-parent-exit
+  (let [cancel? (atom false)
+        command ["sh" "-c" "cat >/dev/null; sleep 30 & exit 0"]
+        task (future (try (run-with-command command {:execution-mode :text :cancel? #(deref cancel?)})
+                          (catch Throwable e e)))]
+    (Thread/sleep 300)
+    (reset! cancel? true)
+    (is (not= ::timeout (deref task 5000 ::timeout)))))
+
+(deftest cli-capture-is-bounded
+  (doseq [command [["sh" "-c" "cat >/dev/null; head -c 2200000 /dev/zero"]
+                   ["sh" "-c" "cat >/dev/null; head -c 2200000 /dev/zero >&2; sleep 30"]]]
+    (let [outcome (deref (future (try (run-with-command command {:execution-mode :text})
+                                      (catch Throwable e e))) 10000 ::timeout)]
+      (is (not= ::timeout outcome))
+      (is (instance? Throwable outcome)))))
 
 (deftest cli-transport-cancellation-destroys-subprocess
   (testing ":cancel? terminates an in-flight subscription CLI call"

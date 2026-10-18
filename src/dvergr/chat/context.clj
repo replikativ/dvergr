@@ -118,18 +118,18 @@
         new-state
         (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
           (swap! (:budget-signal chat-ctx)
-                 (fn [{:keys [total used by-type crossed-thresholds]}]
+                 (fn [{:keys [total used by-type crossed-thresholds] :as budget}]
                    (let [new-used (+ used cost)
                          pct-used (if (pos? total) (/ (double new-used) total) 0.0)
                          threshold (acct/check-thresholds pct-used (or crossed-thresholds #{}))
                          new-crossed (if threshold
                                        (conj (or crossed-thresholds #{}) (:pct threshold))
                                        crossed-thresholds)]
-                     {:total total
-                      :used new-used
-                      :by-type (update by-type resource-type (fnil + 0) amount)
-                      :crossed-thresholds new-crossed
-                      ::just-crossed threshold}))))
+                     (assoc budget :total total
+                            :used new-used
+                            :by-type (update by-type resource-type (fnil + 0) amount)
+                            :crossed-thresholds new-crossed
+                            ::just-crossed threshold)))))
         threshold-info (::just-crossed new-state)
         ;; model spend on the one ledger: a Run with a microdollar wallet pays
         ;; from it, and has no more budget when it is empty
@@ -168,6 +168,14 @@
    (account-tokens! chat-ctx type amount {}))
   ([chat-ctx type amount {:keys [model prompt-tokens]}]
    (account-usage! chat-ctx type amount :model model :prompt-tokens prompt-tokens)))
+
+(defn mark-usage-incomplete!
+  "Missing dimensions stay missing even if later steps report those tokens."
+  [chat-ctx usage]
+  (let [missing (remove #(contains? usage %) [:input-tokens :output-tokens])]
+    (when (seq missing)
+      (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
+        (swap! (:budget-signal chat-ctx) update :unreported-types (fnil into #{}) missing)))))
 
 (defn add-message!
   "Add a message to the chat.

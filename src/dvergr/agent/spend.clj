@@ -128,7 +128,7 @@
 (defn of-budget
   "The spend a chat budget already accounted (`:used` microdollars, `:by-type`
    natural units), attributed to `model`."
-  [model {:keys [used by-type]}]
+  [model {:keys [used by-type unreported-types]}]
   ;; a chat budget accounts uncached input under :input-tokens and cached
   ;; input apart (`dvergr.chat.agent`); a spend's input counts both
   ;; and the writes kept an hour apart from the other writes, a usage counts
@@ -137,9 +137,10 @@
         by-type (cond-> by-type (pos? hour) (update :cache-creation-tokens (fnil + 0) hour))
         cached (+ (get by-type :cache-read-tokens 0) (get by-type :cache-creation-tokens 0))
         by-type (cond-> by-type (pos? cached) (update :input-tokens (fnil + 0) cached))
+        by-type (apply dissoc by-type unreported-types)
         tokens (tokens-of by-type)
-        worth (notional model by-type)
-        one (cond-> {:microdollars (long (or used 0)) :tokens tokens :priced? true}
+        worth (when-not (seq unreported-types) (notional model by-type))
+        one (cond-> {:microdollars (long (or used 0)) :tokens tokens :priced? (not (seq unreported-types))}
               worth (assoc :notional-microdollars worth))]
     (assoc one :by-model (if model {model one} {}))))
 

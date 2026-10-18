@@ -23,6 +23,7 @@
             [dvergr.discourse :as d]
             [dvergr.model.providers :as providers]
             [dvergr.model.registry :as registry]
+            [dvergr.model.api.claude-code :as claude-code]
             [dvergr.resource :as resource]
             [dvergr.room.store :as room-store]
             [dvergr.system.rooms :as system-rooms]
@@ -711,8 +712,11 @@
      (= :llm (get-in agent [:agent/program :kind]))
      (let [tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))]
        (let [spec (resolve-model-spec agent)]
-         (llm-inputs (llm-instructions agent tool-map) tool-map spec (compaction-spec agent spec)
-                     (:agent/sandbox agent))))
+         (cond-> (llm-inputs (llm-instructions agent tool-map) tool-map spec (compaction-spec agent spec)
+                             (:agent/sandbox agent))
+           (get-in agent [:agent/program :execution-mode])
+           (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
+                  :provider-policy (claude-code/execution-policy)))))
 
      :else nil)))
 
@@ -893,6 +897,15 @@
            (start-worker!
             supervisor
             (fn []
+              (when-let [expected (get-in agent [:agent/program :provider-policy])]
+                (when-not (= expected (claude-code/execution-policy))
+                  (throw (ex-info "Admitted Claude Code policy changed" {:type ::provider-policy-drift}))))
+              (when (get-in agent [:agent/program :single-use?])
+                ;; Each physical entry needs a fresh debit. The Run owns
+                ;; exactly ONE conserved admission, so concurrent/replayed
+                ;; initialization cannot both pass Kontor's atomic validation.
+                (resource/consume! control-room run-id
+                                   {:id (random-uuid) :resources {resource/cli-run-admissions 1M}}))
               (let [{:keys [chat-ctx owned-db?]}
                     (new-llm-context control-room work-room run-id agent
                                      budget-dollars chat-id supervisor)
@@ -922,7 +935,10 @@
                     ;; what the model is presented with: the system prompt it
                     ;; is sent (a resumed Run's is the one it started with)
                     compaction (compaction-spec agent model-spec)
-                    inputs (llm-inputs sent tool-map model-spec compaction (:agent/sandbox agent))]
+                    inputs (cond-> (llm-inputs sent tool-map model-spec compaction (:agent/sandbox agent))
+                             (get-in agent [:agent/program :execution-mode])
+                             (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
+                                    :provider-policy (claude-code/execution-policy)))]
                 (update-llm-metrics!
                  supervisor
                  (constantly
@@ -947,6 +963,7 @@
                  :tool-ctx tool-ctx
                  :compaction compaction
                  :model-inputs [(:model inputs) (:compaction inputs)]
+                 :provider-policy (:provider-policy inputs)
                  :model-spec model-spec})))
            initialized (sp/await (worker-result-spin init-worker))]
        (when (or (= ::worker-cancelled initialized)
@@ -957,7 +974,7 @@
                          {:type ::runtime-initialization-failed
                           :agent/id (:agent/id agent)}
                          (::worker-error initialized))))
-       (let [{:keys [chat-ctx tool-map tool-ctx model-spec model-inputs compaction]} initialized
+       (let [{:keys [chat-ctx tool-map tool-ctx model-spec model-inputs compaction provider-policy]} initialized
              posted (ratom/create-atom 0)
              ;; whether this Run's model called tools, and whether it then
              ;; ended silently (`chat-agent/*run-activity*`); a resumed Run
@@ -971,6 +988,8 @@
                  (start-worker!
                   supervisor
                   (fn []
+                    (when (and provider-policy (not= provider-policy (claude-code/execution-policy)))
+                      (throw (ex-info "Claude Code execution policy changed" {:type ::provider-policy-drift})))
                     (binding [chat-agent/*turn-failure* failure
                               chat-agent/*run-activity* activity
                               ;; the step is the charge scope: its debits have
@@ -1005,15 +1024,18 @@
                         ;; The world this Run works in, for an adapter whose
                         ;; model is an external agent (claude -p): it invokes
                         ;; that agent INTO this room over MCP.
-                          :model-opts {:room-id (let [id (:id work-room)]
-                                                  (if (keyword? id) (subs (str id) 1) (str id)))
+                          :model-opts (cond-> {:room-id (let [id (:id work-room)]
+                                                          (if (keyword? id) (subs (str id) 1) (str id)))
                                        ;; whose run token it gets (dvergr.principal)
-                                       :actor (:agent/id agent)}})))))
+                                               :actor (:agent/id agent)}
+                                        (get-in agent [:agent/program :execution-mode])
+                                        (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
+                                               :expected-provider-policy provider-policy))})))))
                  outcome (sp/await (worker-result-spin call))
                  budget (chat-context/get-budget chat-ctx)]
              (update-llm-metrics!
               supervisor merge {:model-steps (inc model-step)
-                                :usage (select-keys budget [:used :by-type])})
+                                :usage (select-keys budget [:used :by-type :unreported-types])})
              ;; posting the turn's rows is a durable write: off the drain
              (sp/await (blocking/blocking
                         #(turn/post-turn-activity! control-room (:agent/id agent) chat-ctx posted
@@ -1209,13 +1231,13 @@
   #{:task :from :parent-run :settlement :resources :limits :role})
 
 (defn- validate-program!
-  [{:keys [kind delay-ms max-model-steps budget-dollars auto-compact? compaction-model]
+  [{:keys [kind delay-ms max-model-steps budget-dollars auto-compact? compaction-model execution-mode single-use? provider-policy]
     :as program} agent-ref agent]
   (let [allowed (case kind
                   :scripted #{:kind :delay-ms :reply :result}
                   :echo #{:kind :delay-ms}
                   :llm #{:kind :max-model-steps :budget-dollars
-                         :auto-compact? :compaction-model}
+                         :auto-compact? :compaction-model :execution-mode :single-use? :provider-policy}
                   nil)]
     (when-not allowed
       (throw (ex-info "hire! does not have an interpreter for this program"
@@ -1251,6 +1273,16 @@
     (when (and (= :llm kind) compaction-model (not (string? compaction-model)))
       (throw (ex-info "LLM program :compaction-model must be a string"
                       {:type ::invalid-compaction-model :compaction-model compaction-model})))
+    (when (and execution-mode
+               (not (and (= :text execution-mode)
+                         (= :claude-code (get-in agent [:agent/model-policy :provider])))))
+      (throw (ex-info "Explicit text mode requires Claude Code" {:type ::invalid-execution-mode})))
+    (when (and (contains? program :single-use?)
+               (not (and (true? single-use?) (= :text execution-mode) (false? auto-compact?))))
+      (throw (ex-info "Single-use CLI Runs require text mode and disabled compaction" {:type ::invalid-single-use})))
+    (when (and provider-policy (not (and (= :text execution-mode) (map? provider-policy)
+                                         (roster/data-value? provider-policy))))
+      (throw (ex-info "Provider policy requires text mode and portable data" {:type ::invalid-provider-policy})))
     (when (= :llm kind)
       (let [policy (:agent/model-policy agent)]
         (when (and policy
@@ -1320,6 +1352,10 @@
                   (throw (ex-info "Unknown AgentRef"
                                   {:type ::unknown-agent :agent-ref agent-ref})))]
     (validate-program! (:agent/program agent) agent-ref agent)
+    (when (and (get-in agent [:agent/program :single-use?])
+               (not= {resource/cli-run-admissions 1M} resources))
+      (throw (ex-info "Single-use CLI Runs require exactly one CLI admission, no other provider grants"
+                      {:type ::invalid-cli-grant})))
     (when (and (seq limits) (not= :llm (get-in agent [:agent/program :kind])))
       (throw (ex-info "hire! model limits require an LLM AgentDef"
                       {:type ::limits-require-llm
@@ -2006,6 +2042,9 @@
     (when-not data
       (throw (ex-info "The Run has no savepoint to resume from" {:type ::no-savepoint :run/id run-id})))
     (let [{:keys [agent task step]} (:savepoint/payload data)
+          _ (when (get-in agent [:agent/program :single-use?])
+              (throw (ex-info "Single-use CLI Runs require a new explicitly admitted task"
+                              {:type ::resume-denied :run/id run-id})))
           new-id (random-uuid)
           ;; excludes a concurrent resume; nothing durable changes until the
           ;; new Run is admitted and holds the old Run's wallet

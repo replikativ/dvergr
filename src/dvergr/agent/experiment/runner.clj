@@ -248,8 +248,8 @@
    evaluation in the latter loses its Run's wakeups. `capabilities` is
    `{:world-setup :protocol :evaluator}` (setup and protocol when named)."
   [room {:keys [capabilities team experiment parallelism cleanup-group benchmark parent-run
-                world-parent admit]
-         :or {parallelism 1}}]
+                world-parent admit resume?]
+         :or {parallelism 1 resume? true}}]
   (let [{:keys [world-setup protocol evaluator]} capabilities
         cells (* (count (:experiment/candidates experiment))
                  (count (get-in experiment [:experiment/dataset :dataset/environments]))
@@ -266,7 +266,7 @@
         :max-parallelism (max 16 parallelism)
         :max-attempts (max 256 cells)
         :cleanup-group cleanup-group
-        :resume? true
+        :resume? resume?
         :complete-only? true
         :on-result #(log-cell benchmark %)
         :parent-run parent-run
