@@ -103,27 +103,31 @@
   (memoize
    (fn [binary owned?]
      (try
-       (let [stop! (if owned? cli-process/stop-session!
-                       (fn [^Process p]
-                         (.destroyForcibly p)
-                         (.waitFor p 1000 TimeUnit/MILLISECONDS)))
-             argv [(:path binary) "--version"]
-             process (.start (doto (ProcessBuilder. ^java.util.List (if owned? (cli-process/command argv) argv))
-                               (.redirectErrorStream true)))
-             output (future (with-open [reader (java.io.InputStreamReader. (.getInputStream process))]
-                              (cli-process/read-bounded reader 4096 #(stop! process))))]
-         (try
-           (when (and (.waitFor process 2000 TimeUnit/MILLISECONDS) (zero? (.exitValue process)))
-             (let [out (deref output 1000 nil)]
-               (when out (first (str/split (str/trim out) #"\s+")))))
-           (finally (stop! process) (future-cancel output))))
-       (catch Exception _ nil)))))
+       (or (let [stop! (if owned? cli-process/stop-session!
+                           (fn [^Process p]
+                             (.destroyForcibly p)
+                             (.waitFor p 1000 TimeUnit/MILLISECONDS)))
+                 argv [(:path binary) "--version"]
+                 process (.start (doto (ProcessBuilder. ^java.util.List (if owned? (cli-process/command argv) argv))
+                                   (.redirectErrorStream true)))
+                 output (future (with-open [reader (java.io.InputStreamReader. (.getInputStream process))]
+                                  (cli-process/read-bounded reader 4096 #(stop! process))))]
+             (try
+               (when (and (.waitFor process 2000 TimeUnit/MILLISECONDS) (zero? (.exitValue process)))
+                 (let [out (deref output 1000 nil)]
+                   (when out (first (str/split (str/trim out) #"\s+")))))
+               (finally (stop! process) (future-cancel output))))
+           ;; memoize caches values, not exceptions. A temporary discovery
+           ;; failure must not permanently disable an unchanged installation.
+           (throw (ex-info "CLI version probe unavailable" {:type ::probe-unavailable})))
+       (catch Exception error (throw error))))))
 
 (defn cli-version
   "Version reported by the configured CLI binary, or nil when unavailable."
   ([] (cli-version false))
   ([owned?]
-   (when-let [binary (cli-binary)] (cli-version* binary owned?))))
+   (try (when-let [binary (cli-binary)] (cli-version* binary owned?))
+        (catch Exception _ nil))))
 
 (defn execution-policy
   "Non-secret identity of the trusted CLI/text adapter. Credentials are never

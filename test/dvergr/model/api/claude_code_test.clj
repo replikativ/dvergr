@@ -108,6 +108,22 @@
         (is (nil? (claude-code/cli-version true))))
       (finally (claude-code/restore-settings! before) (.delete script)))))
 
+(deftest failed-version-discovery-is-not-cached-but-success-is
+  (let [script (doto (java.io.File/createTempFile "cli-recover-probe" ".sh") (.setExecutable true))
+        receipt (doto (java.io.File/createTempFile "cli-recover-probe-count" ".txt") (.delete))
+        before (claude-code/settings-snapshot)]
+    (try
+      (spit script (str "#!/bin/sh\nif test ! -f '" receipt "'; then echo first > '" receipt "'; exit 1; fi\necho successful-probe\n"))
+      (claude-code/configure! {:cli (.getAbsolutePath script)})
+      (is (nil? (claude-code/cli-version true)))
+      (is (= "successful-probe" (claude-code/cli-version true)))
+      ;; The fingerprint remains unchanged; changing the marker to force a
+      ;; failure proves a third call uses the already cached success.
+      (.delete receipt)
+      (is (= "successful-probe" (claude-code/cli-version true)))
+      (is (not (.exists receipt)))
+      (finally (claude-code/restore-settings! before) (.delete script) (.delete receipt)))))
+
 (deftest explicit-text-executes-the-resolved-binary-outside-sanitized-path
   (let [script (doto (java.io.File/createTempFile "cli-outside-path" ".sh") (.setExecutable true))
         before (claude-code/settings-snapshot)]

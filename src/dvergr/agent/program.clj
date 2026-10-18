@@ -861,6 +861,10 @@
                     :on-error (fn [e] (binding [ec/*execution-context* caller] (done {::savepoint-error e})))}))
     (sp/spin (sp/await done))))
 
+(defn- model-step-usage [budget uncertain?]
+  (cond-> (select-keys budget [:used :by-type :unreported-types])
+    uncertain? (update :unreported-types (fnil into #{}) [:input-tokens :output-tokens])))
+
 (defn- execute-llm-program
   "Run a bounded Dvergr-native model/tool loop. Each blocking model round-trip
    runs under a supervised worker; this Spin retains orchestration, activity
@@ -984,6 +988,10 @@
            (when (run/cancel-requested? run-id)
              (cancelled! run-id))
            (let [failure (volatile! nil)
+                 ;; An in-flight call has no complete usage report yet. If
+                 ;; cancellation bypasses the post-worker snapshot, terminal
+                 ;; metrics must not retain the previous step's known totals.
+                 _ (update-llm-metrics! supervisor update :usage model-step-usage true)
                  call
                  (start-worker!
                   supervisor
@@ -1035,7 +1043,9 @@
                  budget (chat-context/get-budget chat-ctx)]
              (update-llm-metrics!
               supervisor merge {:model-steps (inc model-step)
-                                :usage (select-keys budget [:used :by-type :unreported-types])})
+                                :usage (model-step-usage budget
+                                                         (or (not (contains? #{:continue :complete} outcome))
+                                                             (run/cancel-requested? run-id)))})
              ;; posting the turn's rows is a durable write: off the drain
              (sp/await (blocking/blocking
                         #(turn/post-turn-activity! control-room (:agent/id agent) chat-ctx posted

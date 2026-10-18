@@ -124,6 +124,22 @@
                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))))
       (finally (close-resource-test-room! room conn)))))
 
+(deftest in-flight-or-cancelled-model-steps-never-certify-previous-usage
+  (doseq [budget [{} {:used 0 :by-type {:input-tokens 0 :output-tokens 0}}
+                  {:used 0 :by-type {:input-tokens 10 :output-tokens 2}}]]
+    (let [usage (#'program/model-step-usage budget true)
+          result (spend/of-budget "claude-code-haiku" usage)]
+      (is (= #{:input-tokens :output-tokens} (:unreported-types usage)))
+      (is (false? (:priced? result)))
+      (is (nil? (:notional-microdollars result)))
+      (is (empty? (:tokens result)))))
+  (let [known {:used 0 :by-type {:input-tokens 0 :output-tokens 0}}
+        usage (#'program/model-step-usage known false)]
+    (is (= known usage))
+    (is (true? (:priced? (spend/of-budget "claude-code-haiku" usage)))))
+  (is (= #{:input-tokens}
+         (:unreported-types (#'program/model-step-usage {:unreported-types #{:input-tokens}} false)))))
+
 (deftest concurrent-cli-entries-cannot-share-one-conserved-admission
   (let [[room conn] (resource-test-room :cli-admission-race)
         id (random-uuid)]
@@ -1235,7 +1251,8 @@
               (is (= :cancelled (:run/status result)))
               (is (= {:provider :test
                       :model "stub"
-                      :usage {:used 0 :by-type {}}}
+                      :usage {:used 0 :by-type {}
+                              :unreported-types #{:input-tokens :output-tokens}}}
                      (dissoc (:run/metrics result)
                              :prompt-id :inputs-id :model-steps)))
               (is (<= 1 (get-in result [:run/metrics :model-steps]) 2)
