@@ -691,7 +691,7 @@
          model-limits (when agent (require-supported-policy! definition agent protocol))]
      (when-let [unknown (seq (remove #{:from :parent-run :world-setup
                                        :cleanup-group :protocol :metrics :world-parent
-                                       :hold? :experiment-capabilities}
+                                       :hold? :experiment-capabilities :delegation-policy}
                                      (keys opts)))]
        (throw (ex-info "Evaluation contains unknown options"
                        {:type ::unknown-evaluation-options
@@ -792,7 +792,7 @@
                        room cleanup-group
                        #(program/hire-prepared-in! room (or world-parent room) team agent-ref
                                                    hire-opts prepare-world! hosted-protocol
-                                                   (assoc (select-keys opts [:experiment-capabilities])
+                                                   (assoc (select-keys opts [:experiment-capabilities :delegation-policy])
                                                           :deadline-nanos deadline-nanos))
                        #(program/cancel! room %))
             timed-out ::timed-out

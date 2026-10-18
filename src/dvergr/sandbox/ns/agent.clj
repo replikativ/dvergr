@@ -497,6 +497,7 @@
         experiment-ref* (requiring-resolve 'dvergr.agent.experiment/experiment-ref)
         hire-in*       (requiring-resolve 'dvergr.agent.program/hire-in!)
         observe*       (requiring-resolve 'dvergr.agent.program/observe)
+        require-scoped-run!* (requiring-resolve 'dvergr.agent.authority/require-scoped-run!)
         snapshot*      (requiring-resolve 'dvergr.agent.observation/snapshot)
         read-output*   (requiring-resolve 'dvergr.agent.output/read-output)
         issue-receipt* (requiring-resolve 'dvergr.agent.observation/issue-receipt!)
@@ -578,7 +579,7 @@
                                                        (not (contains? opts :parent-run)))
                                                 (assoc opts :parent-run ambient-parent)
                                                 opts)
-                                              (select-keys agent-program-ceiling [:experiment-capabilities]))]
+                                              (select-keys agent-program-ceiling [:experiment-capabilities :delegation-policy]))]
                                (if-let [own-child! (:own-child! agent-program-ceiling)]
                                  (own-child! admit-child!)
                                  (admit-child!))))))
@@ -594,6 +595,8 @@
                          (let [work-room (room!)
                                control-room (control-room! work-room)]
                            (binding [ec/*execution-context* (:ctx work-room)]
+                             (when-let [scope (:parent-run agent-program-ceiling)]
+                               (require-scoped-run!* control-room scope (if (uuid? handle-or-id) handle-or-id (run-id* handle-or-id))))
                              (observe* control-room handle-or-id))))
         inspect-fn     (fn inspect-fn
                          ([] (inspect-fn {}))
@@ -643,6 +646,8 @@
                          (let [work-room (room!)
                                control-room (control-room! work-room)]
                            (binding [ec/*execution-context* (:ctx work-room)]
+                             (when-let [scope (:parent-run agent-program-ceiling)]
+                               (require-scoped-run!* control-room scope (if (uuid? handle-or-id) handle-or-id (run-id* handle-or-id))))
                              (cancel* control-room handle-or-id))))
         result-spin-fn (fn [handle]
                          (if-let [run-id (:parent-run agent-program-ceiling)]
@@ -695,6 +700,8 @@
         'offered      (fn [] (if (contains? agent-program-ceiling :experiment-capabilities)
                                (offered* (:experiment-capabilities agent-program-ceiling))
                                (offered*)))
+        'delegation-policy (fn [] (:delegation-policy agent-program-ceiling))
+        'current-run-id (fn [] (:parent-run agent-program-ceiling))
         'observe      observe-fn
         'inspect      inspect-fn
         'attempt-output attempt-output-fn
@@ -725,6 +732,8 @@
            hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (dvergr.agent/hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it); :role, a keyword naming the part the child plays (:candidate, :judge, ...), which its spend is summed under (see `split`). Unknown keys are rejected."]
            run-experiment! [([roster experiment] [roster experiment opts]) "Run a child experiment in forks of the current world, using only offered verifiers/setups. Returns a Spin of {:job uuid :status keyword :scorecard ScorecardDef (when completed) :error string}. A hired parent owns it even when ignored; cancellation joins cleanup before returning resources. opts: :parallelism (default 1), :resources (explicit aggregate grant covering every candidate/case/repetition). Paid cells require funded per-cell native-provider grants; CLI/relay execution is not admitted. Verifier scope follows recursive hires; an empty scope offers nothing."]
            offered      [([]) "The verifier and world-setup refs this host offers to experiments: {:evaluators [ref ...] :world-setups [ref ...]}."]
+           delegation-policy [([]) "The host's portable child delegation bounds, or nil for a trusted legacy caller. :tools is the maximum tool set, :sandboxes enumerates exact allowed extension combinations, :providers permits LLM transports; optional :max-attempts/:max-parallelism bound each child experiment. Child definitions cannot override this policy."]
+           current-run-id [([]) "The ambient consumer Run UUID, or nil outside a hired Run. This is host-issued scope, not a caller-selected Run identity."]
            observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
            inspect      [([] [opts]) "Inspect the current Run and its structural descendants as one bounded snapshot of Runs, frontier, correlated messages, semantic activities, failures, and conserved balances. Inside a hired agent this cannot see parent or sibling Runs, and inspection without an ambient Run fails closed. A durable semantic receipt identifies the inspection. Options: :run-limit, :message-limit, :content-limit, :content-budget, :detail-limit."]
            attempt-output [([attempt-id] [attempt-id opts]) "Read deliberately published :agent/output from a certified Attempt in the current Run subtree. Private verifier evidence is never returned. opts: :path (map keys/vector indices, at most 16), :offset/:length for string chunks (UTF-16 units; length at most 16384). Maps/collections are bounded; select a smaller path if too large. Returns immutable Attempt identity and :output, with :next-offset for further string chunks. A successful child read records a causal input; missing scope/publication fails closed."]
@@ -752,6 +761,8 @@
           'hire!           [:=> [:cat Roster AgentIdOrRef HireOpts] RunHandle]
           'run-experiment! [:function [:=> [:cat Roster :map] :any] [:=> [:cat Roster :map :map] :any]]
           'offered         [:=> [:cat] :map]
+          'delegation-policy [:=> [:cat] [:maybe :map]]
+          'current-run-id   [:=> [:cat] [:maybe :uuid]]
           'observe         [:=> [:cat [:or :uuid RunHandle]] [:maybe Run]]
           'inspect         [:function [:=> [:cat] Observation]
                             [:=> [:cat InspectOpts] Observation]]

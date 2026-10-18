@@ -2,6 +2,7 @@
   "An SCI child experiment uses ordinary Jobs, evaluation and conserved wallets.
    This adapter owns no candidate state and introduces no new execution engine."
   (:require [dvergr.agent.experiment-admission :as admission]
+            [dvergr.agent.authority :as authority]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.program :as program]
@@ -45,11 +46,10 @@
                      (reset! allocation :allocated))
                    (experiment/run
                     control-room team definition (:evaluators capabilities)
-                    (cond-> {:world-setups (:world-setups capabilities)
-                             :parallelism parallelism :parent-run id :world-parent work-room
-                             :cleanup-group group :complete-only? true}
-                      (contains? authority :experiment-capabilities)
-                      (assoc :experiment-capabilities (:experiment-capabilities authority)))))
+                    (merge (select-keys authority authority/host-option-keys)
+                           {:world-setups (:world-setups capabilities)
+                            :parallelism parallelism :parent-run id :world-parent work-room
+                            :cleanup-group group :complete-only? true})))
                  :before-finish
                  (fn [id _ _]
                    (let [failure (quiesce! control-room group)]

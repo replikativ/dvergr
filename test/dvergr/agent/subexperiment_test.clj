@@ -62,6 +62,10 @@
   (let [[room conn] (#'fixtures/resource-test-room :owned-subexperiment)
         child-entered (promise) release (promise) parent-done (promise)
         parent-calls (atom 0) dispatches (atom 0)
+        seen-policies (atom {})
+        execute-turn chat-agent/run-agent-turn!
+        policy {:tools #{:clojure_eval} :sandboxes #{#{}}
+                :providers #{:test :codex-subscription} :max-attempts 2 :max-parallelism 1}
         scorer (evaluation/make-evaluator
                 {:id :test/owned :version 1 :observe (fn [{:keys [default]}] default)
                  :verify (fn [_ _] {:checks {:done true} :reward 1.0})})
@@ -76,6 +80,10 @@
       (resource/mint! room {:id (random-uuid) :resources {"microUSD" 300M "model-dispatch" 6M}})
       (with-redefs [providers/ensure-initialized! (constantly nil)
                     chat-agent/messages->api-format (fn [messages _ _] messages)
+                    chat-agent/run-agent-turn! (fn [ctx opts]
+                                                 (swap! seen-policies assoc (:model opts)
+                                                        (get-in opts [:tool-ctx :agent-program-ceiling :delegation-policy]))
+                                                 (execute-turn ctx opts))
                     chat/chat
                     (fn [_ opts]
                       (resource/admit-model-dispatch!)
@@ -97,7 +105,8 @@
           (let [handle (program/hire-in!
                         room room team :parent {:task :coordinate :settlement :discard
                                                 :resources {"microUSD" 300M "model-dispatch" 6M}}
-                        {:experiment-capabilities scope})]
+                        {:experiment-capabilities scope
+                         :delegation-policy policy})]
             (try
               (is (= true (deref child-entered 10000 ::timeout)))
               (is (= true (deref parent-done 10000 ::timeout)))
@@ -107,6 +116,9 @@
               (is (= {} (resource/balance room)))
               (finally (deliver release true)))
             (is (= (if cancel? :cancelled :completed) (:run/status (deref handle 10000 ::timeout))))
+            (is (= 2 (count @seen-policies)))
+            (is (contains? @seen-policies "parent"))
+            (is (every? #(= policy %) (vals @seen-policies)))
             (is (= {"microUSD" 300M "model-dispatch" (bigdec (- 6 @dispatches))} (resource/balance room)))
             (is (empty? (run/active-runs (:id room)))))))
       (finally

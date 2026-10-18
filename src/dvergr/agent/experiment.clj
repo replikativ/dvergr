@@ -904,7 +904,7 @@
    (when-let [unknown (seq (remove #{:from :parent-run :world-parent :parallelism
                                      :max-parallelism :max-attempts
                                      :world-setups :protocols :cleanup-group
-                                     :resume? :complete-only? :on-result :admit :experiment-capabilities}
+                                     :resume? :complete-only? :on-result :admit :experiment-capabilities :delegation-policy}
                                    (keys opts)))]
      (invalid! "Experiment contains unknown run options"
                ::unknown-run-options {:unknown (set unknown)}))
@@ -926,7 +926,7 @@
                        ::attempts-exceed-ceiling
                        {:attempt-count attempt-count
                         :max-attempts max-attempts}))
-         base-evaluation-opts (assoc (select-keys opts [:from :parent-run :world-parent :experiment-capabilities])
+         base-evaluation-opts (assoc (select-keys opts [:from :parent-run :world-parent :experiment-capabilities :delegation-policy])
                                      :cleanup-group cleanup-group)
          capabilities {:world-setups world-setups :protocols protocols}
          ;; Validate every distinct candidate/environment pairing once before

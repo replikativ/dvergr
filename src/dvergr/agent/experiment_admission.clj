@@ -2,6 +2,7 @@
   "Pure admission of an agent's child experiment. No wallet mutation, execution
    or new authority: the explicit aggregate grant must cover every cell."
   (:require [dvergr.agent.experiment :as experiment]
+            [dvergr.agent.authority :as authority]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.evaluators :as evaluators]
             [dvergr.resource :as resource]
@@ -28,21 +29,25 @@
    {:keys [program-kinds funded-program-kinds funded-providers max-attempts max-parallelism]
     :or {max-attempts 256 max-parallelism 16
          funded-providers #{:openai :anthropic :fireworks :codex-subscription}} :as authority}]
+  (when (contains? authority :delegation-policy)
+    (authority/validate-policy! (:delegation-policy authority)))
   (when-let [unknown (seq (remove #{:parallelism :resources} (keys opts)))]
     (invalid! "Unknown run-experiment! options" {:unknown (set unknown)}))
   (experiment/validate-experiment definition)
   (resource-vector! resources)
-  (when-not (and (pos-int? parallelism) (<= parallelism max-parallelism))
+  (when-not (and (pos-int? parallelism)
+                 (<= parallelism (min max-parallelism (get-in authority [:delegation-policy :max-parallelism] max-parallelism))))
     (invalid! "Experiment parallelism exceeds the host ceiling" {:parallelism parallelism}))
   (let [candidates (:experiment/candidates definition)
         environments (get-in definition [:experiment/dataset :dataset/environments])
         repetitions (:experiment/repetitions definition)
         count-cells (* (count candidates) (count environments) repetitions)]
-    (when (> count-cells max-attempts)
+    (when (> count-cells (min max-attempts (get-in authority [:delegation-policy :max-attempts] max-attempts)))
       (invalid! "Experiment size exceeds the host ceiling" {:cells count-cells :max-attempts max-attempts}))
     (doseq [candidate candidates]
       (let [agent (or (roster/agent team (:candidate/agent candidate))
                       (invalid! "Experiment candidate is absent from roster" {:candidate candidate}))]
+        (authority/check-agent! agent authority)
         (when-not (= (:candidate/agent-content-id candidate) (hasch/uuid agent))
           (invalid! "Experiment candidate content differs from roster" {:candidate candidate}))))
     (doseq [env environments

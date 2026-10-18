@@ -80,6 +80,14 @@
       (is (= :analyst (:agent/id (get-in revised [:roster/agents :analyst]))))
       (is (= 2 (:agent/version (get-in revised [:roster/agents :analyst])))))))
 
+(deftest unrelated-revisions-preserve-the-sandbox-policy
+  (let [r (roster/make-agent (roster/make-roster)
+                             (assoc analyst-spec :sandbox #{:test/restricted}))
+        revised (roster/revise-agent r :analyst {:prompt "new instructions"})]
+    (is (= #{:test/restricted} (:agent/sandbox (roster/agent revised :analyst))))
+    (is (= #{:test/restricted} (:agent/sandbox (roster/agent r :analyst))))
+    (is (= #{} (:agent/sandbox (roster/agent (roster/revise-agent revised :analyst {:sandbox #{}}) :analyst))))))
+
 (deftest malformed-and-unknown-agent-fields-fail-loudly
   (let [r (roster/make-roster)]
     (is (thrown? clojure.lang.ExceptionInfo

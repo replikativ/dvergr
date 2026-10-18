@@ -12,6 +12,7 @@
    candidate when it starts (assembled prompt, tools, resolved model), which an
    experiment's resume compares per cell."
   (:require [dvergr.agent.roster :as roster]
+            [dvergr.agent.authority :as delegation]
             [dvergr.sandbox.extensions :as extensions]
             [dvergr.agent.prompt :as prompt]
             [dvergr.agent.room-context :as room-context]
@@ -54,7 +55,7 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 7)
+(def interpreter-version 8)
 
 (def ^:private default-max-model-steps 32)
 
@@ -97,7 +98,10 @@
    ;; supervisor before `hire!` returns to agent code.
            :own-child! #(with-owned-child! supervisor %)}
     (contains? supervisor :experiment-capabilities)
-    (assoc :experiment-capabilities (:experiment-capabilities supervisor))))
+    (assoc :experiment-capabilities (:experiment-capabilities supervisor))
+    (contains? supervisor :delegation-policy)
+    (merge (select-keys (:delegation-policy supervisor) [:max-attempts :max-parallelism])
+           {:delegation-policy (:delegation-policy supervisor)})))
 
 (defn- program-result
   ([status value] {::status status ::value value})
@@ -782,11 +786,13 @@
     (seq sandbox) (assoc :sandbox (extensions/refs sandbox))))
 
 (defn- with-experiment-inputs [inputs host-options]
-  (if (and inputs (contains? host-options :experiment-capabilities))
-    (assoc inputs :experiment-capabilities
+  (cond-> inputs
+    (and inputs (contains? host-options :experiment-capabilities))
+    (assoc :experiment-capabilities
            (into {} (for [kind [:evaluators :world-setups]]
                       [kind (set (keys (get-in host-options [:experiment-capabilities kind])))])))
-    inputs))
+    (and inputs (contains? host-options :delegation-policy))
+    (assoc :delegation-policy (delegation/inputs (:delegation-policy host-options)))))
 
 (defn run-inputs
   "What a Run of `agent` will present to its candidate when it starts now,
@@ -1880,7 +1886,7 @@
     (throw (ex-info "Run protocol must be a host capability with a :run function"
                     {:type ::invalid-protocol})))
   (let [opts      (assoc raw-opts :from from)
-        agent     (validate-hire! roster agent-ref opts)
+        agent     (delegation/check-agent! (validate-hire! roster agent-ref opts) host-options)
         actor     (:agent/id agent)
         id        (or preset-id (random-uuid))
         chat-id   (run-chat-id id)
@@ -1894,7 +1900,9 @@
         supervisor (cond-> (assoc (make-supervisor (:ctx world-parent) (:ctx work-room)) :run-id id)
                      deadline-nanos (assoc :deadline-nanos deadline-nanos)
                      (contains? host-options :experiment-capabilities)
-                     (assoc :experiment-capabilities (:experiment-capabilities host-options)))
+                     (assoc :experiment-capabilities (:experiment-capabilities host-options))
+                     (contains? host-options :delegation-policy)
+                     (assoc :delegation-policy (:delegation-policy host-options)))
         session-close (atom nil)
         _ (when (and (= :llm (get-in agent [:agent/program :kind])) (:store control-room))
             (when-let [session (install-turn-savepoints! control-room work-room)]
@@ -2243,7 +2251,7 @@
   ([control-room world-parent roster agent-ref opts]
    (hire-in! control-room world-parent roster agent-ref opts {}))
   ([control-room world-parent roster agent-ref opts host-options]
-   (when-let [unknown (seq (remove #{:experiment-capabilities} (keys host-options)))]
+   (when-let [unknown (seq (remove (set delegation/host-option-keys) (keys host-options)))]
      (throw (ex-info "Unknown host hiring capabilities" {:unknown (set unknown)})))
    (hire-prepared-in! control-room world-parent roster agent-ref opts nil nil host-options)))
 

@@ -1,25 +1,15 @@
 (ns dvergr.agent.output
   "Scoped reads of deliberately published, immutable evaluation outputs.
    Certification evidence is private by default; only :agent/output is public."
-  (:require [dvergr.agent.run :as run]
+  (:require [dvergr.agent.authority :as authority]
+            [dvergr.agent.run :as run]
             [dvergr.room.store :as store]))
 
 (defn- refuse! [message type]
   (throw (ex-info message {:type type})))
 
 (defn- scoped-run! [room scope id]
-  (when-not (and (uuid? scope) (uuid? id))
-    (refuse! "Output access requires an ambient Run and an Attempt UUID" ::invalid-scope))
-  ;; Exact ancestry checks, not a truncated observation/history listing.
-  (loop [candidate id seen #{}]
-    (when (or (nil? candidate) (contains? seen candidate) (>= (count seen) 1024))
-      (refuse! "Attempt is outside the current Run subtree" ::outside-scope))
-    (let [r (run/run room candidate)]
-      (when-not r
-        (refuse! "Attempt is outside the current Run subtree" ::outside-scope))
-      (if (= candidate scope)
-        r
-        (recur (:run/parent r) (conj seen candidate))))))
+  (authority/require-scoped-run! room scope id))
 
 (defn- bounded-data! [value]
   ;; Stop before traversing an entire oversized value. Never print handles or

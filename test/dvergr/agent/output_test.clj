@@ -46,9 +46,9 @@
                                          [id {:run/id id :run/parent (when (pos? i) (nth ids (dec i)))}]) ids))]
     (with-redefs [run/run (fn [_ id] (get ancestry id))
                   run/runs (fn [& _] (throw (ex-info "Must not use bounded history" {})))]
-      (is (= (first ids) (:run/id (#'output/scoped-run! nil (first ids) (last ids))))))
+      (is (= (last ids) (:run/id (#'output/scoped-run! nil (first ids) (last ids))))))
     (with-redefs [run/run (fn [_ id] {:run/id id :run/parent id})]
-      (is (= :dvergr.agent.output/outside-scope
+      (is (= :dvergr.agent.authority/outside-scope
              (error-type #(#'output/scoped-run! nil (first ids) (last ids))))))))
 
 (deftest output-bounds-stop-deep-and-runtime-values
@@ -94,9 +94,9 @@
                (error-type #(output/read-output room parent parent))))
         (is (contains? (:run/caused-by (run/run room parent)) id))
         (is (= :discarded (:run/settlement-status (run/run room id))))
-        (is (= :dvergr.agent.output/outside-scope
+        (is (= :dvergr.agent.authority/outside-scope
                (error-type #(output/read-output room sibling id))))
-        (is (= :dvergr.agent.output/invalid-scope
+        (is (= :dvergr.agent.authority/invalid-scope
                (error-type #(output/read-output room nil id))))
         (is (empty? (:run/caused-by (run/run room sibling))))
         (is (= certified (store/-load-attempt (:store room) (store/conversation-id room) id)))))))

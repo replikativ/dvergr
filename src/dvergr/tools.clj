@@ -2206,7 +2206,7 @@ Note: changes take effect on the next agent restart or reload."
                                                    :settlement settlement}
                                             run-id (assoc :parent-run run-id)
                                             resources (assoc :resources resources))
-                                          (select-keys agent-program-ceiling [:experiment-capabilities]))]
+                                          (select-keys agent-program-ceiling [:experiment-capabilities :delegation-policy]))]
                            (if-let [own-child! (:own-child! agent-program-ceiling)]
                              (own-child! admit-child!)
                              (admit-child!))))]

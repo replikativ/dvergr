@@ -63,6 +63,26 @@ truncating evidence. These string offsets are not file byte offsets.
 This core API does not itself enable a Simmis worker profile, research-network
 access, scheduling, crash recovery or permission to promote a proposed checker.
 
+### Delegation policy
+
+Hosts can attach a portable `:delegation-policy` alongside evaluator capabilities.
+It must explicitly enumerate `:tools`, exact allowed `:sandboxes` combinations
+and native `:providers`; optional `:max-attempts`/`:max-parallelism` narrow each
+child experiment. Missing policy retains trusted host behavior; an empty or
+malformed policy is not an unrestricted grant. It follows SCI hires, delegation
+tools, experiment Jobs and evaluation candidates. Central Run admission checks
+it before opening a world, and experiment preflight checks every candidate before
+creating a Job. Extra sandbox extensions are not accepted as an extension union.
+Tool spellings use the same hyphen/underscore normalization as the tool registry.
+
+Policy data and exact offered sandbox extension refs enter model input identity.
+`agent/delegation-policy` lets code discover its bounds; `agent/current-run-id`
+identifies its host-issued consumer scope. Inside an ambient Run, `agent/observe`
+and `agent/cancel!` accept only that Run and its structural descendants, including
+when passed a handle. Trusted room operators without an ambient Run keep their
+room-wide controls. Effect handlers remain inherited, compositional world policy;
+this allowlist does not replace them or make irreversible effects fork-safe.
+
 ## Public benchmark providers
 
 Dvergr runs public benchmarks natively, as Clojure transcriptions whose
