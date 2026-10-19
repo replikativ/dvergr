@@ -61,6 +61,26 @@ systems refuse settlement; unchanged shared non-mergeable systems and ordinary
 unregistered extensions keep their existing behavior. This is a fresh check,
 not an atomic transaction with an independent grant writer.
 
+Provisioned rooms explicitly record `:room/default-repository`, a non-component
+reference to their newly created repository registry entity. A room refresh
+cannot replace this reference or infer one for an older room. A repository's
+logical Geschichte UUID, its registry UUID and its runtime system name are
+different identities; none can substitute for another.
+
+For host publication into the room's default workspace, use
+`dvergr.system.rooms/default-workspace`. It requires the explicit link, a current
+`:owner` attachment and an unambiguous Geschichte runtime in the canonical room
+context, with a matching physical store path. Registry aliases resolving to the
+same canonical directory are rejected, including dot segments and symlinks.
+It currently supports the file
+stores created by the room provisioner. Missing markers, detached ownership,
+unhydrated systems and identity mismatches refuse; it never selects the first
+attached repository. Older rooms need an explicitly authorized configuration
+operation before this API can be used—there is no automatic backfill here.
+This resolver is not permission to publish: callers must still check the human's
+current permissions, the full retained target identity and expected file state
+at each publication effect.
+
 ### Shared, durable: the system DB
 
 One Datahike DB per home (`dvergr.system.db`), not per room and not forked:

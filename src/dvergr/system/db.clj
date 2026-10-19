@@ -63,6 +63,8 @@
    {:db/ident :room/type     :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}
    {:db/ident :room/owner    :db/valueType :db.type/ref     :db/cardinality :db.cardinality/one} ; party
    {:db/ident :room/db-scope :db/valueType :db.type/string  :db/cardinality :db.cardinality/one} ; own message DB
+   {:db/ident :room/default-repository :db/valueType :db.type/ref :db/cardinality :db.cardinality/one
+    :db/doc "Explicit default repository selected at provisioning; not inferred from grants or names."}
    {:db/ident :room/parties  :db/valueType :db.type/ref     :db/cardinality :db.cardinality/many} ; members
    {:db/ident :room/created  :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}
    ;; a slug claimed by the principal (dvergr.principal) that creates a room over an op,
@@ -251,13 +253,31 @@
 ;; Rooms (projects)
 ;; ---------------------------------------------------------------------------
 
+(defn- create-room-tx [db entity supplied? repository-id]
+  (let [existing (d/entity db [:room/slug (:room/slug entity)])
+        repository (when (and supplied? (uuid? repository-id))
+                     (d/entity db [:system/id repository-id]))]
+    (when (and supplied? (not= :repo (:system/type repository)))
+      (throw (ex-info "Default repository must identify an existing repository"
+                      {:type ::invalid-default-repository})))
+    (when (and existing supplied?
+               (not= repository-id (get-in existing [:room/default-repository :system/id])))
+      (throw (ex-info "Room refresh cannot configure or replace its default repository"
+                      {:type ::default-repository-conflict})))
+    [(cond-> entity
+       existing (assoc :room/id (:room/id existing))
+       supplied? (assoc :room/default-repository [:system/id repository-id]))]))
+
 (defn create-room!
   "Create-or-update a room/project. `slug` is the natural key (upsert), so this
    is idempotent on re-provision. `db-scope` is its own message-DB locator;
    `owner-id` the owning party. RF5 S4: the registry fields (`type`,
    `telegram-chat-id`, `agent-ids`, `parent-slug`) live here too — the UI reads
    them straight off system-db, no chat-db. Returns the room uuid."
-  [{:keys [slug name type db-scope owner-id telegram-chat-id agent-ids parent-slug]}]
+  [{:keys [slug name type db-scope owner-id telegram-chat-id agent-ids parent-slug default-repository-id]
+    :as options}]
+  (when-not (and (string? slug) (not (str/blank? slug)))
+    (throw (ex-info "Room slug is required" {:type ::invalid-room})))
   (let [conn  (get-conn)
         ;; Upsert by slug: reuse the existing room-id if present so re-provision
         ;; (hydrate) doesn't mint a duplicate identity.
@@ -265,14 +285,36 @@
                        @conn slug)
                   (java.util.UUID/randomUUID))
         owner (when owner-id [:party/id owner-id])]
-    (d/transact conn [(cond-> {:room/id id :room/slug slug :room/name (or name slug)
-                               :room/type (or type :project) :room/created (now)}
-                        db-scope         (assoc :room/db-scope db-scope)
-                        owner            (assoc :room/owner owner)
-                        telegram-chat-id (assoc :room/telegram-chat-id (long telegram-chat-id))
-                        (seq agent-ids)  (assoc :room/agent-ids (set agent-ids))
-                        parent-slug      (assoc :room/parent-slug parent-slug))])
-    id))
+    (let [entity (cond-> {:room/id id :room/slug slug :room/name (or name slug)
+                          :room/type (or type :project) :room/created (now)}
+                   db-scope         (assoc :room/db-scope db-scope)
+                   owner            (assoc :room/owner owner)
+                   telegram-chat-id (assoc :room/telegram-chat-id (long telegram-chat-id))
+                   (seq agent-ids)  (assoc :room/agent-ids (set agent-ids))
+                   parent-slug      (assoc :room/parent-slug parent-slug))
+          report (d/transact conn [[:db.fn/call create-room-tx entity
+                                    (contains? options :default-repository-id) default-repository-id]])]
+      (:room/id (d/entity (:db-after report) [:room/slug slug])))))
+
+(defn default-repository
+  "Explicit room-owned repository metadata, or nil. Never infer a default from
+   grant ordering/name similarity. Missing links, wrong types, detached or weaker
+   grants and ambiguous registry paths fail closed. Runtime binding is separate."
+  ([room-id] (default-repository @(get-conn) room-id))
+  ([db room-id]
+   (when (uuid? room-id)
+     (let [system (d/q '[:find (pull ?system [:system/id :system/type :system/name :system/scope]) .
+                         :in $ ?id
+                         :where [?room :room/id ?id]
+                         [?room :room/default-repository ?system]
+                         [?system :system/type :repo]
+                         [?grant :grant/room ?room] [?grant :grant/system ?system]
+                         [?grant :grant/permission :owner]] db room-id)
+           path (:system/scope system)]
+       (when (and (uuid? (:system/id system)) (string? path) (not (str/blank? path))
+                  (= 1 (d/q '[:find (count ?system) . :in $ ?path
+                              :where [?system :system/type :repo] [?system :system/scope ?path]] db path)))
+         system)))))
 
 ;; The full registry projection — everything the in-memory Room/UI needs.
 (def ^:private room-pull
