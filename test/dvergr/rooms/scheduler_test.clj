@@ -71,6 +71,54 @@
 (defn- the-schedule [conn]
   (dh/q '[:find (pull ?s [*]) . :where [?s :schedule/id _]] @conn))
 
+(deftest forked-schedule-definitions-are-inert-before-any-io
+  (doseq [marker [{:forked-from :parent} {:forked-from nil} {:run-world? true}]]
+    (let [room {:id (keyword (str (random-uuid))) :meta (atom marker)}]
+      (with-redefs-fn {#'rsched/room-conn (fn [_] (throw (AssertionError. "Fork scheduler read its store")))}
+        #(do (is (nil? (rsched/fire-due! room (java.util.Date.))))
+             (is (nil? (rsched/start-room-scheduler! room)))
+             (is (not (contains? @@#'rsched/room-schedulers (:id room)))))))))
+
+(deftest marked-room-retains-due-prompt-and-code-rows-unchanged
+  (let [c (ctx/create-execution-context)]
+    (binding [ec/*execution-context* c]
+      (let [[room conn cfg] (datahike-room c "sched-inert")]
+        (try
+          (rsched/stop-room-scheduler! (:id room))
+          (swap! (:meta room) assoc :forked-from :parent)
+          (doseq [task [{:schedule/task "MUST NOT POST"} {:schedule/code "(throw (Exception.))"}]]
+            (add-schedule! conn (merge {:schedule/agent-id :var :schedule/kind :interval
+                                        :schedule/interval-ms 60000 :schedule/next-fire (java.util.Date. 0)} task)))
+          (let [before @conn]
+            (rsched/fire-due! room (java.util.Date.))
+            (is (= before @conn))
+            (is (empty? (d/messages room {:limit 50}))))
+          (finally
+            (rsched/stop-room-scheduler! (:id room))
+            (rmsg/drop-room! (:id room))
+            (dh/release conn) (dh/delete-database cfg)))))))
+
+(deftest nested-room-is-not-necessarily-a-fork
+  (is (#'rsched/wall-clock-room? {:parent-id :parent :meta (atom {})})))
+
+(deftest actual-forks-register-without-wall-clock-handles
+  (let [c (ctx/create-execution-context)]
+    (binding [ec/*execution-context* c]
+      (let [[room conn cfg] (datahike-room c "sched-fork-registration")]
+        (try
+          (doseq [isolation [:none :ctx]]
+            (let [fork (d/fork-room room {:isolation isolation :clone-participants? false})]
+              (try
+                (is (contains? @(:meta fork) :forked-from))
+                (is (not (:run-world? @(:meta fork))) "registration happens before the Run-world tag")
+                (is (not (contains? @@#'rsched/room-schedulers (:id fork))))
+                (is (nil? (rsched/start-room-scheduler! fork)))
+                (finally (d/discard fork)))))
+          (finally
+            (rsched/stop-room-scheduler! (:id room))
+            (rmsg/drop-room! (:id room))
+            (dh/release conn) (dh/delete-database cfg)))))))
+
 (deftest fire-due!-posts-task-and-advances-row
   (let [c (ctx/create-execution-context)]
     (binding [ec/*execution-context* c]

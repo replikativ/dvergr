@@ -13,7 +13,10 @@
    spin created on a register hook + dropped on an unregister hook, spawned on
    the ROOT ctx so it sees the (root-anchored) clock. Schedules live in the
    room's OWN msgs store (`:schedule/*`, transparent attrs), so they fork/merge
-   with the room and drop when it's deleted. The due-check is one indexed query
+   with the room and drop when it's deleted. Inherited definitions in forks
+   are inert: neither registration nor direct firing attaches them to real
+   time. Explicit simulation scheduling is a separate capability, not implied
+   by copying a room. The due-check is one indexed query
    on the materialized `:schedule/next-fire`.
 
    Teardown: spindel `track` has no disposal handle, so a torn-down room's spin
@@ -121,11 +124,17 @@
                :data {:room (:slug room) :agent aid :schedule (:schedule/id s)}}
               "Scheduled task fired")))
 
+(defn- wall-clock-room?
+  [room]
+  (let [metadata (some-> room :meta deref)]
+    (not (or (contains? metadata :forked-from) (:run-world? metadata)))))
+
 (defn fire-due!
   "Fire every schedule in `room` due at `now`. Each fire is isolated — one
-   failure does not skip the rest."
+   failure does not skip the rest. Forks/Run worlds are inert, even when this
+   entrypoint is called directly or an older handle still exists."
   [room ^java.util.Date now]
-  (when-let [conn (room-conn room)]
+  (when-let [conn (when (wall-clock-room? room) (room-conn room))]
     (doseq [s (due-schedules conn now)]
       (try (fire-one! room conn now s)
            (catch Throwable t
@@ -146,9 +155,10 @@
 (defn start-room-scheduler!
   "Spawn the room's scheduler spin (idempotent). Tracks the clock; fires due
    schedules each minute. Created on the ROOT ctx (clock visibility). None
-   while `suspend!`ed."
+   while `suspend!`ed or for a fork/Run world. The canonical :forked-from
+   marker exists before register hooks, unlike the later :run-world? tag."
   [room]
-  (when-not (or @suspended (get @room-schedulers (:id room)))
+  (when-not (or (not (wall-clock-room? room)) @suspended (get @room-schedulers (:id room)))
     (let [handle (atom {:running? true})]
       (swap! room-schedulers assoc (:id room) handle)
       (binding [ec/*execution-context* (rctx/root-ctx (:ctx room))]
