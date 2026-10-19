@@ -776,7 +776,8 @@
                       (:attempt/agent-def-hash certified)
                       :environment (:attempt/environment receipt)
                       :reward (:attempt/reward receipt)
-                      :passed? (passed? receipt)}
+                      :passed? (passed? receipt)
+                      :spend (get-in receipt [:attempt/metrics :spend])}
             actual (select-keys entry (keys expected))]
         (when-not (= expected actual)
           (invalid! "Scorecard entry differs from its certified Attempt"

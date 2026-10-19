@@ -34,7 +34,8 @@
    injects the operator's account email and the wall-clock date, which cannot
    be disabled). The CLI version and the note are part of the ExperimentDef,
    so changing either never resumes into old cells."
-  (:require [clojure.java.io :as io]
+  (:require [clojure.java.basis :as basis]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.environment :as environment]
@@ -186,16 +187,45 @@
    ["org.replikativ" "rechentafel"] ["org.replikativ" "kontor"] ["org.replikativ" "partial-cps"]
    ["org.babashka" "sci"]])
 
+(defn- git-identity [lib {:keys [git/sha deps/root] :as source}]
+  (let [path (some-> root io/file .toPath .normalize)
+        parts (when path (mapv str (iterator-seq (.iterator path))))
+        ;; tools.gitlibs' resolved layout is <cache>/libs/<group>/<name>/<sha>.
+        ;; Match the whole boundary, not an arbitrary SHA-named subdirectory.
+        marker (into ["libs"] (conj (str/split lib #"/") sha))
+        indices (filterv #(= marker (subvec parts % (+ % (count marker))))
+                         (range (inc (- (count parts) (count marker)))))
+        relative (if (and path (.isAbsolute path))
+                   (if (= 1 (count indices))
+                     (subvec parts (+ (first indices) (count marker)))
+                     (throw (ex-info "Unsupported resolved Git root; expected an unambiguous Gitlibs cache layout"
+                                     {:type ::unverified-git-root :git/sha sha :deps/root root})))
+                   parts)
+        subdir (not-empty (str/join "/" relative))]
+    (cond-> (select-keys source [:git/url :git/sha])
+      subdir (assoc :deps/root subdir))))
+
 (defn library-versions
-  "`{\"group/artifact\" version}` of `identity-libraries` found as jars on the
-   classpath (their pom.properties); a library from a local checkout is absent."
+  "Execution library identities: Maven version strings or resolved Git
+   coordinates, never a stale Maven version from a Git checkout's pom.
+   Local checkouts remain absent: their paths are not reproducible identities.
+   Packaged hosts without a runtime basis fall back to pom.properties."
   []
-  (into (sorted-map)
-        (for [[g a] identity-libraries
-              :let [r (io/resource (str "META-INF/maven/" g "/" a "/pom.properties"))]
-              :when r]
-          [(str g "/" a) (with-open [in (io/input-stream r)]
-                           (.getProperty (doto (java.util.Properties.) (.load in)) "version"))])))
+  (let [libs (:libs (basis/current-basis))]
+    (into (sorted-map)
+          (keep (fn [[g a]]
+                  (let [lib (str g "/" a)
+                        source (get libs (symbol lib))
+                        version (cond
+                                  (:local/root source) nil
+                                  (:git/sha source) (git-identity lib source)
+                                  (:mvn/version source) (:mvn/version source)
+                                  (nil? libs)
+                                  (when-let [r (io/resource (str "META-INF/maven/" g "/" a "/pom.properties"))]
+                                    (with-open [in (io/input-stream r)]
+                                      (.getProperty (doto (java.util.Properties.) (.load in)) "version"))))]
+                    (when version [lib version]))))
+          identity-libraries)))
 
 (defn runtime-identity
   "What an experiment's identity takes from the host it runs on: the

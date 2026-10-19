@@ -6,7 +6,9 @@
    second axis from execution: a completed program may be merged, retained for
    review, or discarded without rewriting its execution outcome."
   (:require [dvergr.discourse :as d]
+            [dvergr.resource :as resource]
             [dvergr.rooms.forks :as forks]
+            [kontor.resource :as kontor]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]))
 
@@ -48,8 +50,15 @@
                                   ;; only through explicit hire/tool effects.
                                    :clone-participants? false})]
      ;; the world knows its Run: a resource authority spends from its wallet
+     (resource/register-ledger-room! record-room)
      (binding [ec/*execution-context* (:ctx work)]
-       (ec/swap-state! [:dvergr/run-id] (constantly run-id)))
+       (ec/swap-state! [:dvergr/run-id] (constantly run-id))
+       ;; A Run owns its payer; never inherit a funded ancestor world's wallet.
+       (ec/swap-state! [:dvergr/wallet]
+                       (constantly {:kind :run :fork-id (:fork-id (:ctx work))
+                                    :run-id run-id :wallet (resource/run-wallet-id run-id)
+                                    :account (kontor/account-ref (resource/run-wallet-id run-id))
+                                    :room-id (:id record-room)})))
      (swap! (:meta work) assoc
             :run-world? true
             :run-id run-id

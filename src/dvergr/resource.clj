@@ -239,6 +239,49 @@
   (swap! ledger-rooms assoc (:id room) room)
   room)
 
+(defn- current-payer
+  "Select one owned payer. Copied authority is never a fallback to ambient
+   bindings; explicitly unfunded worlds cannot make governed charges."
+  []
+  (let [ctx ec/*execution-context*
+        state (some-> ctx (rtp/get-state [:dvergr/wallet]))
+        bound (:payer *spend-wallet*)]
+    (if state
+      (do
+        (when (or (not= (:fork-id ctx) (:fork-id state))
+                  (= :unfunded (:kind state)))
+          (throw (ex-info "World has no owned spending authority"
+                          {:type ::unfunded-world :fork-id (:fork-id ctx)})))
+        (let [room (or (get @ledger-rooms (:room-id state))
+                       (when (= (:room-id state) (get-in bound [:room :id])) (:room bound)))]
+          (when-not room
+            (throw (ex-info "World's resource ledger is unavailable"
+                            {:type ::resource-store-unavailable :room-id (:room-id state)})))
+          (case (:kind state)
+            :run {:room room :run-id (:run-id state) :wallet (:wallet state)}
+            :world {:room room :wallet (:wallet state)}
+            (throw (ex-info "Unknown world funding state" {:type ::invalid-world-wallet})))))
+      bound)))
+
+(defn- monetary-payer []
+  (when-let [{:keys [room run-id] :as payer} (current-payer)]
+    ;; Identity does not depend on the money coordinate: admission-only Runs
+    ;; still own a payer, but monetary accounting remains opt-in.
+    (if run-id (spend-wallet room run-id) payer)))
+
+(defn require-model-scope!
+  "A dispatch-governed context cannot lose governance on another thread.
+   Money-only legacy Runs keep their accounting without admission enforcement;
+   an explicitly unfunded speculative child is not a legacy Run."
+  []
+  (when-let [state (some-> ec/*execution-context* (rtp/get-state [:dvergr/wallet]))]
+    (let [{:keys [room run-id]} (current-payer)
+          funded? (or (= :world (:kind state))
+                      (and run-id (model-scope room run-id)))]
+      (when (and funded? (nil? *model-scope*))
+        (throw (ex-info "Funded world dispatch requires a host model-call scope"
+                        {:type ::missing-model-scope :fork-id (:fork-id ec/*execution-context*)}))))))
+
 (defn- world-charge
   "Where a charge made now goes, and the ordinal of its debit.
 
@@ -252,32 +295,24 @@
   []
   (let [bound *spend-wallet*
         ctx ec/*execution-context*
-        {:keys [wallet room-id]} (some-> ctx (rtp/get-state [:dvergr/wallet]))
-        room (when wallet (or (get @ledger-rooms room-id) (get-in bound [:payer :room])))]
+        state (some-> ctx (rtp/get-state [:dvergr/wallet]))
+        payer (monetary-payer)]
     (cond
-      (and wallet room)
-      {:payer {:room room :wallet wallet}
+      (and payer (= :world (:kind state)))
+      {:payer payer
        :id (if bound
              (spend-debit-id [(:scope bound) (:fork-id ctx)] (swap! (:debits bound) inc))
              (let [n (volatile! nil)]
                (rtp/swap-state! ctx [:dvergr/wallet :debits] #(vreset! n (inc (or % 0))))
                (spend-debit-id [:dvergr/world (:fork-id ctx)] @n)))}
 
-      (:payer bound)
-      {:payer (:payer bound)
-       :id (spend-debit-id (:scope bound) (swap! (:debits bound) inc))})))
-
-(defn- current-payer
-  "The wallet a charge made now would come from (`world-charge`), without
-   naming a debit: `{:room :wallet}` or nil."
-  []
-  (let [bound *spend-wallet*
-        ctx ec/*execution-context*
-        {:keys [wallet room-id]} (some-> ctx (rtp/get-state [:dvergr/wallet]))
-        room (when wallet (or (get @ledger-rooms room-id) (get-in bound [:payer :room])))]
-    (cond
-      (and wallet room) {:room room :wallet wallet}
-      (:payer bound) (:payer bound))))
+      payer
+      {:payer payer
+       :id (if bound
+             (spend-debit-id (:scope bound) (swap! (:debits bound) inc))
+             (let [n (volatile! nil)]
+               (rtp/swap-state! ctx [:dvergr/wallet :debits] #(vreset! n (inc (or % 0))))
+               (spend-debit-id [:dvergr/run (:fork-id ctx)] @n)))})))
 
 ;; ---------------------------------------------------------------------------
 ;; Dispatch reservations (doc/design/runs-as-worlds.md, Budgets as a tree)
@@ -463,7 +498,8 @@
    monetary reservation, but still needs its model-call scope and consumes
    admission at the gateway. An unknown/invalid bound is refused."
   []
-  (when-let [payer (when *model-scope* (current-payer))]
+  (require-model-scope!)
+  (when-let [payer (when *model-scope* (monetary-payer))]
     (let [amount *dispatch-bound*]
       (when-not (and (number? amount) (Double/isFinite (double amount)) (not (neg? amount)))
         (throw (ex-info "A funded model dispatch needs a bound on its cost: a priced model, an output limit, no remote content"
@@ -624,11 +660,16 @@
    an admission pays for an egress, not for a result, so unlike a spend debit
    (`charge-spend!`) its id is fresh on purpose."
   []
+  (require-model-scope!)
   (when-let [{:keys [room run-id cancel?]} *model-scope*]
     (when (or (.isInterrupted (Thread/currentThread)) (and cancel? (cancel?)))
       (throw (java.util.concurrent.CancellationException. "Model admission cancelled")))
-    (consume! room run-id {:id (UUID/randomUUID)
-                           :resources {model-dispatches 1M}})))
+    (let [payer (or (current-payer) {:room room :wallet (run-wallet-id run-id)})]
+      (store/-transfer-resources!
+       (resource-store! (:room payer))
+       {:id (UUID/randomUUID) :kind :consume
+        :source (kontor/account-ref (:wallet payer)) :destination kontor/sink-account
+        :resources {model-dispatches 1M}}))))
 
 (defn return!
   "Return an explicit positive vector from a Run to its immediate parent/Room."

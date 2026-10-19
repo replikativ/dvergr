@@ -327,6 +327,19 @@
                   (is (thrown-with-msg?
                        clojure.lang.ExceptionInfo #"certified Attempt"
                        (experiment/persist-scorecard! room forged)))))
+              (testing "a self-consistent content hash cannot forge certified spend"
+                (let [entries (update-in (:scorecard/entries scorecard)
+                                         [0 :spend :microdollars] (fnil inc 0))
+                      forged (-> scorecard
+                                 (assoc :scorecard/entries entries
+                                        :scorecard/summary (#'experiment/summarize entries))
+                                 (dissoc :scorecard/content-id))
+                      forged (assoc forged :scorecard/content-id
+                                    (hasch/uuid [:dvergr/experiment-scorecard forged]))]
+                  (is (= forged (experiment/validate-scorecard forged)))
+                  (is (thrown-with-msg?
+                       clojure.lang.ExceptionInfo #"certified Attempt"
+                       (experiment/persist-scorecard! room forged)))))
               (is (every? #(= % (store/-load-attempt
                                  (:store room) (:id room) (:attempt/id %)))
                           attempts))
