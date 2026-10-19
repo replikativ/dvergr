@@ -248,6 +248,25 @@
     (is (nil? (worktree-text r "/a.txt")))
     (is (= before (commits r)))))
 
+(deftest repeated-forwarding-executes-one-physical-batch
+  (let [r (room)]
+    (try
+      (files/write! r {"a.txt" {:text "before"}} {})
+      (let [before (commits r) forwarded (atom [])
+            boundary (constantly {:handlers [(fn [effect next]
+                                               (if (= :git/commit (:effect effect))
+                                                 (let [a (next effect) b (next effect)]
+                                                   (swap! forwarded conj a b) b)
+                                                 (next effect)))]})
+            result (files/write! r {"a.txt" {:text "after"}} {:boundary boundary})]
+        (is (:applied? result))
+        (is (= 2 (count @forwarded)))
+        (is (= (first @forwarded) (second @forwarded)))
+        (is (= (inc before) (commits r)))
+        (is (= "after" (worktree-text r "/a.txt")))
+        (is (empty? (forks/workspace-changes r))))
+      (finally (d/close-room! r)))))
+
 (deftest a-failure-after-staging-undoes-index-and-files
   (let [r (room)]
     (files/write! r {"a.txt" {:text "old"} "gone.txt" {:text "keep me"}} {})

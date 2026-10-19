@@ -439,34 +439,37 @@
             touched (atom [])
             removed (atom [])
             applied (volatile! nil)
-            _answer (effects/perform!
-                     boundary {:effect :git/commit :resource {:message message :system-id system-id}}
-                     (fn []
-                       (try
-                         (doseq [[p c] entries
+            ;; Handlers may forward more than once. The physical transaction,
+            ;; including failure/rollback, belongs to this batch only once.
+            execute (delay
+                      (try
+                        (doseq [[p c] entries
                                 ;; compare-and-write: what the snapshot saw, or fail
-                                 :let [opts (cond-> {:expect (some-> (get before p) :content str)}
-                                              (contains? file-modes p) (assoc :mode (get file-modes p)))]]
-                           (if (= ::remove c)
-                             (when (tools/workspace-delete! ctx p opts)
-                               (swap! touched conj p)
-                               (swap! removed conj p))
-                             (do (tools/workspace-write! ctx p c opts)
-                                 (swap! touched conj p))))
-                         (let [{:keys [commit tree]} (forks/commit-paths! room expected message
-                                                                          {:receipt? true :expected-modes file-modes})
-                               entries (into {} (map (fn [p] [p (get tree (rel p))])) paths)]
+                                :let [opts (cond-> {:expect (some-> (get before p) :content str)}
+                                             (contains? file-modes p) (assoc :mode (get file-modes p)))]]
+                          (if (= ::remove c)
+                            (when (tools/workspace-delete! ctx p opts)
+                              (swap! touched conj p)
+                              (swap! removed conj p))
+                            (do (tools/workspace-write! ctx p c opts)
+                                (swap! touched conj p))))
+                        (let [{:keys [commit tree]} (forks/commit-paths! room expected message
+                                                                         {:receipt? true :expected-modes file-modes})
+                              entries (into {} (map (fn [p] [p (get tree (rel p))])) paths)]
                           ;; Only the forwarded physical write path can produce
                           ;; this receipt. A handler may answer without forwarding.
-                           (vreset! applied {:commit commit :entries entries})
-                           commit)
-                         (catch Throwable e
-                           (let [conflicted (restore! conn before expected @touched created)]
-                             (throw (if (seq conflicted)
-                                      (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
-                                                    (str/join ", " conflicted))
-                                               (assoc (ex-data e) :conflicted conflicted) e)
-                                      e)))))))
+                          (vreset! applied {:commit commit :entries entries})
+                          commit)
+                        (catch Throwable e
+                          (let [conflicted (restore! conn before expected @touched created)]
+                            (throw (if (seq conflicted)
+                                     (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
+                                                   (str/join ", " conflicted))
+                                              (assoc (ex-data e) :conflicted conflicted) e)
+                                     e))))))
+            _answer (effects/perform!
+                     boundary {:effect :git/commit :resource {:message message :system-id system-id}}
+                     #(force execute))
             ;; a directory a removal emptied goes too (git keeps none): a
             ;; later write may put a file in its place
             _ (when (seq @removed)
