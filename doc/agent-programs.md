@@ -1,6 +1,6 @@
 # Agent programs in the room REPL
 
-Status: deterministic and native LLM/tool interpreters, conserved resource
+Status: deterministic, pinned SCI and native LLM/tool interpreters, conserved resource
 delegation, model-spend debiting from a Run's microdollar wallet, and resume
 from turn savepoints (doc/runs.md, "Resuming a Run") are implemented. Simulation and
 replay interpreters are not built.
@@ -156,6 +156,61 @@ The handle supports:
 (agent/observe handle)       ; durable Run projection
 (agent/cancel! handle)       ; targeted cooperative cancellation
 ```
+
+## Pinned SCI programs
+
+An AgentDef can run reviewed Clojure directly, without a model generating the
+orchestration calls. Source, entrypoint, arguments and execution timeout are
+ordinary immutable program data:
+
+```clojure
+(def team
+  (agent/make-agent
+   (agent/roster)
+   {:id :driver :tools #{} :sandbox #{}
+    :program {:kind :sci
+              :source "(ns example.driver) (defn run [task suffix] {:task task :suffix suffix})"
+              :entrypoint 'example.driver/run
+              :args ["review"]
+              :timeout-ms 10000}}))
+
+(def work (agent/hire! team :driver {:task {:claim 42} :settlement :discard}))
+@(agent/result-spin work)
+```
+
+The entrypoint receives the task followed by the optional argument vector's
+elements. Inputs are passed as data, not interpolated into executable source.
+It returns portable data synchronously; a pending Spin, RunHandle, function,
+atom or record is not a result. Finite lazy sequences are realized inside the
+SCI context. Orchestration may await owned child result Spins from this native
+worker boundary, or compose `spin`/`await` and dereference the outer Spin here;
+it must never block inside a Spin body.
+
+The interpreter uses the same fork-local working context, namespace extensions,
+effects, child ownership and resource ledger as the LLM interpreter. Direct
+provider effects remain closed; funded child LLM Runs use their own attenuated
+grants. A host delegation policy must explicitly include `:sci` in its optional
+`:program-kinds` set. Policies that omit that key admit only the pre-existing
+`:echo`, `:scripted` and `:llm` kinds, not this new interpreter. No policy remains
+the trusted host boundary, not a sandbox grant. Both `hire!` and child experiments
+enforce this policy before admitting work.
+
+Source is bounded to 65536 UTF-8 bytes. Arguments (at most 32), the task and
+returned data each have a 262144-byte encoded bound, 10000-node bound and depth
+64. Each diagnostic stream is bounded to 16384 UTF-8 bytes. Timeout is an
+explicit 1–600000 ms execution bound, narrowed by any host execution deadline.
+Cancellation/deadline checks remain sticky even if code catches an interruption.
+An uncaught source failure cancels its owned children before settlement.
+The Run retains physical ownership, its world and its wallet until the worker
+and every owned child really quiesce; no untracked eval future is used.
+
+Program data, interpreter version, sandbox extension revisions and offered
+delegation/verification scope enter the execution inputs identity. A changed
+source, entrypoint or argument is a different candidate, not a live module
+reload. Workspace imports still read the selected world; reproducible fixtures
+must pin that world too. SCI Runs do not currently have LLM turn savepoints or automatic restart
+resumption. This interpreter does not admit new checkers, make inherited files
+into clean benchmark fixtures, or certify the returned answer's correctness.
 
 ## Native model and tool programs
 

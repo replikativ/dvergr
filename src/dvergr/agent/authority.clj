@@ -10,10 +10,13 @@
 (defn validate-policy! [policy]
   (when-not
    (and (map? policy)
-        (every? #{:tools :sandboxes :providers :max-attempts :max-parallelism} (keys policy))
+        (every? #{:tools :sandboxes :providers :program-kinds :max-attempts :max-parallelism} (keys policy))
         (every? #(and (set? (get policy %)) (every? keyword? (get policy %))) [:tools :providers])
         (set? (:sandboxes policy))
         (every? #(and (set? %) (every? qualified-keyword? %)) (:sandboxes policy))
+        (or (not (contains? policy :program-kinds))
+            (and (set? (:program-kinds policy))
+                 (every? #{:echo :scripted :llm :sci} (:program-kinds policy))))
         (every? (fn [[key maximum]]
                   (or (not (contains? policy key))
                       (and (pos-int? (get policy key)) (<= (get policy key) maximum))))
@@ -33,6 +36,8 @@
       (when-not (and (set/subset? (into #{} (map tool-name) (:agent/tools agent))
                                   (into #{} (map tool-name) tools))
                      (contains? sandboxes (set (:agent/sandbox agent)))
+                     (contains? (get policy :program-kinds #{:echo :scripted :llm})
+                                (get-in agent [:agent/program :kind]))
                      (or (not= :llm (get-in agent [:agent/program :kind]))
                          (contains? providers (get-in agent [:agent/model-policy :provider]))))
         (throw (ex-info "Agent exceeds the host delegation policy"

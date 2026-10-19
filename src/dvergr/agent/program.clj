@@ -12,6 +12,7 @@
    candidate when it starts (assembled prompt, tools, resolved model), which an
    experiment's resume compares per cell."
   (:require [dvergr.agent.roster :as roster]
+            [dvergr.agent.sci-program :as sci-program]
             [dvergr.agent.authority :as delegation]
             [dvergr.sandbox.extensions :as extensions]
             [dvergr.agent.prompt :as prompt]
@@ -55,7 +56,7 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 9)
+(def interpreter-version 10)
 
 (def ^:private default-max-model-steps 32)
 
@@ -83,7 +84,7 @@
    Keep this one value shared by the SCI and native-tool surfaces so a model
    cannot bypass delegation attenuation by choosing a different interface."
   [run-id supervisor]
-  (cond-> {:program-kinds #{:echo :scripted}
+  (cond-> {:program-kinds #{:echo :scripted :sci}
    ;; A child that calls providers is admitted only when its grant funds
    ;; them (`resource/funded-grant?`): money and dispatch admissions split
    ;; from this Run's wallet, which bound what it can spend, each dispatch's
@@ -806,6 +807,8 @@
    - A protocol (`protocol`, the environment's): its ref, the resolved model
      of the AgentDef's policy, and what the protocol's own `:inputs` says
      (`dvergr.agent.evaluation/make-protocol`).
+   - A SCI program: exact program data, interpreter version and resolved
+     sandbox extension revisions. Task data remains the EnvironmentDef's input.
    - Any other program: nil. A deterministic program (`:echo`, `:scripted`)
      resolves nothing at Run start: everything it does is in its AgentDef.
 
@@ -836,6 +839,11 @@
            (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
                   :provider-policy (claude-code/execution-policy)))))
 
+     (= :sci (get-in agent [:agent/program :kind]))
+     (cond-> {:inputs/kind :sci :program (:agent/program agent)
+              :interpreter-version interpreter-version}
+       (seq (:agent/sandbox agent)) (assoc :sandbox (extensions/refs (:agent/sandbox agent))))
+
      :else nil))
   ([agent protocol host-options]
    (with-experiment-inputs (run-inputs agent protocol) host-options)))
@@ -846,7 +854,7 @@
   [inputs]
   (when (some? inputs) (hasch/uuid [:dvergr/run-inputs inputs])))
 
-(defn- new-llm-context
+(defn- new-program-context
   [control-room work-room run-id agent budget-dollars chat-id supervisor]
   (let [system-id (room-context/room-system-id work-room)
         ;; Model messages, tool results, authorization receipts, and costs are
@@ -1069,8 +1077,8 @@
                 (resource/consume! control-room run-id
                                    {:id (random-uuid) :resources {resource/cli-run-admissions 1M}}))
               (let [{:keys [chat-ctx owned-db?]}
-                    (new-llm-context control-room work-room run-id agent
-                                     budget-dollars chat-id supervisor)
+                    (new-program-context control-room work-room run-id agent
+                                         budget-dollars chat-id supervisor)
                     _ (when owned-db?
                         (register-cleanup!
                          supervisor #(chat-context/close-chat! chat-ctx)))
@@ -1381,6 +1389,54 @@
 
        :else (program-result :completed outcome)))))
 
+(defn- execute-sci-program
+  [control-room work-room run-id chat-id agent task supervisor]
+  (let [program (:agent/program agent)
+        deadline (min (or (:deadline-nanos supervisor) Long/MAX_VALUE)
+                      (+ (System/nanoTime) (* 1000000 (long (:timeout-ms program)))))
+        check! (fn []
+                 (when (or (run/cancel-requested? run-id) (:cancelled? @(:state supervisor)))
+                   (cancelled! run-id))
+                 (when (>= (System/nanoTime) deadline)
+                   (throw (ex-info "SCI execution deadline expired" {:type ::sci-timeout}))))]
+    (sp/spin
+     (let [worker (start-worker!
+                   supervisor
+                   (fn []
+                     (check!)
+                     (let [{:keys [chat-ctx owned-db?]}
+                           (new-program-context control-room work-room run-id agent 0.0 chat-id supervisor)]
+                       (register-cleanup!
+                        supervisor
+                        #(if owned-db?
+                           (chat-context/close-chat! chat-ctx)
+                           (chat-context/release-sci-in! chat-ctx (:ctx work-room))))
+                       (check!)
+                       (let [inputs (run-inputs agent nil supervisor)
+                             _ (update-llm-metrics! supervisor merge {:inputs-id (inputs-id inputs)})
+                             result (sci-program/execute!
+                                     (chat-context/sci-context-in chat-ctx (:ctx work-room))
+                                     program task check!)]
+                         (check!)
+                         (select-keys result [:value])))))
+           remaining-ms (max 1 (long (Math/ceil (/ (- deadline (System/nanoTime)) 1000000.0))))
+           outcome (sp/await (comb/timeout (worker-result-spin worker) remaining-ms ::sci-timeout))]
+       (when (= ::sci-timeout outcome)
+         (cancel-supervisor! supervisor)
+         (throw (ex-info "SCI execution deadline expired" {:type ::sci-timeout})))
+       (when (or (= ::worker-cancelled outcome) (run/cancel-requested? run-id))
+         (cancelled! run-id))
+       (when (worker-error? outcome)
+         ;; The sticky worker deadline may win before the graph timer. Fatal
+         ;; source failures must cancel owned children on either frontier.
+         (cancel-supervisor! supervisor)
+         (throw (::worker-error outcome)))
+       (try (check!)
+            (catch Throwable error
+              (cancel-supervisor! supervisor)
+              (throw error)))
+       (program-result :completed (:value outcome))))))
+
 (defn- execute-program
   [control-room work-room run-id chat-id agent task trigger supervisor]
   (if-let [protocol (::protocol agent)]
@@ -1394,6 +1450,7 @@
   (case (get-in agent [:agent/program :kind])
     :llm (execute-llm-program control-room work-room run-id chat-id agent task
                               trigger supervisor (::limits agent))
+    :sci (execute-sci-program control-room work-room run-id chat-id agent task supervisor)
     (execute-deterministic-program run-id agent task)))
 
 (def ^:private hire-option-keys
@@ -1405,6 +1462,7 @@
   (let [allowed (case kind
                   :scripted #{:kind :delay-ms :reply :result}
                   :echo #{:kind :delay-ms}
+                  :sci #{:kind :source :entrypoint :args :timeout-ms}
                   :llm #{:kind :max-model-steps :budget-dollars
                          :auto-compact? :compaction-model :execution-mode :single-use? :provider-policy}
                   nil)]
@@ -1463,6 +1521,7 @@
                           {:type ::invalid-model-policy
                            :agent-ref agent-ref
                            :model-policy policy})))))
+    (when (= :sci kind) (sci-program/validate! program))
     program))
 
 (defn- validate-hire!
@@ -1521,6 +1580,8 @@
                   (throw (ex-info "Unknown AgentRef"
                                   {:type ::unknown-agent :agent-ref agent-ref})))]
     (validate-program! (:agent/program agent) agent-ref agent)
+    (when (= :sci (get-in agent [:agent/program :kind]))
+      (sci-program/portable-value! task))
     (when (and (get-in agent [:agent/program :single-use?])
                (not= {resource/cli-run-admissions 1M} resources))
       (throw (ex-info "Single-use CLI Runs require exactly one CLI admission, no other provider grants"
@@ -2274,8 +2335,8 @@
    - `:settlement` `:automatic` (default), `:review`, `:discard`, or host-owned `:deferred`
    - `:resources`  positive conserved vector split from the parent Run/Room
    - `:limits`     restrictive LLM `:max-model-steps` / `:budget-dollars`
-   Built-in program kinds are deterministic `:scripted` / `:echo` and the
-   bounded Dvergr-native `:llm` model/tool loop. (No simulation or replay
+   Built-in program kinds are deterministic `:scripted` / `:echo`, pinned
+   `:sci` source entrypoints and the bounded `:llm` model/tool loop. (No simulation or replay
    interpreter exists; one would implement the same boundary.)"
   ([control-room world-parent roster agent-ref opts]
    (hire-in! control-room world-parent roster agent-ref opts {}))
