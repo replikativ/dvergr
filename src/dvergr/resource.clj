@@ -398,6 +398,38 @@
                 (.setScale (bigdec (* 2 (+ (* in-tokens in-price) (* max-output output))))
                            0 java.math.RoundingMode/CEILING)))))))))
 
+(declare return!)
+
+(defn reconcile-return!
+  "Host cleanup boundary: AFTER physical quiescence, reconcile an uncertain
+   allocation and return its remaining balance. Store failures retain ownership
+   and retry with stable transfer identities. Never call from a drain."
+  [room run-id parent-run allocation-state]
+  (let [allocated?
+        (loop []
+          (case @allocation-state
+            (:not-requested :not-started) false
+            :allocated true
+            (:attempting :uncertain)
+            (let [outcome (try
+                            (if (satisfies? store/PResourceStore (:store room))
+                              (boolean (store/-resource-receipt (:store room) (allocation-id run-id)))
+                              false)
+                            (catch Throwable t t))]
+              (if (instance? Throwable outcome)
+                (do (Thread/sleep 25) (recur))
+                outcome))))]
+    (when allocated?
+      (loop []
+        (let [outcome (try
+                        (let [remaining (run-balance room run-id)]
+                          (when (seq remaining) (return! room run-id parent-run remaining)))
+                        :returned
+                        (catch Throwable t t))]
+          (when (instance? Throwable outcome)
+            (Thread/sleep 25)
+            (recur)))))))
+
 (defn funded-grant?
   "Does a child's grant `resources` fund provider calls: money to pay them
    and admissions to make them (doc/design/runs-as-worlds.md, Budgets as a

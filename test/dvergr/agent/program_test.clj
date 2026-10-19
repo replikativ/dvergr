@@ -2308,10 +2308,13 @@
 (deftest the-delegate-tool-funds-the-child-it-hires-in-a-paid-run
   (let [room (test-room :delegate-funding)
         hired (atom nil)
-        ceiling (#'program/child-program-authority (random-uuid) nil)]
+        host-options (atom nil)
+        ceiling (assoc (#'program/child-program-authority (random-uuid) nil)
+                       :experiment-capabilities {})]
     (try
       (with-redefs-fn
-        {#'program/hire-in! (fn [_ _ _ _ opts] (reset! hired opts)
+        {#'program/hire-in! (fn [_ _ _ _ opts host] (reset! hired opts)
+                              (reset! host-options host)
                               (delay {:run/status :completed :run/value "ok"}))}
         #(#'tools/delegate-agent!
           {:task "summarize" :budget 0.25}
@@ -2323,6 +2326,8 @@
              (:resources @hired))
           "its budget in microdollars, two admissions per model step")
       (is (resource/funded-grant? (:resources @hired)))
+      (is (= {:experiment-capabilities {}} @host-options)
+          "the convenience tool cannot discard an explicitly empty verifier scope")
       (finally (d/close-room! room)))))
 
 (deftest split-divides-a-grant-among-roles

@@ -497,7 +497,9 @@
         experiment-ref* (requiring-resolve 'dvergr.agent.experiment/experiment-ref)
         hire-in*       (requiring-resolve 'dvergr.agent.program/hire-in!)
         observe*       (requiring-resolve 'dvergr.agent.program/observe)
+        require-scoped-run!* (requiring-resolve 'dvergr.agent.authority/require-scoped-run!)
         snapshot*      (requiring-resolve 'dvergr.agent.observation/snapshot)
+        read-output*   (requiring-resolve 'dvergr.agent.output/read-output)
         issue-receipt* (requiring-resolve 'dvergr.agent.observation/issue-receipt!)
         revoke-receipt* (requiring-resolve 'dvergr.agent.observation/revoke-receipt!)
         lifecycle-activity* (requiring-resolve 'dvergr.activity/lifecycle-activity)
@@ -510,15 +512,8 @@
         room-balance*  (requiring-resolve 'dvergr.resource/balance)
         run-balance*   (requiring-resolve 'dvergr.resource/run-balance)
         room-lookup*   (requiring-resolve 'dvergr.room.registry/lookup)
-        run-experiment* (requiring-resolve 'dvergr.agent.experiment/run)
-        capabilities-for* (requiring-resolve 'dvergr.agent.evaluators/capabilities-for)
+        start-experiment* (requiring-resolve 'dvergr.agent.subexperiment/start!)
         offered*       (requiring-resolve 'dvergr.agent.evaluators/offered)
-        job-start*     (requiring-resolve 'dvergr.jobs/start!)
-        job-cancel*    (requiring-resolve 'dvergr.jobs/cancel!)
-        cancel-hook*   (requiring-resolve 'dvergr.agent.run/register-cancel-hook!)
-        deferred*      (requiring-resolve 'org.replikativ.spindel.core/deferred)
-        deliver*       (requiring-resolve 'org.replikativ.spindel.core/deliver!)
-
         selected-ctx   #(runtime-ctx/selected-context spindel-ctx)
         current-room-id #(or (when binding-resolver
                                (:room-runtime-id (binding-resolver)))
@@ -583,65 +578,25 @@
                                               (if (and ambient-parent
                                                        (not (contains? opts :parent-run)))
                                                 (assoc opts :parent-run ambient-parent)
-                                                opts))]
+                                                opts)
+                                              (select-keys agent-program-ceiling [:experiment-capabilities :delegation-policy]))]
                                (if-let [own-child! (:own-child! agent-program-ceiling)]
                                  (own-child! admit-child!)
                                  (admit-child!))))))
         run-experiment-fn
         (fn run-experiment-fn
           ([roster experiment] (run-experiment-fn roster experiment {}))
-          ([roster experiment {:keys [parallelism] :or {parallelism 1} :as opts}]
-           (when-let [unknown (seq (remove #{:parallelism} (keys opts)))]
-             (throw (ex-info "Unknown run-experiment! options"
-                             {:type ::unknown-experiment-options :unknown (set unknown)})))
+          ([roster experiment opts]
            (let [work-room (room!)
-                 control-room (control-room! work-room)
-                 allowed-kinds (:program-kinds agent-program-ceiling)
-                 ambient-parent (:parent-run agent-program-ceiling)
-                 kinds (->> (:experiment/candidates experiment)
-                            (map #(get-in (lookup-agent* roster (:candidate/agent %))
-                                          [:agent/program :kind])))]
-             (when-let [over (and allowed-kinds (seq (remove allowed-kinds kinds)))]
-               (throw (ex-info "A candidate exceeds this sandbox's delegation ceiling"
-                               {:type ::program-ceiling-exceeded
-                                :program-kinds (set over)
-                                :allowed-program-kinds allowed-kinds})))
-             ;; Scoring is host code: only verifiers this host offers.
-             (let [{:keys [evaluators world-setups]} (capabilities-for* experiment)
-                   ctx (:ctx work-room)
-                   result (binding [ec/*execution-context* ctx] (deferred*))
-                   job (job-start*
-                        control-room
-                        (cond-> {:kind :experiment :ctx ctx}
-                          ambient-parent (assoc :parent ambient-parent))
-                        (fn [job-id]
-                          ;; Worlds fork the current world; Runs and Attempts
-                          ;; are certified where this Run's are.
-                          (run-experiment* control-room roster experiment evaluators
-                                           {:world-setups world-setups
-                                            :parallelism parallelism
-                                            :parent-run job-id
-                                            :world-parent work-room
-                                            :complete-only? true}))
-                        :settled
-                        (fn [status v]
-                          (binding [ec/*execution-context* ctx]
-                            (deliver* result
-                                      (if (= :completed status)
-                                        {:status status :scorecard (:scorecard v)}
-                                        {:status status
-                                         :error (when (instance? Throwable v) (ex-message v))})))))]
-               ;; The sub-experiment is this Run's work: cancelling the Run
-               ;; stops it.
-               (when ambient-parent
-                 (cancel-hook* ambient-parent [::experiment (:id job)]
-                               #(job-cancel* (:id job))))
-               (binding [ec/*execution-context* ctx]
-                 (await-deferred result (:id job)))))))
+                 control-room (control-room! work-room)]
+             (binding [ec/*execution-context* (:ctx work-room)]
+               (start-experiment* control-room work-room roster experiment opts agent-program-ceiling)))))
         observe-fn     (fn [handle-or-id]
                          (let [work-room (room!)
                                control-room (control-room! work-room)]
                            (binding [ec/*execution-context* (:ctx work-room)]
+                             (when-let [scope (:parent-run agent-program-ceiling)]
+                               (require-scoped-run!* control-room scope (if (uuid? handle-or-id) handle-or-id (run-id* handle-or-id))))
                              (observe* control-room handle-or-id))))
         inspect-fn     (fn inspect-fn
                          ([] (inspect-fn {}))
@@ -676,6 +631,14 @@
                                   (catch Throwable error
                                     (revoke-receipt* scope-run-id receipt-id)
                                     (throw error))))))))
+        attempt-output-fn
+        (fn attempt-output-fn
+          ([id] (attempt-output-fn id {}))
+          ([id opts]
+           (let [work-room (room!)
+                 control-room (control-room! work-room)]
+             (binding [ec/*execution-context* (:ctx work-room)]
+               (read-output* control-room (:parent-run agent-program-ceiling) id opts)))))
         cancel-fn      (fn [handle-or-id]
                          ;; Run cancellation tokens are process-local. Binding
                          ;; the Room ctx keeps this boundary consistent with
@@ -683,6 +646,8 @@
                          (let [work-room (room!)
                                control-room (control-room! work-room)]
                            (binding [ec/*execution-context* (:ctx work-room)]
+                             (when-let [scope (:parent-run agent-program-ceiling)]
+                               (require-scoped-run!* control-room scope (if (uuid? handle-or-id) handle-or-id (run-id* handle-or-id))))
                              (cancel* control-room handle-or-id))))
         result-spin-fn (fn [handle]
                          (if-let [run-id (:parent-run agent-program-ceiling)]
@@ -727,11 +692,19 @@
                              hire-fn)
         'run-experiment! (gated effects (fn [_ experiment & _]
                                           {:effect :run/start
+                                           ;; The value is an observer Spin,
+                                           ;; not the eventual experiment data.
+                                           :result-of (constantly nil)
                                            :resource {:experiment (str (or (:id experiment) (:experiment/id experiment)))}})
                                 run-experiment-fn)
-        'offered      (fn [] (offered*))
+        'offered      (fn [] (if (contains? agent-program-ceiling :experiment-capabilities)
+                               (offered* (:experiment-capabilities agent-program-ceiling))
+                               (offered*)))
+        'delegation-policy (fn [] (:delegation-policy agent-program-ceiling))
+        'current-run-id (fn [] (:parent-run agent-program-ceiling))
         'observe      observe-fn
         'inspect      inspect-fn
+        'attempt-output attempt-output-fn
         'cancel!      (gated effects (fn [handle] {:effect :run/cancel :resource {:run (str (or (:run/id handle) handle))}})
                              cancel-fn)
         'balance      balance-fn
@@ -757,10 +730,13 @@
            experiment-ref [([experiment]) "Return the stable logical/version/content reference for one exact ExperimentDef. Running and trusted scoring remain host-owned capabilities."]
            room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
            hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (dvergr.agent/hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it); :role, a keyword naming the part the child plays (:candidate, :judge, ...), which its spend is summed under (see `split`). Unknown keys are rejected."]
-           run-experiment! [([roster experiment] [roster experiment opts]) "Run an ExperimentDef as a sub-experiment of the current Run: a job Run (its child) whose cells are attempts in worlds forked from the current Room/world, scored only by verifiers this host offers (see `offered`), certified with this Run's records. Candidates are held to the same program ceiling as `hire!`. Returns a Spin resolving to {:job uuid :status :completed|:failed|:cancelled :scorecard ScorecardDef (when completed) :error string}. Cancelling the current Run cancels it. opts: :parallelism (default 1)."]
+           run-experiment! [([roster experiment] [roster experiment opts]) "Run a child experiment in forks of the current world, using only offered verifiers/setups. Returns a Spin of {:job uuid :status keyword :scorecard ScorecardDef (when completed) :error string}. A hired parent owns it even when ignored; cancellation joins cleanup before returning resources. opts: :parallelism (default 1), :resources (explicit aggregate grant covering every candidate/case/repetition). Paid cells require funded per-cell native-provider grants; CLI/relay execution is not admitted. Verifier scope follows recursive hires; an empty scope offers nothing."]
            offered      [([]) "The verifier and world-setup refs this host offers to experiments: {:evaluators [ref ...] :world-setups [ref ...]}."]
+           delegation-policy [([]) "The host's portable child delegation bounds, or nil for a trusted legacy caller. :tools is the maximum tool set, :sandboxes enumerates exact allowed extension combinations, :providers permits LLM transports; optional :max-attempts/:max-parallelism bound each child experiment. Child definitions cannot override this policy."]
+           current-run-id [([]) "The ambient consumer Run UUID, or nil outside a hired Run. This is host-issued scope, not a caller-selected Run identity."]
            observe      [([handle-or-run-id]) "Read the current Room's durable Run projection for a RunHandle or UUID."]
            inspect      [([] [opts]) "Inspect the current Run and its structural descendants as one bounded snapshot of Runs, frontier, correlated messages, semantic activities, failures, and conserved balances. Inside a hired agent this cannot see parent or sibling Runs, and inspection without an ambient Run fails closed. A durable semantic receipt identifies the inspection. Options: :run-limit, :message-limit, :content-limit, :content-budget, :detail-limit."]
+           attempt-output [([attempt-id] [attempt-id opts]) "Read deliberately published :agent/output from a certified Attempt in the current Run subtree. Private verifier evidence is never returned. opts: :path (map keys/vector indices, at most 16), :offset/:length for string chunks (UTF-16 units; length at most 16384). Maps/collections are bounded; select a smaller path if too large. Returns immutable Attempt identity and :output, with :next-offset for further string chunks. A successful child read records a causal input; missing scope/publication fails closed."]
            cancel!      [([handle-or-run-id]) "Request cooperative cancellation of exactly one live Run. Returns true when the Run was found."]
            balance      [([]) "Return the conserved resource vector available to the current Run, or the Room root at top level."]
            split        [([resources shares]) "Divide a resource vector among roles: (dvergr.agent/split (dvergr.agent/balance) {:candidate 1/2 :judge 1/4}) returns {role grant}, each a :resources map for `hire!` with that :role. Shares are positive fractions summing to at most 1; amounts round down, and what is left stays with the current Run."]
@@ -785,9 +761,13 @@
           'hire!           [:=> [:cat Roster AgentIdOrRef HireOpts] RunHandle]
           'run-experiment! [:function [:=> [:cat Roster :map] :any] [:=> [:cat Roster :map :map] :any]]
           'offered         [:=> [:cat] :map]
+          'delegation-policy [:=> [:cat] [:maybe :map]]
+          'current-run-id   [:=> [:cat] [:maybe :uuid]]
           'observe         [:=> [:cat [:or :uuid RunHandle]] [:maybe Run]]
           'inspect         [:function [:=> [:cat] Observation]
                             [:=> [:cat InspectOpts] Observation]]
+          'attempt-output  [:function [:=> [:cat :uuid] :map]
+                            [:=> [:cat :uuid :map] :map]]
           'cancel!         [:=> [:cat [:or :uuid RunHandle]] :boolean]
           'balance         [:=> [:cat] Balance]
           'split           [:=> [:cat Balance [:map-of :keyword 'number?]] [:map-of :keyword Balance]]

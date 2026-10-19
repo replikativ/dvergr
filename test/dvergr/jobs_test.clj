@@ -84,6 +84,31 @@
         (is (= #{(:id job) (:run/id @child)} (set (map :run/id tree))))
         (is (= (:id job) (:run/parent (first (filter #(= (:run/id @child) (:run/id %)) tree)))))))))
 
+(deftest physical-finish-boundary-precedes-durable-terminality
+  (with-room [room :jobs-physical-boundary]
+    (let [entered (promise) release (promise)
+          job (jobs/start! room {:kind :experiment}
+                           (fn [_] (binding [ec/*execution-context* (:ctx room)] (sp/spin :done)))
+                           :before-finish (fn [id status value]
+                                            (deliver entered [id status value]) @release))]
+      (try
+        (is (= [(:id job) :completed :done] (deref entered 5000 ::timeout)))
+        (is (= :running (:status (jobs/status (:id job)))))
+        (is (false? (:settled? (jobs/status (:id job)))))
+        (finally (deliver release true)))
+      (is (= :completed (:status (jobs/status (:id job) 5000)))))))
+
+(deftest physical-finish-boundary-also-runs-on-construction-failure
+  (with-room [room :jobs-construction-boundary]
+    (let [called (atom [])]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"construction"
+                            (jobs/start! room {:kind :experiment}
+                                         (fn [_] (throw (ex-info "construction" {})))
+                                         :before-finish (fn [id status _] (swap! called conj [id status])))))
+      (is (= 1 (count @called)))
+      (is (= :failed (second (first @called))))
+      (is (empty? (run/active-runs (:id room)))))))
+
 (deftest waiting-is-capped
   (with-room [room :jobs-wait]
     (let [job (jobs/start! room {:kind :workflow}

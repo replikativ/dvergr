@@ -161,7 +161,7 @@
                                (get-in % [:attempt-receipt :attempt/metrics
                                           :timed-out?])])
                           results))
-              (is (every? #(= [:not-applicable 1 5]
+              (is (every? #(= [:not-applicable 1 program/interpreter-version]
                               [(get-in % [:attempt-receipt :attempt/metrics
                                           :model-resolution])
                                (get-in % [:attempt-receipt :attempt/metrics

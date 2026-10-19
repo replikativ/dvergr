@@ -249,6 +249,7 @@
          :prompt (:agent/prompt prior)
          :program (:agent/program prior)
          :tools (:agent/tools prior)
+         :sandbox (:agent/sandbox prior)
          :model-policy (:agent/model-policy prior)
          :metadata (:agent/metadata prior)}
         revised (normalize-agent friendly-prior patch)]

@@ -12,6 +12,7 @@
    candidate when it starts (assembled prompt, tools, resolved model), which an
    experiment's resume compares per cell."
   (:require [dvergr.agent.roster :as roster]
+            [dvergr.agent.authority :as delegation]
             [dvergr.sandbox.extensions :as extensions]
             [dvergr.agent.prompt :as prompt]
             [dvergr.agent.room-context :as room-context]
@@ -54,7 +55,7 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 5)
+(def interpreter-version 8)
 
 (def ^:private default-max-model-steps 32)
 
@@ -82,20 +83,25 @@
    Keep this one value shared by the SCI and native-tool surfaces so a model
    cannot bypass delegation attenuation by choosing a different interface."
   [run-id supervisor]
-  {:program-kinds #{:echo :scripted}
+  (cond-> {:program-kinds #{:echo :scripted}
    ;; A child that calls providers is admitted only when its grant funds
    ;; them (`resource/funded-grant?`): money and dispatch admissions split
    ;; from this Run's wallet, which bound what it can spend, each dispatch's
    ;; cost reserved before it leaves (doc/design/runs-as-worlds.md, Budgets
    ;; as a tree). An unfunded child, an experiment's candidates, and provider
    ;; calls made from this Run's own sandbox stay closed.
-   :funded-program-kinds #{:llm}
-   :provider-effects? false
-   :parent-run run-id
+           :funded-program-kinds #{:llm}
+           :provider-effects? false
+           :parent-run run-id
    ;; Process-local structured ownership. The sandbox may construct immutable
    ;; rosters freely, but every admitted child execution is leased to this
    ;; supervisor before `hire!` returns to agent code.
-   :own-child! #(with-owned-child! supervisor %)})
+           :own-child! #(with-owned-child! supervisor %)}
+    (contains? supervisor :experiment-capabilities)
+    (assoc :experiment-capabilities (:experiment-capabilities supervisor))
+    (contains? supervisor :delegation-policy)
+    (merge (select-keys (:delegation-policy supervisor) [:max-attempts :max-parallelism])
+           {:delegation-policy (:delegation-policy supervisor)})))
 
 (defn- program-result
   ([status value] {::status status ::value value})
@@ -577,11 +583,16 @@
                {:cancel! #(when-let [cancel-child! @cancel-slot]
                             (cancel-child!))})))
     (try
-      (let [^RunHandle handle (admit-child!)
+      (let [handle (admit-child!)
             child-id (run-id handle)
             owner-ctx (ec/current-execution-context)
             cancel-child! #(binding [ec/*execution-context* owner-ctx]
-                             (cancel! handle))]
+                             ;; Host-owned jobs share the same lease. They
+                             ;; terminalize only after their before-finish
+                             ;; boundary has joined cleanup and returned grants.
+                             (if-let [cancel-job! (when (map? handle) (::cancel! handle))]
+                               (cancel-job!)
+                               (cancel! handle)))]
         (reset! cancel-slot cancel-child!)
         (locking supervisor
           (swap! (:state supervisor) assoc-in [:children lease-id :handle] handle))
@@ -589,14 +600,20 @@
         ;; registry lock. We therefore cannot miss a child that terminalizes
         ;; during registration, and acknowledgement is independent of either
         ;; execution graph being cancelled.
-        (run/watch-runs!
-         watch-key
-         (fn [{:keys [type runs run]}]
-           (when (or (and (= :runs/snapshot type)
-                          (not-any? #(= child-id (:run/id %)) runs))
-                     (and (= :run/finished type)
-                          (= child-id (:run/id run))))
-             (acknowledge!))))
+        (let [watch-terminal!
+              (fn [] (run/watch-runs!
+                      watch-key
+                      (fn [{:keys [type runs run]}]
+                        (when (or (and (= :runs/snapshot type)
+                                       (not-any? #(= child-id (:run/id %)) runs))
+                                  (and (= :run/finished type)
+                                       (= child-id (:run/id run))))
+                          (acknowledge!)))))]
+          (if-let [on-settled! (when (map? handle) (::on-settled! handle))]
+            ;; A Job must BOTH publish into its still-live caller context and
+            ;; durably terminalize. Neither frontier alone releases ownership.
+            (on-settled! watch-terminal!)
+            (watch-terminal!)))
         (when (:cancelled? @(:state supervisor))
           (cancel-child!))
         handle)
@@ -768,6 +785,15 @@
     compaction (assoc :compaction (model-inputs compaction))
     (seq sandbox) (assoc :sandbox (extensions/refs sandbox))))
 
+(defn- with-experiment-inputs [inputs host-options]
+  (cond-> inputs
+    (and inputs (contains? host-options :experiment-capabilities))
+    (assoc :experiment-capabilities
+           (into {} (for [kind [:evaluators :world-setups]]
+                      [kind (set (keys (get-in host-options [:experiment-capabilities kind])))])))
+    (and inputs (contains? host-options :delegation-policy))
+    (assoc :delegation-policy (delegation/inputs (:delegation-policy host-options)))))
+
 (defn run-inputs
   "What a Run of `agent` will present to its candidate when it starts now,
    as portable data: the inputs resolved at Run start that are not in the
@@ -810,7 +836,9 @@
            (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
                   :provider-policy (claude-code/execution-policy)))))
 
-     :else nil)))
+     :else nil))
+  ([agent protocol host-options]
+   (with-experiment-inputs (run-inputs agent protocol) host-options)))
 
 (defn inputs-id
   "The content id of `run-inputs` (`:attempt/inputs-id`); nil for nil (a
@@ -1042,10 +1070,11 @@
                     ;; what the model is presented with: the system prompt it
                     ;; is sent (a resumed Run's is the one it started with)
                     compaction (compaction-spec agent model-spec)
-                    inputs (cond-> (llm-inputs sent tool-map model-spec compaction (:agent/sandbox agent))
-                             (get-in agent [:agent/program :execution-mode])
-                             (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
-                                    :provider-policy (claude-code/execution-policy)))]
+                    inputs (with-experiment-inputs
+                             (cond-> (llm-inputs sent tool-map model-spec compaction (:agent/sandbox agent))
+                               (get-in agent [:agent/program :execution-mode])
+                               (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
+                                      :provider-policy (claude-code/execution-policy))) supervisor)]
                 (update-llm-metrics!
                  supervisor
                  (constantly
@@ -1271,7 +1300,7 @@
                (fn []
                  (let [;; the model the inputs id names, resolved once
                        pinned (pin-model (dissoc agent ::limits ::protocol))
-                       inputs (run-inputs pinned protocol)]
+                       inputs (run-inputs pinned protocol supervisor)]
                    ;; what the protocol presents, as `run-inputs` predicts it
                    (update-llm-metrics!
                     supervisor
@@ -1590,38 +1619,7 @@
    transient store failures retain the live Run and retry behind the same
    physical-quiescence fence as durable terminal persistence."
   [room id parent-run allocation-state]
-  (let [allocated?
-        (loop []
-          (case @allocation-state
-            (:not-requested :not-started) false
-            :allocated true
-            ;; The allocating worker exited through an exception. Reconcile its
-            ;; stable transfer identity after physical quiescence: a receipt is
-            ;; authoritative evidence that the wallet/grant committed, while an
-            ;; authoritative nil proves there is nothing to return.
-            (:attempting :uncertain)
-            (let [outcome
-                  (try
-                    (if (satisfies? room-store/PResourceStore (:store room))
-                      (boolean
-                       (room-store/-resource-receipt
-                        (:store room) (resource/allocation-id id)))
-                      false)
-                    (catch Throwable t t))]
-              (if (instance? Throwable outcome)
-                (do (Thread/sleep 25) (recur))
-                outcome))))]
-    (when allocated?
-      (loop []
-        (let [outcome (try
-                        (let [remaining (resource/run-balance room id)]
-                          (when (seq remaining)
-                            (resource/return! room id parent-run remaining))
-                          :returned)
-                        (catch Throwable t t))]
-          (when (instance? Throwable outcome)
-            (Thread/sleep 25)
-            (recur)))))))
+  (resource/reconcile-return! room id parent-run allocation-state))
 
 (defn- finalize-execution-external!
   "Finalize from a process-local watcher only after the orchestration Spin has a
@@ -1877,7 +1875,7 @@
     :as raw-opts}
    prepare-world! & [protocol {resume-from :resume snapshots :snapshots preset-id :id
                                on-world :on-world resources-from :resources-from
-                               deadline-nanos :deadline-nanos}]]
+                               deadline-nanos :deadline-nanos :as host-options}]]
   (when-not (or (nil? deadline-nanos) (integer? deadline-nanos))
     (throw (ex-info "Run deadline must be an absolute monotonic timestamp"
                     {:type ::invalid-deadline})))
@@ -1888,7 +1886,7 @@
     (throw (ex-info "Run protocol must be a host capability with a :run function"
                     {:type ::invalid-protocol})))
   (let [opts      (assoc raw-opts :from from)
-        agent     (validate-hire! roster agent-ref opts)
+        agent     (delegation/check-agent! (validate-hire! roster agent-ref opts) host-options)
         actor     (:agent/id agent)
         id        (or preset-id (random-uuid))
         chat-id   (run-chat-id id)
@@ -1900,7 +1898,11 @@
                                (when snapshots {:snapshots snapshots}))
         work-room (:work run-world)
         supervisor (cond-> (assoc (make-supervisor (:ctx world-parent) (:ctx work-room)) :run-id id)
-                     deadline-nanos (assoc :deadline-nanos deadline-nanos))
+                     deadline-nanos (assoc :deadline-nanos deadline-nanos)
+                     (contains? host-options :experiment-capabilities)
+                     (assoc :experiment-capabilities (:experiment-capabilities host-options))
+                     (contains? host-options :delegation-policy)
+                     (assoc :delegation-policy (:delegation-policy host-options)))
         session-close (atom nil)
         _ (when (and (= :llm (get-in agent [:agent/program :kind])) (:store control-room))
             (when-let [session (install-turn-savepoints! control-room work-room)]
@@ -2246,8 +2248,12 @@
    Built-in program kinds are deterministic `:scripted` / `:echo` and the
    bounded Dvergr-native `:llm` model/tool loop. (No simulation or replay
    interpreter exists; one would implement the same boundary.)"
-  [control-room world-parent roster agent-ref opts]
-  (hire-prepared-in! control-room world-parent roster agent-ref opts nil))
+  ([control-room world-parent roster agent-ref opts]
+   (hire-in! control-room world-parent roster agent-ref opts {}))
+  ([control-room world-parent roster agent-ref opts host-options]
+   (when-let [unknown (seq (remove (set delegation/host-option-keys) (keys host-options)))]
+     (throw (ex-info "Unknown host hiring capabilities" {:unknown (set unknown)})))
+   (hire-prepared-in! control-room world-parent roster agent-ref opts nil nil host-options)))
 
 (defn hire!
   "Start a top-level AgentDef execution in `room` and return an opaque

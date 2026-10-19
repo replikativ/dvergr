@@ -392,10 +392,10 @@
    (`program/run-inputs`, in the bound context: the world the cells fork),
    computed once per candidate and protocol. Tokens are not spent: the
    system prompt is assembled, not sent."
-  [team experiment protocols]
+  [team experiment protocols host-options]
   (let [by (memoize (fn [candidate protocol]
                       (program/inputs-id
-                       (program/run-inputs (exact-agent! team candidate) protocol))))]
+                       (program/run-inputs (exact-agent! team candidate) protocol host-options))))]
     (into {}
           (for [candidate (:experiment/candidates experiment)
                 definition (get-in experiment [:experiment/dataset :dataset/environments])]
@@ -904,7 +904,7 @@
    (when-let [unknown (seq (remove #{:from :parent-run :world-parent :parallelism
                                      :max-parallelism :max-attempts
                                      :world-setups :protocols :cleanup-group
-                                     :resume? :complete-only? :on-result :admit}
+                                     :resume? :complete-only? :on-result :admit :experiment-capabilities :delegation-policy}
                                    (keys opts)))]
      (invalid! "Experiment contains unknown run options"
                ::unknown-run-options {:unknown (set unknown)}))
@@ -926,7 +926,7 @@
                        ::attempts-exceed-ceiling
                        {:attempt-count attempt-count
                         :max-attempts max-attempts}))
-         base-evaluation-opts (assoc (select-keys opts [:from :parent-run :world-parent])
+         base-evaluation-opts (assoc (select-keys opts [:from :parent-run :world-parent :experiment-capabilities :delegation-policy])
                                      :cleanup-group cleanup-group)
          capabilities {:world-setups world-setups :protocols protocols}
          ;; Validate every distinct candidate/environment pairing once before
@@ -942,7 +942,7 @@
                                     definition)))
          ;; what each cell's candidate would be presented with now: a kept
          ;; cell must have been made with exactly that, and so must a new one
-         current (current-inputs-ids team experiment protocols)
+         current (current-inputs-ids team experiment protocols opts)
          {:keys [done stale]} (if resume? (completed-cells room experiment current) {:done {} :stale #{}})
          _ (when (seq stale)
              (tel/log! {:level :info :id ::inputs-changed

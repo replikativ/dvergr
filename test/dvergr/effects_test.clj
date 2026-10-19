@@ -40,6 +40,19 @@
   [sink specs]
   (constantly {:handlers (into [(effects/receipts sink nil)] (effects/handlers specs))}))
 
+(deftest receipting-an-asynchronous-handle-never-evaluates-it
+  (let [calls (atom 0)
+        handle (reify clojure.lang.IDeref
+                 (deref [_] (swap! calls inc) (throw (ex-info "must not dereference" {}))))
+        sink (effects/make-sink)]
+    (is (nil? (effects/digest handle)))
+    (is (identical? handle (effects/perform! (boundary sink [])
+                                             {:effect :run/start :resource {:agent "test"}}
+                                             (constantly handle))))
+    (is (zero? @calls))
+    (is (= :allowed (:decision (first @sink))))
+    (is (nil? (:digest (first @sink))))))
+
 (deftest the-stack-decides-and-receipts
   (let [sink (effects/make-sink)]
     (testing "no handlers: the world answers, and the read is receipted by digest, not body"
