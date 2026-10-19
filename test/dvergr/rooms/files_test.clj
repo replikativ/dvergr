@@ -2,8 +2,10 @@
   "A room's workspace files from outside the room: listed, read as text or
    base64 in chunks, and written as one commit of exactly the named paths,
    through the effect boundary (a read-only world refuses and receipts it)."
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [datahike.api :as dh]
             [dvergr.catalog.workspace :as ws]
             [dvergr.discourse :as d]
             [dvergr.effects :as effects]
@@ -12,6 +14,8 @@
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms.files :as files]
             [dvergr.rooms.forks :as forks]
+            [dvergr.rooms.publication :as publication]
+            [dvergr.rooms.file-tx :as file-tx]
             [dvergr.substrate.geschichte :as gs]
             [dvergr.tools :as tools]
             [geschichte.repo :as repo]
@@ -28,6 +32,224 @@
 (defn- commits [r] (count (repo/log (conn r) {:limit 1000})))
 (defn- b64 [^bytes b] (.encodeToString (Base64/getEncoder) b))
 (defn- unb64 [^String s] (.decode (Base64/getDecoder) s))
+
+(defn- publication-options [r journal]
+  (let [plan (repo/prepare-commit (conn r) {:message "Identify publication target"})]
+    {:identity {:publication/id (random-uuid) :publication/intent (random-uuid)
+                :publication/actor (random-uuid) :publication/manifest (random-uuid)
+                :publication/repository (:repository plan)
+                :publication/store (get-in plan [:workspace :store :id])
+                :publication/backend (get-in plan [:workspace :store :backend])
+                :publication/branch (get-in plan [:workspace :branch])
+                :publication/ref (:ref plan)}
+     :authorize! (constantly true)
+     :before-dispatch! #(swap! journal conj %)}))
+
+(deftest durable-publication-recovers-after-lost-ack-and-later-human-edit
+  (let [r (room)
+        journal (atom [])]
+    (try
+      (let [options (publication-options r journal)
+            native-publish! publication/publish!
+            error (with-redefs [publication/publish!
+                                (fn [& args]
+                                  (apply native-publish! args)
+                                  (throw (ex-info "lost after commit"
+                                                  {::publication/uncertain? true})))]
+                    (try (files/write! r {"wiki/brief.md" {:text "accepted"}}
+                                       {:publication options
+                                        :expected-worktree {"/wiki/brief.md" nil}})
+                         nil
+                         (catch Exception error error)))
+            committed (str (:geschichte.commit/id (repo/head-commit (conn r))))]
+        (is (publication/uncertain? error))
+        (is (= "accepted" (:text (files/read-file r "wiki/brief.md" {}))))
+        (is (= 1 (count @journal)))
+        (files/write! r {"wiki/brief.md" {:text "later human edit"}} {})
+        (let [count-before (commits r)
+              recovered (files/write! r {"wiki/brief.md" {:text "accepted"}}
+                                      {:publication options
+                                       :expected-worktree {"/wiki/brief.md" nil}})]
+          (is (:recovered? recovered))
+          (is (:applied? recovered))
+          (is (= committed (:commit recovered)))
+          (is (= count-before (commits r)))
+          (is (= "later human edit" (:text (files/read-file r "wiki/brief.md" {}))))
+          (is (= 1 (count @journal)))))
+      (finally (d/close-room! r)))))
+
+(deftest skipped-publication-does-not-produce-a-receipt-or-journal-dispatch
+  (let [r (room)
+        journal (atom [])]
+    (try
+      (let [options (publication-options r journal)
+            result (files/write! r {"wiki/skipped.md" {:text "not written"}}
+                                 {:publication options
+                                  :boundary (constantly {:handlers [(fn [_ _] :skipped)]})})]
+        (is (false? (:applied? result)))
+        (is (nil? (:publication result)))
+        (is (empty? @journal))
+        (is (nil? (publication/recover @(conn r) (:identity options))))
+        (is (not (mfs/exists? (ws/room-fs r) "/wiki/skipped.md"))))
+      (finally (d/close-room! r)))))
+
+(deftest failed-prepublication-journal-does-not-commit-the-files
+  (let [r (room)
+        journal (atom [])]
+    (try
+      (let [options (assoc (publication-options r journal)
+                           :before-dispatch! (fn [_] (throw (ex-info "journal unavailable" {}))))
+            before (commits r)]
+        (is (thrown? Exception
+                     (files/write! r {"wiki/not-committed.md" {:text "refused"}}
+                                   {:publication options})))
+        (is (= before (commits r)))
+        (is (nil? (publication/recover @(conn r) (:identity options))))
+        (is (not (mfs/exists? (ws/room-fs r) "/wiki/not-committed.md"))))
+      (finally (d/close-room! r)))))
+
+(deftest repeated-effect-forwarding-publishes-only-once
+  (let [r (room)
+        journal (atom [])]
+    (try
+      (let [options (publication-options r journal)
+            before (commits r)
+            result (files/write! r {"wiki/once.md" {:text "one"}}
+                                 {:publication options
+                                  :boundary (constantly {:handlers [(fn [effect next]
+                                                                      (next effect)
+                                                                      (when (= :git/commit (:effect effect))
+                                                                        (next effect)))]})})]
+        (is (:applied? result))
+        (is (= 1 (count @journal)))
+        (is (= (inc before) (commits r)))
+        (is (= "one" (:text (files/read-file r "wiki/once.md" {}))))
+        (is (= (:commit result) (str (:publication/commit (:publication result))))))
+      (finally (d/close-room! r)))))
+
+(deftest postpublication-handler-failure-preserves-recovery-evidence
+  (let [r (room)
+        journal (atom [])]
+    (try
+      (let [options (publication-options r journal)
+            error (try (files/write! r {"wiki/committed.md" {:text "keep"}}
+                                     {:publication options
+                                      :boundary (constantly {:handlers [(fn [effect next]
+                                                                          (next effect)
+                                                                          (when (= :git/commit (:effect effect))
+                                                                            (throw (ex-info "handler failed" {}))))]})})
+                       nil
+                       (catch Exception error error))]
+        (is (publication/uncertain? error))
+        (is (= "keep" (:text (files/read-file r "wiki/committed.md" {}))))
+        (is (some? (publication/recover @(conn r) (:identity options)))))
+      (finally (d/close-room! r)))))
+
+(deftest unrelated-files-staged-during-preparation-do-not-enter-the-publication
+  (let [r (room)
+        journal (atom [])]
+    (try
+      (let [options (publication-options r journal)
+            prepare publication/prepare
+            before (commits r)]
+        (with-redefs [publication/prepare
+                      (fn [conn options paths]
+                        (repo/write! conn "unrelated.md" (.getBytes "someone else's work" "UTF-8"))
+                        (repo/stage! conn ["unrelated.md"])
+                        (prepare conn options paths))]
+          (is (thrown? Exception
+                       (files/write! r {"wiki/ours.md" {:text "refuse"}} {:publication options}))))
+        (is (= before (commits r)))
+        (is (empty? @journal))
+        (is (nil? (publication/recover @(conn r) (:identity options))))
+        (is (= "someone else's work" (:text (files/read-file r "unrelated.md" {}))))
+        (is (contains? (repo/index-tree (conn r)) "unrelated.md")))
+      (finally (d/close-room! r)))))
+
+(deftest publication-authorization-must-return-literal-true
+  (let [r (room)
+        journal (atom [])]
+    (try
+      (doseq [answer [false nil (ex-info "denied as a value" {}) (async/promise-chan)]]
+        (let [options (assoc (publication-options r journal) :authorize! (constantly answer))]
+          (is (thrown? Exception
+                       (files/write! r {"wiki/denied.md" {:text "no"}} {:publication options})))
+          (is (not (mfs/exists? (ws/room-fs r) "/wiki/denied.md")))))
+      (is (empty? @journal))
+      (finally (d/close-room! r)))))
+
+(deftest deletion-cleanup-and-receipt-are-one-transaction
+  (let [r (room)
+        journal (atom [])]
+    (try
+      (files/write! r {"a/b/remove.md" {:text "gone"} "a/keep.md" {:text "keep"}} {})
+      (let [options (publication-options r journal)
+            result (files/write! r {"a/b/remove.md" nil} {:publication options})]
+        (is (:publication result))
+        (is (not (mfs/exists? (ws/room-fs r) "/a/b")))
+        (is (mfs/exists? (ws/room-fs r) "/a"))
+        (is (= "keep" (:text (files/read-file r "a/keep.md" {}))))
+        ;; Recovery must short circuit before ANY cleanup after later edits.
+        (files/write! r {"a/b/later.md" {:text "later"}} {})
+        (let [again (with-redefs [file-tx/remove-empty-dirs-tx
+                                  (fn [& _] (throw (ex-info "must not run on recovery" {})))]
+                      (files/write! r {"a/b/remove.md" nil} {:publication options}))]
+          (is (:recovered? again))
+          (is (= (:commit result) (:commit again)))
+          (is (= "later" (:text (files/read-file r "a/b/later.md" {}))))))
+      (finally (d/close-room! r)))))
+
+(deftest interrupted-deletion-does-not-start-a-second-postpublication-write
+  (let [r (room)
+        journal (atom [])]
+    (try
+      (files/write! r {"delete/only.md" {:text "gone"}} {})
+      (let [publishing? (atom false)
+            options (assoc (publication-options r journal)
+                           :before-dispatch! (fn [receipt]
+                                               (swap! journal conj receipt)
+                                               (reset! publishing? true)))
+            original-async dh/transact!
+            original-sync dh/transact
+            submissions (atom 0)
+            dispatched (promise)
+            acknowledgement (async/promise-chan)
+            completed (promise)
+            thread (Thread. (fn []
+                              (deliver completed
+                                       (try {:result (files/write! r {"delete/only.md" nil} {:publication options})
+                                             :interrupted? (.isInterrupted (Thread/currentThread))}
+                                            (catch Throwable error {:error error})))))]
+        (with-redefs [dh/transact!
+                      (fn [& args]
+                        (if @publishing?
+                          (do (swap! submissions inc)
+                              ;; The native write really finishes. Only its
+                              ;; acknowledgement is held for the interruption.
+                              (deliver dispatched @(apply original-async args))
+                              acknowledgement)
+                          (apply original-async args)))
+                      dh/transact
+                      (fn [& args]
+                        (when @publishing?
+                          (throw (ex-info "Unexpected postpublication write" {})))
+                        (apply original-sync args))]
+          (.start thread)
+          (let [report (deref dispatched 10000 ::timeout)]
+            (is (map? report))
+            (.interrupt thread)
+            (is (not (realized? completed)))
+            (async/>!! acknowledgement report))
+          (let [answer (deref completed 10000 ::timeout)]
+            (is (map? answer))
+            (is (nil? (:error answer)))
+            (is (:interrupted? answer))
+            (is (get-in answer [:result :publication])))
+          (.join thread 10000)
+          (is (not (.isAlive thread)))
+          (is (= 1 @submissions)))
+        (is (not (mfs/exists? (ws/room-fs r) "/delete"))))
+      (finally (d/close-room! r)))))
 
 (deftest opened-worktree-preconditions-are-checked-inside-the-batch-snapshot
   (let [r (room)]

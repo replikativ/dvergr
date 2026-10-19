@@ -14,6 +14,7 @@
             [dvergr.discourse :as d]
             [dvergr.substrate.geschichte :as git]
             [dvergr.system.rooms :as srooms]
+            [dvergr.rooms.publication :as publication]
             [geschichte.repo :as repo]
             [clojure.string :as str]
             [hasch.core :as hasch]
@@ -300,7 +301,7 @@
    BEFORE publication, so obtaining a receipt requires no postcommit read.
    Optional :expected-modes is checked against that same staged index."
   ([room expected message] (commit-paths! room expected message {}))
-  ([room expected message {:keys [receipt? expected-modes]}]
+  ([room expected message {:keys [receipt? expected-modes publication]}]
    (binding [ec/*execution-context* (:ctx room)]
      (let [{:keys [conn]} (or (git/current-workspace)
                               (throw (ex-info "Room has no workspace"
@@ -330,10 +331,40 @@
              (when (seq differs)
                (throw (ex-info (str "Changed while it was written: " (str/join ", " differs))
                                {:type ::concurrent-change :room (:id room) :paths (vec differs)})))
-             (let [commit (when (seq staged)
-                            (some-> (repo/commit! conn {:message message :author (configured-author conn)})
-                                    :geschichte.commit/id str))]
-               (if receipt? {:commit commit :tree index} commit)))))))))
+             (let [options {:message message :author (configured-author conn)}
+                   published
+                   (when publication
+                     (let [{:keys [identity authorize! before-dispatch!]} publication
+                           plan (publication/prepare conn options (mapv #(str "/" %) paths))
+                           _ (when-not (= index (:index plan))
+                               (throw (ex-info "Staged files changed during publication preparation"
+                                               {:type ::concurrent-change :room (:id room)})))
+                           candidate (publication/receipt
+                                      plan
+                                      (select-keys identity [:publication/id :publication/intent
+                                                             :publication/actor :publication/proposal
+                                                             :publication/manifest :publication/attempt])
+                                      (into {} (map (fn [p] [(str "/" p) (get index p)])) paths))]
+                       (when-not (= identity (select-keys candidate (keys identity)))
+                         (throw (ex-info "Publication target changed before dispatch"
+                                         {:type ::publication-target-changed})))
+                       ;; Host policy is current at the final boundary. Journal
+                       ;; applying durably BEFORE the native operation can start.
+                       (publication/authorize! publication)
+                       (when-let [reason (srooms/room-effect-write-refusal
+                                          room {:effect :room/write
+                                                :resource {:system-id (srooms/connection-system-id conn)}})]
+                         (throw (ex-info "Room policy changed before publication"
+                                         {:type ::publication-policy-changed :reason reason})))
+                       (before-dispatch! candidate)
+                       (publication/publish! conn plan candidate)))
+                   commit (if publication
+                            (some-> (:publication/commit published) str)
+                            (when (seq staged)
+                              (some-> (repo/commit! conn options) :geschichte.commit/id str)))]
+               (if receipt?
+                 (cond-> {:commit commit :tree index} published (assoc :publication published))
+                 commit)))))))))
 
 (defn- refuse-dirty-parent! [parent]
   (when-let [dirty (workspace-changes parent)]

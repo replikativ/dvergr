@@ -18,6 +18,8 @@
             [dvergr.effects :as effects]
             [dvergr.system.rooms :as srooms]
             [dvergr.rooms.forks :as forks]
+            [dvergr.rooms.publication :as publication]
+            [dvergr.rooms.file-tx :as file-tx]
             [dvergr.sandbox.ns.io :as sio]
             [dvergr.substrate.geschichte :as gs]
             [dvergr.tools :as tools]
@@ -51,7 +53,7 @@
 (def max-batch-files "How many paths one `room_write` names." 200)
 (def write-capabilities
   "Host embedding contracts supported by the canonical batch writer."
-  #{:expected-worktree :applied-receipt :file-modes})
+  #{:expected-worktree :applied-receipt :file-modes :durable-publication})
 
 ;; ---------------------------------------------------------------------------
 ;; Paths and the workspace
@@ -250,9 +252,6 @@
 
 (defn- size-of [c] (if (bytes? c) (alength ^bytes c) 0))
 
-(defn- ancestors-of [abs]
-  (->> (str/split abs #"/") (remove str/blank?) butlast (reductions #(str %1 "/" %2) "") rest))
-
 (defn- plan
   "The validated batch: `[[absolute-path bytes-or-::remove] …]`, sorted."
   [files]
@@ -267,7 +266,7 @@
     (let [written (set (keep (fn [[p c]] (when (not= ::remove c) p)) entries))]
       (doseq [[p c] entries
               :when (not= ::remove c)
-              :let [parent (some written (ancestors-of p))]
+              :let [parent (some written (file-tx/ancestors-of p))]
               :when parent]
         (refuse (str p ": the batch also writes " parent " as a file") {:path p})))
     (doseq [[p c] entries :when (< max-file-bytes (size-of c))]
@@ -287,7 +286,7 @@
       :dir (refuse (str p " is a directory; name its files") {:path p})
       (refuse (str p " is a symbolic link; room_write does not write through or remove links") {:path p}))
     (when-let [[blocked bt] (some #(let [t (:type (mfs/stat fs %))] (when (and t (not= :dir t)) [% t]))
-                                  (ancestors-of p))]
+                                  (file-tx/ancestors-of p))]
       (refuse (str p ": " blocked " is " (if (= :file bt) "a file" "a symbolic link")) {:path p}))))
 
 (defn- restore-tx
@@ -315,24 +314,6 @@
                        (when eid [[:db/retractEntity eid]])))))
                paths)))
 
-(defn- remove-empty-dirs-tx
-  "Transaction function: retract the explicit directories `dirs` (absolute)
-   that nothing lies beneath, deepest first, in the transactor. A file that
-   took a directory's place is not a directory entry, so it is left alone."
-  [db dirs]
-  (let [files (map first (d/q '[:find ?p :where [_ :geschichte.work/path ?p]] db))
-        explicit (into {} (d/q '[:find ?p ?e :where [?e :geschichte.work-dir/path ?p]] db))]
-    (loop [[dir & more] (sort-by count > (map rel dirs)) gone #{} tx []]
-      (if-not dir
-        tx
-        (let [prefix (str dir "/")
-              eid (get explicit dir)
-              beneath (some #(str/starts-with? % prefix)
-                            (concat files (remove gone (keys explicit))))]
-          (if (and eid (not beneath))
-            (recur more (conj gone dir) (conj tx [:db/retractEntity eid]))
-            (recur more gone tx)))))))
-
 (defn- restore!
   "Undo this batch's changes: the index of its paths back to HEAD (where it
    was: nothing was staged), the files it wrote or removed back to `before`
@@ -344,7 +325,7 @@
        (catch Throwable _ nil))
   (try (when (seq touched) (d/transact conn [[:db.fn/call restore-tx before expected (vec touched)]]))
        (catch Throwable _ nil))
-  (try (when (seq created) (d/transact conn [[:db.fn/call remove-empty-dirs-tx (vec created)]]))
+  (try (when (seq created) (d/transact conn [[:db.fn/call file-tx/remove-empty-dirs-tx (vec created)]]))
        (catch Throwable _ nil))
   (let [now (content-ids conn)]
     (vec (sort (remove #(= (get now %) (some-> (get before %) :content str)) touched)))))
@@ -372,6 +353,20 @@
         (refuse "expected-worktree must describe exactly the batch's absolute paths" {}))
       expected)))
 
+(defn- publication-result
+  [receipt message]
+  {:commit (some-> (:publication/commit receipt) str)
+   :applied? true :recovered? true :publication receipt :message message
+   :written (mapv (fn [entry]
+                    (let [content (get-in entry [:publication.entry/content :geschichte.content/id])]
+                      {:path (:publication.entry/path entry)
+                       :size (:publication.entry/size entry) :content-id (str content)
+                       :entry {:content content :size (:publication.entry/size entry)
+                               :mode (:publication.entry/mode entry)}}))
+                  (filter #(= :present (:publication.entry/state %)) (:publication/entries receipt)))
+   :removed (mapv :publication.entry/path
+                  (filter #(= :deleted (:publication.entry/state %)) (:publication/entries receipt)))})
+
 (defn write!
   "Write `files` (`{path content}`; content `{:text …}`, `{:base64 …}`, or nil
    to remove the file) into `room`'s workspace and commit exactly those paths
@@ -389,12 +384,18 @@
    is not proof of publication. Written entries are immutable staged metadata.
    Optional `:file-modes` maps absolute written paths to 33188 or 33261.
 
+   Host-only `:publication` supplies a complete scoped receipt `:identity`, a
+   current `:authorize!` callback and a durable `:before-dispatch!` journal hook.
+   Repeated operations recover their recorded result before modifying files.
+   Post-dispatch uncertainty NEVER restores files or authorizes an automatic
+   retry; keep the journal until scoped recovery establishes the result.
+
    Optional `:expected-worktree` maps EVERY absolute batch path to the
    worktree entry the caller opened (`{:content uuid :size n :mode n}`), or
    nil for absent. Compared with the SAME snapshot used by compare-and-write,
    before any effect/write. A stale opened version refuses the whole batch;
    omission retains the ordinary unconditional client-write behavior."
-  [room files {:keys [message boundary file-modes] :as opts}]
+  [room files {:keys [message boundary file-modes publication] :as opts}]
   (let [entries (plan files)
         {:keys [conn] :as ws} (workspace! room)
         system-id (binding [ec/*execution-context* (:ctx room)]
@@ -417,69 +418,104 @@
         message (or (not-empty (some-> message str str/trim))
                     (str "Write " (if (= 1 (count paths)) (rel (first paths)) (str (count paths) " files"))))
         expected (into {} (for [[p c] entries] [p (when (bytes? c) (str (blob/blob-id c)))]))]
-    ;; one batch at a time per repository, and no git operation of dvergr's
-    ;; in between (`gs/workspace-lock`)
+    (when (and publication
+               (not (and (map? publication) (map? (:identity publication))
+                         (fn? (:authorize! publication)) (fn? (:before-dispatch! publication)))))
+      (refuse "Durable publication requires host identity, authorization and journaling hooks" {}))
+    ;; This monitor serializes participating Dvergr operations, not arbitrary
+    ;; filesystem or external repository writers. Writer-side basis checks are
+    ;; the atomic publication guard against those other writers.
     (locking (gs/workspace-lock conn)
-      (check-shape! fs entries)
+      (when publication
+        (publication/authorize! publication)
+        (publication/install! conn))
+      (if-let [recovered (when publication (publication/recover @conn (:identity publication)))]
+        (publication-result recovered message)
+        (do
+          (check-shape! fs entries)
       ;; the undo restores the index to HEAD: so it must be at HEAD
-      (let [staged (:staged (repo/status conn))]
-        (when (seq staged)
-          (throw (ex-info (str "The workspace has staged changes (" (str/join ", " (take 5 staged))
-                               "); commit them before a room_write")
-                          {:type ::staged-changes :staged (vec staged)}))))
-      (let [worktree (repo/worktree conn)
-            before (into {} (keep (fn [p] (when-let [e (get worktree (rel p))] [p e]))) paths)
-            _ (when (and opened
-                         (not= opened (into {} (map (fn [p] [p (get before p)])) paths)))
-                (throw (ex-info "Files changed since they were opened; reload before saving"
-                                {:type ::stale-worktree :paths paths})))
-            created (into #{} (comp (mapcat (fn [[p c]] (when (not= ::remove c) (ancestors-of p))))
-                                    (remove #(mfs/exists? fs %)))
-                          entries)
-            touched (atom [])
-            removed (atom [])
-            applied (volatile! nil)
-            ;; Handlers may forward more than once. The physical transaction,
-            ;; including failure/rollback, belongs to this batch only once.
-            execute (delay
-                      (try
-                        (doseq [[p c] entries
+          (let [staged (:staged (repo/status conn))]
+            (when (seq staged)
+              (throw (ex-info (str "The workspace has staged changes (" (str/join ", " (take 5 staged))
+                                   "); commit them before a room_write")
+                              {:type ::staged-changes :staged (vec staged)}))))
+          (let [worktree (repo/worktree conn)
+                before (into {} (keep (fn [p] (when-let [e (get worktree (rel p))] [p e]))) paths)
+                _ (when (and opened
+                             (not= opened (into {} (map (fn [p] [p (get before p)])) paths)))
+                    (throw (ex-info "Files changed since they were opened; reload before saving"
+                                    {:type ::stale-worktree :paths paths})))
+                created (into #{} (comp (mapcat (fn [[p c]] (when (not= ::remove c) (file-tx/ancestors-of p))))
+                                        (remove #(mfs/exists? fs %)))
+                              entries)
+                touched (atom [])
+                removed (atom [])
+                applied (volatile! nil)
+                execution-error (volatile! nil)
+                ;; A handler may forward more than once. This one invocation
+                ;; owns exactly one physical batch, including its exception.
+                execute (delay
+                          (try
+                            (doseq [[p c] entries
                                 ;; compare-and-write: what the snapshot saw, or fail
-                                :let [opts (cond-> {:expect (some-> (get before p) :content str)}
-                                             (contains? file-modes p) (assoc :mode (get file-modes p)))]]
-                          (if (= ::remove c)
-                            (when (tools/workspace-delete! ctx p opts)
-                              (swap! touched conj p)
-                              (swap! removed conj p))
-                            (do (tools/workspace-write! ctx p c opts)
-                                (swap! touched conj p))))
-                        (let [{:keys [commit tree]} (forks/commit-paths! room expected message
-                                                                         {:receipt? true :expected-modes file-modes})
-                              entries (into {} (map (fn [p] [p (get tree (rel p))])) paths)]
+                                    :let [opts (cond-> {:expect (some-> (get before p) :content str)}
+                                                 (contains? file-modes p) (assoc :mode (get file-modes p)))]]
+                              (if (= ::remove c)
+                                (when (tools/workspace-delete! ctx p opts)
+                                  (swap! touched conj p)
+                                  (swap! removed conj p))
+                                (do (tools/workspace-write! ctx p c opts)
+                                    (swap! touched conj p))))
+                            (let [{:keys [commit tree publication]} (forks/commit-paths! room expected message
+                                                                                         {:receipt? true :expected-modes file-modes
+                                                                                          :publication publication})
+                                  entries (into {} (map (fn [p] [p (get tree (rel p))])) paths)]
                           ;; Only the forwarded physical write path can produce
                           ;; this receipt. A handler may answer without forwarding.
-                          (vreset! applied {:commit commit :entries entries})
-                          commit)
-                        (catch Throwable e
-                          (let [conflicted (restore! conn before expected @touched created)]
-                            (throw (if (seq conflicted)
-                                     (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
-                                                   (str/join ", " conflicted))
-                                              (assoc (ex-data e) :conflicted conflicted) e)
-                                     e))))))
-            _answer (effects/perform!
-                     boundary {:effect :git/commit :resource {:message message :system-id system-id}}
-                     #(force execute))
-            ;; a directory a removal emptied goes too (git keeps none): a
-            ;; later write may put a file in its place
-            _ (when (seq @removed)
-                (d/transact conn [[:db.fn/call remove-empty-dirs-tx (vec (distinct (mapcat ancestors-of @removed)))]]))
-            receipt @applied]
-        {:commit (when receipt (:commit receipt))
-         :applied? (boolean receipt)
-         :message message
-         :written (vec (for [[p c] entries :when (and receipt (not= ::remove c))
-                             :let [entry (get-in receipt [:entries p])]]
-                         {:path p :size (:size entry) :content-id (some-> (:content entry) str)
-                          :entry entry}))
-         :removed @removed}))))
+                              (vreset! applied {:commit commit :entries entries :publication publication})
+                               ;; Durable publication already includes directory
+                               ;; cleanup in its one joined transaction. Never
+                               ;; enqueue another mutation after restoring an
+                               ;; interrupted publication caller's interrupt flag.
+                              (when (and (nil? publication) (seq @removed))
+                                (d/transact conn [[:db.fn/call file-tx/remove-empty-dirs-tx
+                                                   (vec (distinct (mapcat file-tx/ancestors-of @removed)))]]))
+                              commit)
+                            (catch Throwable e
+                              (vreset! execution-error e)
+                           ;; Native publication may have committed despite a lost
+                           ;; acknowledgement. Never undo it or infer failure
+                           ;; from an absent receipt; retain the host journal.
+                              (if (or @applied (publication/uncertain? e))
+                                (throw e)
+                                (let [conflicted (restore! conn before expected @touched created)]
+                                  (throw (if (seq conflicted)
+                                           (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
+                                                         (str/join ", " conflicted))
+                                                    (assoc (ex-data e) :conflicted conflicted) e)
+                                           e)))))))
+                _answer (try
+                          (effects/perform!
+                           boundary {:effect :git/commit :resource {:message message :system-id system-id}}
+                           #(force execute))
+                          (catch Throwable error
+                            (cond
+                              (publication/uncertain? @execution-error) (throw @execution-error)
+                              (and publication @applied)
+                              (throw (ex-info "Publication committed before completion failed"
+                                              {::publication/uncertain? true
+                                               :publication (:publication @applied)} error))
+                              :else (throw error))))
+                ;; An answering handler cannot turn an uncertain forwarded
+                ;; write into an ordinary skipped operation by swallowing it.
+                _ (when (publication/uncertain? @execution-error) (throw @execution-error))
+                receipt @applied]
+            (cond-> {:commit (when receipt (:commit receipt))
+                     :applied? (boolean receipt)
+                     :message message
+                     :written (vec (for [[p c] entries :when (and receipt (not= ::remove c))
+                                         :let [entry (get-in receipt [:entries p])]]
+                                     {:path p :size (:size entry) :content-id (some-> (:content entry) str)
+                                      :entry entry}))
+                     :removed @removed}
+              (:publication receipt) (assoc :publication (:publication receipt)))))))))

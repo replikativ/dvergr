@@ -219,6 +219,30 @@ later worktree read. A handler answering without forwarding does not certify a
 save. Existing executable modes survive edits; `:file-modes` permits explicit
 regular-file mode preservation when moving a file.
 
+Host proposal adopters may also supply `:publication`: a scoped `:identity`,
+a synchronous `:authorize!` callback returning literal `true`, and a synchronous
+`:before-dispatch!` callback that durably journals the candidate before dispatch.
+This is not exposed as an MCP argument or sandbox capability. Identity binds the
+operation/intent/actor/manifest UUIDs and repository, store UUID/backend, physical
+branch and Git ref; optional proposal and certified Attempt UUIDs bind attribution.
+The host must authorize recovery reads too. Receipts confer evidence, not authority.
+
+`dvergr.rooms.publication` stores typed receipt entries and the Geschichte commit/ref
+in one guarded transaction. Deletion-directory cleanup is part of that same native
+operation. Preparation is validated against the exact transaction basis, and the
+prepared index must equal the batch's validated index. Repeated effect forwarding
+within the invocation memoizes the physical result or error; it cannot execute a
+second batch. An interrupted host joins the one dispatched operation before its
+interrupt flag is restored.
+
+On an uncertain dispatched result, retain the application journal and recover the
+exact scoped receipt. Never restore files or automatically replay/replan because a
+receipt is absent. A duplicate receipt recovers the original winning commit before
+stale-editor checks or file mutations, preserving later edits. Post-forward handler
+errors retain recovery evidence; skipped forwarding produces no publication receipt.
+The workspace monitor serializes participating writers, not every filesystem writer;
+the writer-side basis guard is the atomic protection against intervening changes.
+
 ## Tools and an Attempt's inputs
 
 What a model is offered is part of what an experiment compares. An LLM Run records an
