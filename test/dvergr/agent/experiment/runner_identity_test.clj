@@ -8,9 +8,22 @@
   ;; a resume after a library upgrade folded Attempts of two versions into
   ;; one Scorecard (results-correctness review): their versions are in it now
   (let [v (runner/library-versions)]
-    (is (let [source (get v "org.replikativ/spindel")]
-          (or (string? source) (string? (:git/sha source)))) (pr-str v))
-    (is (string? (get v "org.replikativ/datahike")) (pr-str v))))
+    (doseq [lib ["org.replikativ/spindel" "org.replikativ/datahike"]]
+      (is (let [source (get v lib)]
+            (or (string? source) (string? (:git/sha source)))) (pr-str v)))))
+
+(deftest resolved-datahike-git-sha-not-cache-location-identifies-execution
+  (let [first-sha "1234567890123456789012345678901234567890"
+        next-sha "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        identity-at (fn [cache sha]
+                      (with-redefs [basis/current-basis
+                                    (constantly {:libs {'org.replikativ/datahike
+                                                        {:git/url "https://example.test/datahike.git"
+                                                         :git/sha sha
+                                                         :deps/root (str cache "/libs/org.replikativ/datahike/" sha)}}})]
+                        (runner/library-versions)))]
+    (is (= (identity-at "/ci/cache" first-sha) (identity-at "/dev/cache" first-sha)))
+    (is (not= (identity-at "/ci/cache" first-sha) (identity-at "/ci/cache" next-sha)))))
 
 (deftest resolved-source-wins-over-packaging-metadata
   (let [git {:git/url "https://example.test/spindel.git"
