@@ -357,7 +357,7 @@
 (defn- guarded-write!
   "Write `content` to the workspace file at `resolved` in one transaction
    with a check that it still holds `expected` (`expect-guard`)."
-  [ctx resolved content expected]
+  [ctx resolved content expected & [mode]]
   (let [conn (guarded-connection ctx)
         rel (subs resolved 1)
         bytes (if (bytes? content) content (.getBytes (str content) "UTF-8"))
@@ -369,7 +369,7 @@
         {:geschichte.work/path rel
          :geschichte.work/content [:geschichte.content/id id]
          :geschichte.work/size (long (alength ^bytes bytes))
-         :geschichte.work/mode (long (or (:mode old) 33188))}]))
+         :geschichte.work/mode (long (or mode (:mode old) 33188))}]))
     resolved))
 
 (defn- changed-underneath
@@ -405,6 +405,10 @@
    throws `::changed-underneath`. Without it, no check."
   ([ctx path content] (workspace-write! ctx path content {}))
   ([ctx path content opts]
+   (when (and (contains? opts :mode)
+              (not (and (contains? opts :expect) (#{33188 33261} (:mode opts)))))
+     (throw (ex-info "A file mode requires a guarded write and a regular-file mode"
+                     {:type ::invalid-mode})))
    (let [content (if (bytes? content) content (str content))
          n (if (bytes? content) (alength ^bytes content) (alength (.getBytes ^String content "UTF-8")))]
      (effects/perform! (effect-boundary ctx)
@@ -422,7 +426,7 @@
                              (let [resolved (tool-path ctx path)]
                                ;; the directories first, as a plain write makes them
                                (make-parents! (:filesystem ctx) resolved)
-                               (guarded-write! ctx resolved content (:expect opts)))))
+                               (guarded-write! ctx resolved content (:expect opts) (:mode opts)))))
                          #(write-file! ctx path content))))))
 
 (defn workspace-delete!

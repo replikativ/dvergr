@@ -209,6 +209,16 @@ JSON API ops `room_files`, `room_read` and `room_write` (`dvergr.rooms.files`, s
 world's read-only mode, quota and receipts decide them as they decide an agent's
 `write_file` ([effects.md](effects.md)).
 
+Host editors can pass `files/write!` an `:expected-worktree` map covering every
+absolute batch path with its opened `{:content uuid :size n :mode n}` entry,
+or nil for an absent file. The canonical batch checks it against its own before
+snapshot, before effects or writes; a stale editor cannot adopt a newer edit as
+its base. This host option is not an additional MCP argument. Its response has
+`:applied?` and immutable `:written` entry receipts from the staged index, not a
+later worktree read. A handler answering without forwarding does not certify a
+save. Existing executable modes survive edits; `:file-modes` permits explicit
+regular-file mode preservation when moving a file.
+
 ## Tools and an Attempt's inputs
 
 What a model is offered is part of what an experiment compares. An LLM Run records an

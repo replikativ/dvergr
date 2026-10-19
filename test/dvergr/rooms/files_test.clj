@@ -29,6 +29,79 @@
 (defn- b64 [^bytes b] (.encodeToString (Base64/getEncoder) b))
 (defn- unb64 [^String s] (.decode (Base64/getDecoder) s))
 
+(deftest opened-worktree-preconditions-are-checked-inside-the-batch-snapshot
+  (let [r (room)]
+    (try
+      (files/write! r {"a.md" {:text "opened"}} {})
+      (let [opened {"/a.md" (get (repo/worktree (conn r)) "a.md")
+                    "/new.md" nil}
+            read-worktree repo/worktree
+            raced? (atom false)
+            commit-count (commits r)]
+        ;; Inject an external writer immediately before the canonical batch
+        ;; captures its before snapshot. A caller-side lock/check alone would
+        ;; miss this edit and let the batch adopt it as its expected base.
+        (with-redefs [repo/worktree (fn [c]
+                                      (when (compare-and-set! raced? false true)
+                                        (repo/write! c "a.md" (.getBytes "agent edit" "UTF-8")))
+                                      (read-worktree c))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"changed since"
+                                (files/write! r {"a.md" {:text "stale human"}
+                                                 "new.md" {:text "must not appear"}}
+                                              {:expected-worktree opened}))))
+        (is @raced?)
+        (is (= commit-count (commits r)))
+        (is (= "agent edit" (:text (files/read-file r "a.md" {}))))
+        (is (not (mfs/exists? (ws/room-fs r) "/new.md")))
+        (let [now {"/a.md" (get (repo/worktree (conn r)) "a.md")}]
+          (is (string? (:commit (files/write! r {"a.md" {:text "fresh human"}}
+                                              {:expected-worktree now}))))))
+      (finally (d/close-room! r)))))
+
+(deftest a-forwarding-handler-cannot-replace-the-publication-receipt
+  (let [r (room)]
+    (try
+      (let [boundary (constantly {:handlers [(fn [effect next] (next effect) :transformed-answer)]})
+            result (files/write! r {"source.clj" {:text "(def x 1)"}} {:boundary boundary})]
+        (is (:applied? result))
+        (is (string? (:commit result)))
+        (is (= (:commit result) (str (:geschichte.commit/id (repo/head-commit (conn r))))))
+        (is (= (get (repo/tree (conn r) :head) "source.clj") (get-in result [:written 0 :entry]))))
+      (finally (d/close-room! r)))))
+
+(deftest expected-absence-and-all-path-coverage-are-not-optional-when-supplied
+  (let [r (room)]
+    (try
+      (is (string? (:commit (files/write! r {"new.md" {:text "first"}}
+                                          {:expected-worktree {"/new.md" nil}}))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (files/write! r {"new.md" {:text "clobber"}} {:expected-worktree {"/new.md" nil}})))
+      (doseq [expected [nil {} {"new.md" nil} {"/new.md" nil "/extra.md" nil}
+                        {"/new.md" {:content "not-a-uuid" :size 0 :mode 33188}}]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (files/write! r {"new.md" {:text "invalid"}} {:expected-worktree expected}))))
+      (is (= "first" (:text (files/read-file r "new.md" {}))))
+      (finally (d/close-room! r)))))
+
+(deftest applied-receipts-preserve-modes-and-do-not-certify-intercepted-writes
+  (let [r (room)]
+    (try
+      (let [result (files/write! r {"script.sh" {:text "echo one\n"}}
+                                 {:file-modes {"/script.sh" 33261}})
+            opened (:entry (first (:written result)))]
+        (is (:applied? result))
+        (is (= 33261 (:mode opened)))
+        (let [saved (files/write! r {"script.sh" {:text "echo two\n"}}
+                                  {:expected-worktree {"/script.sh" opened}})]
+          (is (= 33261 (get-in saved [:written 0 :entry :mode])))
+          (is (= (get-in saved [:written 0 :entry]) (get (repo/tree (conn r) :head) "script.sh")))))
+      (let [boundary (constantly {:handlers [(fn [_effect _next] nil)]})
+            skipped (files/write! r {"skipped.md" {:text "not applied"}} {:boundary boundary})]
+        (is (false? (:applied? skipped)))
+        (is (empty? (:written skipped)))
+        (is (not (mfs/exists? (ws/room-fs r) "/skipped.md"))))
+      (finally (d/close-room! r)))))
+
 (def ^:private xlsx-ish
   "Bytes that are not UTF-8 text: a zip header and invalid sequences."
   (byte-array (map unchecked-byte [0x50 0x4b 0x03 0x04 0x00 0xff 0xfe 0x80 0x81 0x00 0x10])))
@@ -174,6 +247,25 @@
                           (files/write! r {"a.txt" {:text "a"}} {:boundary boundary})))
     (is (nil? (worktree-text r "/a.txt")))
     (is (= before (commits r)))))
+
+(deftest repeated-forwarding-executes-one-physical-batch
+  (let [r (room)]
+    (try
+      (files/write! r {"a.txt" {:text "before"}} {})
+      (let [before (commits r) forwarded (atom [])
+            boundary (constantly {:handlers [(fn [effect next]
+                                               (if (= :git/commit (:effect effect))
+                                                 (let [a (next effect) b (next effect)]
+                                                   (swap! forwarded conj a b) b)
+                                                 (next effect)))]})
+            result (files/write! r {"a.txt" {:text "after"}} {:boundary boundary})]
+        (is (:applied? result))
+        (is (= 2 (count @forwarded)))
+        (is (= (first @forwarded) (second @forwarded)))
+        (is (= (inc before) (commits r)))
+        (is (= "after" (worktree-text r "/a.txt")))
+        (is (empty? (forks/workspace-changes r))))
+      (finally (d/close-room! r)))))
 
 (deftest a-failure-after-staging-undoes-index-and-files
   (let [r (room)]

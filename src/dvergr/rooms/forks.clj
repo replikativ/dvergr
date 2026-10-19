@@ -295,37 +295,45 @@
    pathspec parsing). The index must hold nothing else staged, and once the
    paths are staged they must hold the expected content: otherwise nothing is
    committed (a concurrent writer changed them) and it throws. Returns the
-   commit id, or nil when the paths already match HEAD."
-  [room expected message]
-  (binding [ec/*execution-context* (:ctx room)]
-    (let [{:keys [conn]} (or (git/current-workspace)
-                             (throw (ex-info "Room has no workspace"
-                                             {:type ::no-workspace :room (:id room)})))
-          rel #(str/replace (str %) #"^/+" "")
-          expected (update-keys expected rel)
-          paths (vec (sort (keys expected)))]
-      (locking (git/workspace-lock conn)
-        (let [staged (:staged (repo/status conn))]
-          (when (seq (remove (set paths) staged))
-            (throw (ex-info (str "The workspace of " (name (:id room)) " has staged changes ("
-                                 (str/join ", " (take 5 staged)) "); commit them first")
-                            {:type ::staged-changes :room (:id room) :staged staged}))))
-        (when (seq paths)
-          (repo/stage! conn paths)
-          (let [index (repo/index-tree conn)
-                staged (:staged (repo/status conn))
+   commit id, or nil when the paths already match HEAD. With `:receipt? true`,
+   returns {:commit id-or-nil :tree validated-index}; the tree is captured
+   BEFORE publication, so obtaining a receipt requires no postcommit read.
+   Optional :expected-modes is checked against that same staged index."
+  ([room expected message] (commit-paths! room expected message {}))
+  ([room expected message {:keys [receipt? expected-modes]}]
+   (binding [ec/*execution-context* (:ctx room)]
+     (let [{:keys [conn]} (or (git/current-workspace)
+                              (throw (ex-info "Room has no workspace"
+                                              {:type ::no-workspace :room (:id room)})))
+           rel #(str/replace (str %) #"^/+" "")
+           expected (update-keys expected rel)
+           paths (vec (sort (keys expected)))]
+       (locking (git/workspace-lock conn)
+         (let [staged (:staged (repo/status conn))]
+           (when (seq (remove (set paths) staged))
+             (throw (ex-info (str "The workspace of " (name (:id room)) " has staged changes ("
+                                  (str/join ", " (take 5 staged)) "); commit them first")
+                             {:type ::staged-changes :room (:id room) :staged staged}))))
+         (when (seq paths)
+           (repo/stage! conn paths)
+           (let [index (repo/index-tree conn)
+                 staged (:staged (repo/status conn))
                 ;; the content, and a regular file: a link to the same text has the same id
-                link? #(= 0120000 (bit-and (long (or (:mode (get index %)) 0)) 0170000))
-                differs (concat (filter #(or (not= (get expected %) (some-> (get index %) :content str))
-                                             (link? %))
-                                        paths)
-                                (remove (set paths) staged))]
-            (when (seq differs)
-              (throw (ex-info (str "Changed while it was written: " (str/join ", " differs))
-                              {:type ::concurrent-change :room (:id room) :paths (vec differs)})))
-            (when (seq staged)
-              (some-> (repo/commit! conn {:message message :author (configured-author conn)})
-                      :geschichte.commit/id str))))))))
+                 link? #(= 0120000 (bit-and (long (or (:mode (get index %)) 0)) 0170000))
+                 differs (concat (filter #(or (not= (get expected %) (some-> (get index %) :content str))
+                                              (link? %)
+                                              (and (contains? expected-modes (str "/" %))
+                                                   (not= (get expected-modes (str "/" %))
+                                                         (:mode (get index %)))))
+                                         paths)
+                                 (remove (set paths) staged))]
+             (when (seq differs)
+               (throw (ex-info (str "Changed while it was written: " (str/join ", " differs))
+                               {:type ::concurrent-change :room (:id room) :paths (vec differs)})))
+             (let [commit (when (seq staged)
+                            (some-> (repo/commit! conn {:message message :author (configured-author conn)})
+                                    :geschichte.commit/id str))]
+               (if receipt? {:commit commit :tree index} commit)))))))))
 
 (defn- refuse-dirty-parent! [parent]
   (when-let [dirty (workspace-changes parent)]
