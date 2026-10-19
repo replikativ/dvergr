@@ -9,6 +9,7 @@
             [dvergr.chat.tool-schema :as tool-schema]
             [dvergr.model.api.codex-auth :as codex-auth]
             [dvergr.model.provider :as p]
+            [dvergr.model.image-content :as image-content]
             [dvergr.model.quirks :as quirks]
             [jsonista.core :as json]
             [taoensso.telemere :as tel])
@@ -383,8 +384,12 @@
 (defn- response-message [role content]
   {:type "message"
    :role role
-   :content [{:type (if (= "assistant" role) "output_text" "input_text")
-              :text (or content "")}]})
+   :content (if (vector? content)
+              (do (when-not (= "user" role)
+                    (throw (ex-info "Inline images require a user message" {:type ::invalid-image-role})))
+                  (image-content/responses content))
+              [{:type (if (= "assistant" role) "output_text" "input_text")
+                :text (or content "")}])})
 
 (defn- formatted-input [messages]
   (mapv (fn [message]

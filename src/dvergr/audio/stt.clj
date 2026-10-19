@@ -43,6 +43,11 @@
             (transcribe-fn model (.getAbsolutePath tmp)))
           (finally (.delete tmp)))))))
 
+(def ^:dynamic *python-executable*
+  "Trusted host override for local Whisper's interpreter. Otherwise uses
+   DVERGR_WHISPER_PYTHON, then python3 on PATH. Not a sandbox capability."
+  nil)
+
 (defn- transcribe-local [^bytes bytes ext]
   (let [script (or (System/getenv "DVERGR_WHISPER_SCRIPT") "scripts/transcribe.py")
         tmp (java.io.File/createTempFile "voice" (str "." ext))]
@@ -50,7 +55,7 @@
       (java.nio.file.Files/write (.toPath tmp) bytes
                                  (make-array java.nio.file.OpenOption 0))
       (let [{:keys [exit out err]} (clojure.java.shell/sh
-                                    "python3" script
+                                    (or *python-executable* (not-empty (System/getenv "DVERGR_WHISPER_PYTHON")) "python3") script
                                     (.getAbsolutePath tmp)
                                     (or (System/getenv "DVERGR_WHISPER_MODEL")
                                         "base"))]
