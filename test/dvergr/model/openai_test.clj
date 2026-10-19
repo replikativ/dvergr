@@ -34,15 +34,23 @@
   (fn [f]
     (let [before-providers @providers/providers
           before-models @registry/registry
-          before-aliases @registry/aliases]
+          before-aliases @registry/aliases
+          before-defaults @registry/defaults
+          loaded? @#'registry/models-loaded?
+          before-loaded? @loaded?]
       (try
         (reset! providers/providers {})
         (registry/reset-to-defaults!)
+        ;; Lazy loading during this fixture must not leave a true loaded flag
+        ;; paired with the pre-fixture (possibly still cold) restored registry.
+        (reset! loaded? false)
         (f)
         (finally
           (reset! providers/providers before-providers)
           (reset! registry/registry before-models)
-          (reset! registry/aliases before-aliases))))))
+          (reset! registry/aliases before-aliases)
+          (reset! registry/defaults before-defaults)
+          (reset! loaded? before-loaded?))))))
 
 (defn- native-provider []
   (openai/create {:api-key "test-openai-key"} {}))
