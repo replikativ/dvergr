@@ -370,7 +370,8 @@
             msgs-id   (sdb/register-system! {:type :msgs :name (str slug "-msgs")
                                              :scope msgs-path :owner-id owner-id})
             room-id   (sdb/create-room! (merge {:slug slug :name name :owner-id owner-id
-                                                :db-scope (str (random-uuid))} reg))
+                                                :db-scope (str (random-uuid))
+                                                :default-repository-id repo-id} reg))
           ;; The room's OWN ctx — a fork of the daemon root. Register its systems
           ;; INTO it so its composite holds only them (scoped forks).
             room-ctx  (fork-room-ctx)]
@@ -492,6 +493,59 @@
   "Ordered repos attached to a room (own/`:owner` first), each `{:slug :path :permission}`."
   [room-id]
   (resolve-type room-id :repo))
+
+(defn default-workspace
+  "Host-only canonical default workspace, never current-system's attachment
+   fallback. Requires an explicit owned registry link and exactly one matching
+   Geschichte runtime in the room's OWN context. Returns live handles; retain
+   only registry-system/runtime-system and exact DB target metadata as evidence.
+   Currently supports the provisioner's file-backed default repositories."
+  [room-id]
+  (when-not (uuid? room-id)
+    (throw (ex-info "Exact room UUID required" {:type ::invalid-room})))
+  (let [registry-db @(sdb/get-conn)
+        registered (sdb/default-repository registry-db room-id)
+        ctx (room-ctx-for room-id)]
+    (when-not registered
+      (throw (ex-info "Room default repository is not configured or no longer owned"
+                      {:type ::default-repository-unconfigured :room/id room-id})))
+    (when-not ctx
+      (throw (ex-info "Room default workspace is not hydrated"
+                      {:type ::default-workspace-unavailable :room/id room-id})))
+    ;; Raw locators are not physical identities: dot segments and symlinks may
+    ;; give two registry entries the same directory. Use the SAME registry
+    ;; snapshot as the ownership check, and refuse ambiguous physical owners.
+    (let [canonical (.getCanonicalPath (io/file (:system/scope registered) "datahike"))
+          owners (filterv
+                  (fn [{:system/keys [type scope]}]
+                    (and (= :repo type) (string? scope)
+                         (= canonical (.getCanonicalPath (io/file scope "datahike")))))
+                  (sdb/all-systems registry-db))]
+      (when-not (and (= 1 (count owners))
+                     (= (:system/id registered) (:system/id (first owners))))
+        (throw (ex-info "Default repository physical ownership is ambiguous"
+                        {:type ::default-workspace-mismatch :room/id room-id}))))
+    (binding [ec/*execution-context* ctx]
+      (let [expected (repo-system-name (:system/scope registered))
+            matches (filterv #(= expected (str (ygg-protocols/system-id %)))
+                             (vals (ygg/registered-systems)))]
+        (when-not (and (= 1 (count matches))
+                       (= :geschichte (ygg-protocols/system-type (first matches))))
+          (throw (ex-info "Default repository runtime identity is missing or ambiguous"
+                          {:type ::default-workspace-unavailable :room/id room-id})))
+        (let [system (first matches) conn (geschichte/gy-connection system)
+              config (when conn (:config @conn))
+              path (get-in config [:store :path])
+              expected-path (.getCanonicalPath (io/file (:system/scope registered) "datahike"))]
+          (when-not (and (= :file (get-in config [:store :backend]))
+                         (uuid? (get-in config [:store :id]))
+                         (keyword? (:branch config)) (string? path)
+                         (= expected-path (.getCanonicalPath (io/file path))))
+            (throw (ex-info "Default workspace does not match its registered repository"
+                            {:type ::default-workspace-mismatch :room/id room-id})))
+          {:registry-system (:system/id registered) :runtime-system expected
+           :system system :conn conn :id (geschichte/gy-workspace-id system)
+           :repository {:conn conn :config config :workspace-branch (:branch config)}})))))
 
 (defn room-kbs
   "Ordered KBs attached to a room (own first), each `{:slug :path :permission}`."
