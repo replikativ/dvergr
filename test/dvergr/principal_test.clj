@@ -105,10 +105,10 @@
           (run! rreg/register! rooms))
         (binding [*rooms* rooms] (f))
         (finally
-          (binding [ec/*execution-context* c]
-            (doseq [r rooms]
-              (try (rreg/unregister! (:id r)) (catch Throwable _ nil))
-              (d/close-room! r))))))))
+          ;; These Rooms share one root executor: drain every owner first,
+          ;; then release the context once, rather than closing the first
+          ;; Room's root underneath its still-registered sibling.
+          (d/close-shutdown-contexts! (d/close-registered-rooms! c)))))))
 
 (defn- only-open
   "Anyone may list; only Alice reads and writes a room, the open one."
@@ -373,9 +373,7 @@
         (is (thrown? clojure.lang.ExceptionInfo
                      (ops/authorize! (daemon (constantly true)) alice :room/merge {:room "authz-open"}))))
       (finally
-        (binding [ec/*execution-context* (:execution-ctx (daemon nil))]
-          (try (rreg/unregister! :authz-fork) (catch Throwable _ nil)))
-        (d/close-room! fork)))))
+        (d/close-room! fork {:close-context? false})))))
 
 (deftest a-room-workflow-benchmark-reads-its-room-and-creates-one
   (let [[seen authz] (recorder (constantly true))]
@@ -490,7 +488,7 @@
           (finally
             (binding [ec/*execution-context* c]
               (doseq [k [:authz-a :authz-l]]
-                (when-let [r (rreg/lookup k)] (rreg/unregister! k) (d/close-room! r))))))))))
+                (when-let [r (rreg/lookup k)] (d/close-room! r {:close-context? false}))))))))))
 
 (deftest a-principal-opens-its-own-dm-with-an-agent
   (with-system-db
@@ -515,7 +513,7 @@
           (finally
             (binding [ec/*execution-context* c]
               (doseq [s @opened]
-                (when-let [r (rreg/lookup (keyword s))] (rreg/unregister! (keyword s)) (d/close-room! r))))))))))
+                (when-let [r (rreg/lookup (keyword s))] (d/close-room! r {:close-context? false}))))))))))
 
 (deftest a-forged-local-is-refused-by-decide-itself
   (is (false? (:allow? (principal/decide {:config {:auth {:authorize (constantly true)}}}
@@ -618,7 +616,7 @@
           (finally
             (binding [ec/*execution-context* c]
               (doseq [k [:authz-b :authz-c]]
-                (when-let [r (rreg/lookup k)] (rreg/unregister! k) (d/close-room! r))))))))))
+                (when-let [r (rreg/lookup k)] (d/close-room! r {:close-context? false}))))))))))
 
 (deftest telegram-owners-are-numeric-ids
   (is (nil? (dvergr.orchestration.daemon/check-telegram-owners! {:owners [12345]})))

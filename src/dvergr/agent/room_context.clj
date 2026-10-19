@@ -18,12 +18,15 @@
    - Dedup is by message `:id` through a synchronized set, so a trigger already
      present in the seed and its live admission cannot appear twice."
   (:require [dvergr.actors :as actors]
+            [sci.core :as sci]
+            [dvergr.sandbox :as sandbox]
             [dvergr.discourse :as d]
             [dvergr.agent.run :as run]
             [dvergr.agent.turn :as turn]
             [dvergr.chat.context :as chat-ctx]
             [dvergr.chat.schema :as schema]
             [dvergr.room.registry :as rreg]
+            [dvergr.runtime.preparation :as preparation]
             [dvergr.room.store :as rstore]
             [dvergr.sandbox.extensions :as extensions]
             [dvergr.chat.accounting :as acct]
@@ -290,17 +293,130 @@
         ;; partial installation too (releasing what never installed is a
         ;; no-op)
         (swap! room-agent-ctxs assoc k
-               (assoc entry :chat-ctx cctx
+               (assoc entry :chat-ctx (update cctx :extension-owners (fnil conj [])
+                                              (chat-ctx/extension-owner execution-ctx
+                                                                        (chat-ctx/sci-context-in cctx execution-ctx)
+                                                                        (remove have want)))
                       :sandbox-opts (assoc sandbox-opts :sandbox-extensions want)))
         (try
           (extensions/install! (chat-ctx/sci-context-in cctx execution-ctx) execution-ctx
                                (remove have want))
-          cctx
+          (:chat-ctx (get @room-agent-ctxs k))
           (catch Throwable error
             (drop-entry! room-id agent-id)
             (throw error))))
 
       :else (do (drop-entry! room-id agent-id) nil))))
+
+(defn- current-entry!
+  "A cached interpreter belongs to its exact Room monitor and execution world.
+   Never release a stale owner on behalf of a replacement incarnation."
+  [room agent-id]
+  (when-let [entry (get @room-agent-ctxs [(:id room) agent-id])]
+    (when-not (and (identical? (:meta room) (:room-meta entry))
+                   (identical? (:ctx room) (:execution-ctx entry)))
+      (throw (ex-info "Cached context belongs to another Room incarnation; explicit old-owner cleanup is required"
+                      {:type ::stale-context-owner :room-id (:id room) :agent-id agent-id})))
+    entry))
+
+(defn stage-ctx!
+  "Construct an unpublished provider working context on an owned native worker.
+
+   `lease` fences snapshots while construction allocates world components.
+   `own-cleanup!` registers physical post-worker cleanup with that owner. The
+   returned stage is usable only after `publish-staged!` accepts its exact
+   captured cache entry. An unchanged sandbox reuses the existing interpreter."
+  [room agent-id {:keys [system-prompt budget-dollars limit sandbox]} lease own-cleanup!]
+  (binding [ec/*execution-context* (:ctx room)]
+    (let [k [(:id room) agent-id]
+          previous (preparation/with-current! lease #(current-entry! room agent-id))
+          have (set (get-in previous [:chat-ctx :sandbox-extensions]))
+          want (if (nil? sandbox) have (set sandbox))]
+      (cond
+        (and previous (= have want))
+        {:key k :previous previous :entry previous :system-prompt system-prompt}
+
+        (and previous (every? want have))
+        (let [old-cctx (:chat-ctx previous)
+              old-interpreter (chat-ctx/sci-context-in old-cctx (:ctx room))
+              interpreter (sci/fork old-interpreter)
+              added (set (remove have want))
+              owner (chat-ctx/extension-owner (:ctx room) interpreter added)
+              published? (atom false)
+              cctx (-> old-cctx
+                       (assoc :sandbox-extensions want)
+                       (update :extension-owners (fnil conj []) owner))]
+          (own-cleanup!
+           (fn []
+             (when (and (not @published?)
+                        (compare-and-set! (:released? owner) false true))
+               (extensions/release! interpreter added))))
+          (extensions/install! interpreter (:ctx room) added)
+          {:key k :previous previous :entry (-> previous
+                                                (assoc :chat-ctx cctx)
+                                                (assoc-in [:sandbox-opts :sandbox-extensions] want))
+           :system-prompt system-prompt :published? published?
+           :expected-interpreter old-interpreter :interpreter interpreter})
+
+        :else
+        (let [room-id (:id room)
+              room-uuid (room-system-id room)
+              opts {:execution-ctx (:ctx room)
+                    :chat-id (stable-chat-id room-id agent-id)
+                    :title (str (name agent-id) "-" (name room-id))
+                    :agent-id agent-id :budget-dollars budget-dollars
+                    :db-conn (some-> room :store :conn)
+                    :kb-conn (some-> room-uuid srooms/room-kb-conn)
+                    :room-id room-uuid :room-runtime-id room-id
+                    :room-incarnation (:incarnation room)
+                    :allowed-domains (some-> (actors/lookup (sdb/get-conn) agent-id)
+                                             :config :allowed-domains)
+                    :durable? false :sandbox-extensions want}
+              messages (hydration-messages! room agent-id limit)
+              owned (atom nil)
+              published? (atom false)]
+          ;; Install cleanup before acquisition, including cancellation during
+          ;; construction, including a partially bound context handed over by
+          ;; turn/new-working-ctx before namespace installation begins.
+          (own-cleanup!
+           (fn []
+             (if @published?
+               (when-let [old-cctx (:chat-ctx previous)]
+                 (chat-ctx/release-sci-in! old-cctx (:ctx room)))
+               (when-let [cctx @owned]
+                 (chat-ctx/release-sci-in! cctx (:ctx room))))))
+          (let [cctx (turn/new-working-ctx (assoc opts :own-cleanup! (fn [cctx] (reset! owned cctx) true)))
+                seen (java.util.Collections/synchronizedSet (java.util.HashSet.))]
+            (when system-prompt
+              (append-signal-only! cctx {:role :system :content system-prompt}))
+            (doseq [m messages]
+              (append-inbound-to! cctx seen (:id m)
+                                  (or (:role m) (if (= agent-id (:from m)) :assistant :user))
+                                  (:content m)
+                                  (when (not= agent-id (:from m))
+                                    (display-name room (:from m)))
+                                  (:ts m)
+                                  (when (= agent-id (:from m)) (:reasoning m))))
+            {:key k :previous previous :published? published?
+             :entry {:chat-ctx cctx :seen seen :execution-ctx (:ctx room)
+                     :room-meta (:meta room)
+                     :sandbox-opts (assoc opts :capability-id (:capability-id cctx))}}))))))
+
+(defn publish-staged!
+  "Short publication only; caller must hold its current preparation lease."
+  [{:keys [key previous entry published? system-prompt expected-interpreter interpreter]}]
+  (when-not (identical? previous (get @room-agent-ctxs key))
+    (throw (ex-info "Working context changed during preparation"
+                    {:type ::stale-context-preparation})))
+  (when expected-interpreter
+    (sandbox/replace-spindel-sci-context! (:execution-ctx entry)
+                                          (:sci-component (:chat-ctx entry))
+                                          expected-interpreter interpreter))
+  (when published? (reset! published? true))
+  (swap! room-agent-ctxs assoc key entry)
+  (when system-prompt
+    (with-system-prompt! (:chat-ctx entry) system-prompt))
+  (:chat-ctx entry))
 
 (defn ensure-ctx!
   "Get-or-create the long-lived working chat-ctx for `agent-id` in `room`.
@@ -330,8 +446,9 @@
                   (throw (ex-info "Working context requested for a closed Room incarnation"
                                   {:type ::closed-room
                                    :room-id room-id
-                                   :room/incarnation (:incarnation room)})))]
-          (or (when-let [entry (get @room-agent-ctxs k)]
+                                   :room/incarnation (:incarnation room)})))
+              _ (preparation/assert-agent-quiescent! room agent-id)]
+          (or (when-let [entry (current-entry! room agent-id)]
                 (some-> (with-extensions! k entry sandbox)
                         (with-system-prompt! system-prompt)))
               (let [;; The room's system-db UUID — the key the system resolvers
@@ -445,9 +562,11 @@
                                     :room-incarnation (:incarnation child-room)
                                     :fork-projection? true
                                     :capability-id (:capability-id chat-ctx))
-                  projected (assoc chat-ctx
-                                   :spindel-ctx (:ctx child-room)
-                                   :db-conn (some-> child-room :store :conn))
+                  projected (chat-ctx/reset-extension-owners
+                             (assoc chat-ctx
+                                    :spindel-ctx (:ctx child-room)
+                                    :db-conn (some-> child-room :store :conn))
+                             (:ctx child-room) (:sandbox-extensions chat-ctx))
                   _ (turn/rebind-working-ctx! projected child-opts)
                   child-seen (java.util.Collections/synchronizedSet
                               (locking seen
@@ -463,12 +582,37 @@
               (:chat-ctx (get @room-agent-ctxs child-k))))))))
 
 (defn drop-ctx!
-  "Tear down the (room, agent) provider projection."
-  [room-id agent-id]
-  (if-let [room-meta (:room-meta (get @room-agent-ctxs [room-id agent-id]))]
-    (locking room-meta (drop-entry! room-id agent-id))
-    (drop-entry! room-id agent-id))
-  nil)
+  "Tear down a quiescent provider projection off-engine. Prefer the Room form
+   so unpublished preparation is fenced too. :if-absent? protects a concurrent
+   rejoin when a host stops an earlier participant incarnation."
+  ([room-or-id agent-id] (drop-ctx! room-or-id agent-id {}))
+  ([room-or-id agent-id {:keys [if-absent?]}]
+   (let [explicit-room (when (map? room-or-id) room-or-id)
+         room-id (if explicit-room (:id explicit-room) room-or-id)
+         k [room-id agent-id]
+         cached (get @room-agent-ctxs k)
+         execution-ctx (or (:ctx explicit-room) (:execution-ctx cached) ec/*execution-context*)
+         room (or explicit-room
+                  (when execution-ctx
+                    (binding [ec/*execution-context* execution-ctx] (rreg/lookup room-id))))
+         detach! (fn []
+                   (when-not (and if-absent? room (contains? @(:participants room) agent-id))
+                     (when room (preparation/assert-agent-quiescent! room agent-id))
+                     (when-let [entry (get @room-agent-ctxs k)]
+                       (let [lease (when room (preparation/retain-cleanup! room agent-id entry))]
+                         (swap! room-agent-ctxs dissoc k)
+                         [entry lease]))))
+         [entry lease] (if-let [room-meta (or (:meta room) (:room-meta cached))]
+                         (locking room-meta (detach!))
+                         (detach!))]
+     (when-let [cctx (:chat-ctx entry)]
+       (try
+         (chat-ctx/release-sci-in! cctx (or (:execution-ctx entry) (:spindel-ctx cctx)))
+         (when lease (preparation/complete-cleanup! lease nil))
+         (catch Throwable error
+           (when lease (preparation/complete-cleanup! lease error))
+           (throw error)))))
+   nil))
 
 (defn drop-room!
   "Drop all agent ctxs for a room (room delete / fork discard)."
@@ -485,10 +629,21 @@
    shared monitor makes the closed marker and complete component teardown one
    lifecycle transition, so a stale caller cannot publish after cleanup."
   [room]
+  (preparation/drain-room! room)
   (d/with-room-lock room
-    (doseq [[rid aid] (keys @room-agent-ctxs)
-            :when (= rid (:id room))]
-      (drop-entry! rid aid)))
+    (let [entries (into {} (filter (fn [[[rid _] _]] (= rid (:id room))))
+                        @room-agent-ctxs)]
+      (doseq [[[_ agent-id] _] entries]
+        (current-entry! room agent-id))
+      (preparation/retain-room-cleanup!
+       room entries
+       (fn [{:keys [chat-ctx execution-ctx]}]
+         (chat-ctx/release-sci-in! chat-ctx execution-ctx)))
+      (swap! room-agent-ctxs #(apply dissoc % (keys entries)))))
+  ;; A failed release leaves its exact entry in the Room's receipt, not lost in
+  ;; an already empty cache. The unregister reservation and Room fence remain;
+  ;; an explicit lifecycle retry drains that same receipt before proceeding.
+  (preparation/drain-room! room)
   nil)
 
 (defn clear-all!

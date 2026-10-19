@@ -102,16 +102,16 @@
   "Tear down a lite daemon booted by `start!` (no-op when attached to a real one)."
   []
   (if-let [ctx @!lite-ctx]
-    (do (binding [rtc/*execution-context* ctx]
-          (try ((requiring-resolve 'dvergr.agent.room-context/clear-all!)) (catch Throwable _))
-          (try ((requiring-resolve 'dvergr.rooms.messages/clear-all!))     (catch Throwable _))
-          (try ((requiring-resolve 'dvergr.system.rooms/clear-room-ctxs!)) (catch Throwable _)))
+    (let [shutdown (d/close-registered-rooms! ctx)]
+      (binding [rtc/*execution-context* ctx]
+        ((requiring-resolve 'dvergr.agent.room-context/clear-all!))
+        (try ((requiring-resolve 'dvergr.rooms.messages/clear-all!))     (catch Throwable _))
+        (try ((requiring-resolve 'dvergr.system.rooms/clear-room-ctxs!)) (catch Throwable _)))
         ;; release the ctx's drain thread / executor (was leaked — never closed)
-        (try ((requiring-resolve 'org.replikativ.spindel.engine.context/close-context!) ctx)
-             (catch Throwable _))
-        (reset! !lite-ctx nil)
-        (reset! daemon/current-daemon nil)
-        :stopped)
+      (d/close-shutdown-contexts! shutdown)
+      (reset! !lite-ctx nil)
+      (reset! daemon/current-daemon nil)
+      :stopped)
     :attached-noop))
 
 ;; ============================================================================
@@ -230,9 +230,18 @@
   ([room n] (in-room room (->> (d/log room) (take-last n) vec))))
 
 (defn close!
-  "Stop the room's agent(s) and tear down the room (closes the bus + spins)."
+  "Stop the room's agent(s) and tear down the room (closes the bus + spins).
+   A Room on the attached daemon's own context does not own that context's
+   executor; stop! (for a lite daemon) or the owning host releases it. Other
+   standalone/child contexts retain discourse's ordinary close semantics."
   [room]
-  (in-room room (d/close-room! room))
+  (let [context (:ctx room)
+        daemon-context (:execution-ctx @daemon/current-daemon)
+        daemon-owned? (and daemon-context
+                           (= (:fork-id context) (:fork-id daemon-context))
+                           (every? #(identical? (get context %) (get daemon-context %))
+                                   [:backend :running :executor]))]
+    (in-room room (d/close-room! room {:close-context? (not daemon-owned?)})))
   :closed)
 
 ;; ============================================================================

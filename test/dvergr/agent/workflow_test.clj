@@ -188,7 +188,10 @@
           fork (binding [ec/*execution-context* (:ctx room)] (forks/fork! room))]
       (with-redefs [forks/reconcile-merge! (fn [& _] {:ok? false :error "parent is gone"})]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"failed: parent is gone"
-                              (ops/invoke daemon dvergr.principal/local-principal :room/merge {:room (name (:id fork))})))))))
+                              (ops/invoke daemon dvergr.principal/local-principal :room/merge {:room (name (:id fork))}))))
+      ;; Refusal intentionally leaves an open proposal; the fixture owns its
+      ;; explicit discard before releasing the parent's shared executor.
+      (d/discard fork))))
 
 (deftest a-daemon-room-is-evaluated-in-its-own-context
   ;; A daemon room's context is a fork of the daemon's (dvergr.system.rooms).
@@ -209,6 +212,10 @@
           (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
           (is (= ["completed" "completed"] (mapv :status (get-in done [:result :attempts]))))))
       (finally
+        (binding [ec/*execution-context* (:ctx host)]
+          (doseq [fork (rreg/list-rooms)
+                  :when (= (:id room) (:forked-from @(:meta fork)))]
+            (d/discard fork)))
         (try (binding [ec/*execution-context* (:ctx host)] (rreg/unregister! (:id room))) (catch Throwable _ nil))
         (d/close-room! room)
         (d/close-room! host)))))

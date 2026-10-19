@@ -70,6 +70,22 @@
    the ChatContext's owning world when called outside a Spindel binding."
   [chat-ctx]
   (sci-context-in chat-ctx (selected-execution-context chat-ctx)))
+
+(defn extension-owner
+  "One process-local extension acquisition, owned by exactly one world.
+   This is a cleanup lease, not agent-visible/forkable semantic state."
+  [execution-context interpreter ids]
+  {:execution-context execution-context :interpreter interpreter
+   :ids (set ids) :released? (atom false)})
+
+(defn reset-extension-owners
+  "Give a newly constructed/projected facade its own extension cleanup chain.
+   A child facade must never inherit its parent's raw interpreter leases."
+  [chat-ctx execution-context ids]
+  (assoc chat-ctx :extension-owners
+         (if (seq ids)
+           [(extension-owner execution-context (sci-context-in chat-ctx execution-context) ids)]
+           [])))
 ;; ============================================================================
 ;; Signal Accessors (must be called with spindel context bound)
 ;; ============================================================================
@@ -473,8 +489,14 @@
    room caches use it when a child world is discarded."
   [chat-ctx execution-context]
   (try
-    (when-let [ids (seq (:sandbox-extensions chat-ctx))]
-      (extensions/release! (sci-context-in chat-ctx execution-context) ids))
+    (if (contains? chat-ctx :extension-owners)
+      (doseq [{:keys [interpreter ids released?] owner-context :execution-context}
+              (:extension-owners chat-ctx)
+              :when (and (identical? execution-context owner-context)
+                         (compare-and-set! released? false true))]
+        (extensions/release! interpreter ids))
+      (when-let [ids (seq (:sandbox-extensions chat-ctx))]
+        (extensions/release! (sci-context-in chat-ctx execution-context) ids)))
     (sandbox/release-agent-resources! execution-context (:capability-id chat-ctx))
     (finally
       ;; Disposable-resource cleanup is best-effort with respect to component

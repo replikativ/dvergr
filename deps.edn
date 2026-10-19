@@ -101,7 +101,9 @@
         ;; Nil-grant authority initialization is required, including forks of
         ;; plain Room contexts, source-preserving failed-copy recovery, and
         ;; independent Sessions at fork creation (spindel#145/#146).
-        org.replikativ/spindel     {:mvn/version "0.1.133"}
+        ;; Reviewed staged-interpreter publication API (Spindel PR #147).
+        org.replikativ/spindel     {:git/url "https://github.com/replikativ/spindel.git"
+                                  :git/sha "0cda03449d853f32c13d4087b1f9abbc19400db5"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,

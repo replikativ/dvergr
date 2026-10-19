@@ -11,16 +11,77 @@
             [dvergr.room.store :as store]
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms.forks :as forks]
+            [dvergr.runtime.preparation :as preparation]
+            [dvergr.sandbox.work :as sandbox-work]
             [dvergr.substrate.datahike :as substrate]
+            [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]))
+
+(defn- identity-distinct [items]
+  (reduce (fn [result item]
+            (if (some #(identical? item %) result) result (conj result item)))
+          [] items))
+
+(defn- terminate-test-process! [room work connections configs]
+  ;; These tests deliberately retain an INCOMPLETE affine settlement, which
+  ;; ordinary close must not reclaim. Model termination of this isolated test
+  ;; process, not a merge/discard/abandon API. The fixture creates synchronous
+  ;; database worlds only: fail closed if that no-live-work premise changes.
+  (binding [ec/*execution-context* (:ctx room)]
+    (let [rooms (registry/list-rooms)
+          owned (remove nil? [room work])
+          same-inventory? (fn [actual expected]
+                            (and (= (count actual) (count expected))
+                                 (every? #(some (fn [owner] (identical? % owner)) expected) actual)))
+          _ (when-not (every? #(some (fn [owner] (identical? % owner)) owned) rooms)
+              (throw (ex-info "Unexpected Room in isolated settlement fixture" {})))
+          contexts (identity-distinct (concat (map :ctx (remove #(identical? room %) rooms)) [(:ctx room)]))
+          conns (identity-distinct
+                 (concat connections
+                         (mapcat (fn [execution-context]
+                                   (binding [ec/*execution-context* execution-context]
+                                     (keep :conn (vals (ygg/registered-systems))))) contexts)))
+          evidence (when work
+                     {:claim (:dvergr.discourse/settlement-claim @(:meta work))
+                      :settlement (d/settlement work)
+                      :disposition (ygg/fork-disposition (d/fork-handle work))})]
+      (doseq [owner rooms]
+        (when (or (seq @(:participants owner))
+                  (some-> @(:meta owner) :dvergr/owned-listeners deref seq)
+                  (seq (run/active-runs (:id owner))))
+          (throw (ex-info "Settlement fixture has live work; process termination refused" {})))
+        (preparation/assert-quiescent! owner)
+        (sandbox-work/close-room-work! owner))
+      (when (get-in evidence [:claim :active?])
+        (throw (ex-info "Settlement attempt has not physically ended" {})))
+      (when-not (same-inventory? (registry/list-rooms) rooms)
+        (throw (ex-info "Rooms changed while settlement fixture was quiescing" {})))
+      (d/close-room! room {:close-context? false})
+      ;; Run canonical physical hooks, including global controller/cache owner
+      ;; release, without rewriting the incomplete world's settlement evidence.
+      (doseq [owner rooms :when (not (identical? room owner))]
+        (registry/unregister! (:id owner)))
+      (when (seq (registry/list-rooms))
+        (throw (ex-info "Room registration raced isolated test shutdown" {})))
+      (when (and work
+                 (not= evidence {:claim (:dvergr.discourse/settlement-claim @(:meta work))
+                                 :settlement (d/settlement work)
+                                 :disposition (ygg/fork-disposition (d/fork-handle work))}))
+        (throw (ex-info "Process shutdown altered settlement evidence" {})))
+      ;; No cleanup failure is swallowed: do not release live stores after a
+      ;; failed proof/hook. Exact test-owned stores go before child/root engines.
+      (doseq [conn conns] (dh/release conn))
+      (doseq [execution-context contexts] (context/close-context! execution-context))
+      (doseq [cfg configs] (dh/delete-database cfg)))))
 
 (defn- with-world [f]
   (let [room (d/make-room {:id (keyword (str "settlement-truth-" (random-uuid))) :store (memory/make)})
         configs (mapv (fn [_] {:store {:backend :memory :id (random-uuid)}
                                :schema-flexibility :write :keep-history? true :commit-graph? true}) (range 2))
         systems (mapv #(str "settlement-truth-" %) (range 2))
-        connections (atom [])]
+        connections (atom [])
+        work (atom nil)]
     (try
       (binding [ec/*execution-context* (:ctx room)]
         (registry/register! room)
@@ -34,14 +95,13 @@
             (swap! connections conj conn)
             (dh/transact conn [{:datum/id :entry :datum/text "parent"}])))
         (let [w (world/open! room (random-uuid) :automatic)]
+          (reset! work (:work w))
           (binding [ec/*execution-context* (:ctx (:work w))]
             (doseq [sid systems]
               (dh/transact (:conn (ygg/system sid)) [{:datum/id :entry :datum/text "child"}])))
           (f room w systems @connections)))
       (finally
-        (d/close-room! room)
-        (doseq [conn @connections] (dh/release conn))
-        (doseq [cfg configs] (dh/delete-database cfg))))))
+        (terminate-test-process! room @work @connections configs)))))
 
 (defn- fail-after-first-system [f]
   (let [seat-var (ns-resolve 'org.replikativ.spindel.yggdrasil 'seat-merged!)

@@ -54,8 +54,10 @@
       (binding [ec/*execution-context* (:ctx room)] (rreg/register! room))
       (with-stub-model (f room))
       (finally
-        (try (binding [ec/*execution-context* (:ctx room)] (rreg/unregister! (:id room))) (catch Throwable _ nil))
-        (d/close-room! room)))))
+        ;; Review worlds intentionally remain live after these assertions. This
+        ;; fixture owns the whole root, so drain all owners before releasing it;
+        ;; shutdown does not claim that those proposals merged or were discarded.
+        (d/close-shutdown-contexts! (d/close-registered-rooms! (:ctx room)))))))
 
 (deftest a-search-merges-one-world-and-records-every-member
   (with-room :search-test

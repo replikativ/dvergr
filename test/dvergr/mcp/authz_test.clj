@@ -46,10 +46,7 @@
           (with-redefs [server/current-daemon (constantly (daemon c))] (f)))
         (finally
           (reset! authorize policy)
-          (binding [ec/*execution-context* c]
-            (doseq [r rooms]
-              (try (rreg/unregister! (:id r)) (catch Throwable _ nil))
-              (d/close-room! r))))))))
+          (d/close-shutdown-contexts! (d/close-registered-rooms! c)))))))
 
 (defn- session [principal & [meta]]
   (let [sent (atom [])

@@ -143,7 +143,10 @@
     (let [closed (atom [])
           close! dvergr.discourse/close-room!]
       (with-redefs [dvergr.rooms/hydrate-registry! (fn [_] (throw (ex-info "hydration broke" {})))
-                    dvergr.discourse/close-room! (fn [r] (swap! closed conj (:id r)) (close! r))]
+                    dvergr.discourse/close-room!
+                    (fn
+                      ([r] (swap! closed conj (:id r)) (close! r))
+                      ([r opts] (swap! closed conj (:id r)) (close! r opts)))]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"hydration broke" (runner/open-home! dir))))
       (is (some #{:daemon} @closed) "the root room (its context's drain) is closed")
       (is (nil? @@#'daemon/starting-room)))

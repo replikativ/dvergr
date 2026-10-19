@@ -25,7 +25,10 @@
      (try
        (binding [ec/*execution-context* (:ctx ~room)] (rreg/register! ~room))
        (with-redefs [workflow/candidates echo-candidates] ~@body)
-       (finally (d/close-room! ~room)))))
+       (finally
+         ;; :propose keeps review worlds alive. The fixture owns the whole
+         ;; computation, not authority to invent a semantic settlement for them.
+         (d/close-shutdown-contexts! (d/close-registered-rooms! (:ctx ~room)))))))
 
 (defn- opts [room]
   {:task "prepare" :attempts 1 :principal (assoc principal/local-principal
@@ -215,7 +218,7 @@
                                                        {:review/verdict :approve}))))
                        (catch Throwable _ :stopped)))]
           (is (= true (deref entered 5000 :timeout)))
-          (let [closing (future (d/close-room! room))]
+          (let [closing (future (d/close-room! room {:close-context? false}))]
             (Thread/sleep 100)
             (is (not (realized? closing)))
             (deliver release true)
@@ -224,7 +227,7 @@
             (is (empty? (run/active-runs (:id room)))))))
       (finally
         (deliver release true)
-        (d/close-room! room)))))
+        (d/close-shutdown-contexts! (d/close-registered-rooms! (:ctx room)))))))
 
 (deftest scope-intersection-attenuates-paths-and-kb-kinds
   (let [declared {:repo ["/" "" "docs/"]

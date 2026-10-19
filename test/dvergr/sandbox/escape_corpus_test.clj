@@ -49,7 +49,8 @@
     (try
       (sandbox/setup-agent-namespaces! sci-ctx ec)
       (f sci-ctx ec)
-      (finally (ctx/stop-context! ec)))))
+      (finally
+        (d/close-shutdown-contexts! (d/close-registered-rooms! ec))))))
 
 (defn- eval-in
   "Evaluate `code` the way production does: execution context bound (as
@@ -127,11 +128,12 @@
                         (let [r (eval-in sci-ctx ec "(dvergr.room/root)")]
                           (is (= :daemon (get-in r [:ok :id])) (pr-str r))
                           (is (plain? (:ok r))))
-                        (finally (d/close-room! daemon)))))))
+                        (finally (d/close-room! daemon {:close-context? false})))))))
               (finally
                 (binding [rtc/*execution-context* ec]
                   (some-> (rreg/lookup (rstore/slug->room-id created)) d/close-room!))
-                (d/close-room! room))))))
+                ;; with-sandbox owns this exact shared root's final release.
+                (d/close-room! room {:close-context? false}))))))
       (finally
         (paths/set-home! prev)
         (sdb/reset-conn!)))))

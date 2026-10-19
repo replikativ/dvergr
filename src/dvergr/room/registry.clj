@@ -21,6 +21,17 @@
 (defonce ^:private lifecycle-lock (Object.))
 (defonce ^:private transitions (atom {}))
 
+(defn shutdown-context-receipt!
+  "Root-owned process-local cleanup receipt, like the registry's native Room
+   handles—not persisted agent/fork semantics. Survives a failed host shutdown
+   after some Rooms were already unregistered. Caller must bind its root tree."
+  []
+  (locking lifecycle-lock
+    (or (rctx/shared-get-state [:dvergr/shutdown-context-receipt])
+        (let [receipt (atom {})]
+          (rctx/shared-swap-state! [:dvergr/shutdown-context-receipt] (constantly receipt))
+          receipt))))
+
 (defn- transition-key [room-id]
   [(:fork-id (rctx/current-root)) room-id])
 

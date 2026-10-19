@@ -29,6 +29,7 @@
             [dvergr.agent.turn :as turn]
             [dvergr.agent.prompt :as prompt]
             [dvergr.agent.room-context :as room-context]
+            [dvergr.runtime.preparation :as preparation]
             [dvergr.sandbox.extensions :as extensions]
             [dvergr.agent.persona :as persona]
             [dvergr.room.store :as rstore]
@@ -474,12 +475,13 @@
     ;; drops — leaving only the daemon room would leak membership in the
     ;; global/config rooms and keep `online?` true.
     (doseq [room (rreg/list-rooms)]
-      (when (contains? @(:participants room) agent-id)
+      (when-let [participant (get @(:participants room) agent-id)]
         (binding [rtc/*execution-context* (:ctx room)]
-          (d/leave room agent-id))
+          (d/leave room agent-id (:participant/incarnation participant)))
+        (preparation/drain-participant! room participant)
         ;; Drop the agent's cached working ctx for this room (unsubscribe its
         ;; bus fold). It re-seeds from the store next time the agent rejoins.
-        (room-context/drop-ctx! (:id room) agent-id)))
+        (room-context/drop-ctx! room agent-id {:if-absent? true})))
     :stopped))
 
 ;; ============================================================================
@@ -1173,10 +1175,6 @@
       (try (stop-agent! daemon agent-id)
            (catch Exception _))))
 
-  ;; Drop all cached per-room working ctxs (the cache is a defonce surviving a
-  ;; same-process restart; a fresh start must re-seed rather than reuse them).
-  (room-context/clear-all!)
-
   ;; Stop the reactive clock heartbeat (per-room scheduler spins go quiet with
   ;; it; their rows persist in each room's store and resume on next boot).
   (clock/stop!)
@@ -1200,21 +1198,14 @@
     (tel/log! {:id :daemon/telegram-disconnecting} "Disconnecting Telegram")
     (channels/disconnect! (:id tg-ch)))
 
-  ;; Unregister execution context
-  (sdist/unregister-context! :default)
-
-  ;; Tear down the discourse room — clears participants, stops the
-  ;; spindel ExecutionContext drain thread. Without this, dvergr tests
-  ;; (or any short-lived embedding) accumulate one drain thread per
-  ;; start!/stop! cycle. Virtual-thread-backed since spindel 0.1.10, so
-  ;; the leak is invisible — but explicit teardown is the right contract.
-  (when-let [room (:discourse-room daemon)]
-    (try (d/close-room! room)
-         (catch Exception _)))
-
-  ;; Last, once nothing writes: release every room store's connection and drop
-  ;; the room contexts, so a same-process restart does not inherit them.
-  (srooms/release-room-stores!)
+  ;; Every Room owns work before a working context or Run exists. Do not infer
+  ;; quiescence from the cache or only the daemon Room. Keep the shared executor
+  ;; alive until ALL canonical Rooms have drained; failures retain stores/ctxs.
+  (let [shutdown (d/close-registered-rooms! (:execution-ctx daemon))]
+    (room-context/clear-all!)
+    (sdist/unregister-context! :default)
+    (srooms/release-room-stores!)
+    (d/close-shutdown-contexts! shutdown))
 
   (reset! (:status daemon) :stopped)
   (reset! current-daemon nil)
@@ -1231,10 +1222,13 @@
   (srooms/enable-storage-gc! false)
   (try (mail/stop-sync!) (catch Throwable _ nil))
   (try (sdist/unregister-context! :default) (catch Throwable _ nil))
-  (when-let [room @starting-room]
-    (try (d/close-room! room) (catch Throwable _ nil))
-    (reset! starting-room nil))
-  (srooms/release-room-stores!)
+  (if-let [room @starting-room]
+    (let [shutdown (d/close-registered-rooms! (:ctx room))]
+      (room-context/clear-all!)
+      (srooms/release-room-stores!)
+      (d/close-shutdown-contexts! shutdown)
+      (reset! starting-room nil))
+    (srooms/release-room-stores!))
   (reset! current-daemon nil)
   :aborted)
 

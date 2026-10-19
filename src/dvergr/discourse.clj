@@ -31,6 +31,7 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [org.replikativ.spindel.core :as sp]
+            [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]
             [org.replikativ.spindel.spin.core :as spin-core]
@@ -41,6 +42,8 @@
             [dvergr.runtime.bus :as bus]
             [dvergr.substrate.geschichte :as geschichte]
             [dvergr.runtime.peer-bus :as peer-bus]
+            [dvergr.runtime.ctx :as runtime-ctx]
+            [dvergr.runtime.preparation :as preparation]
             [dvergr.agent.run :as agent-run]
             [dvergr.sandbox.work :as sandbox-work]
             [dvergr.room.store :as rstore]
@@ -776,6 +779,19 @@
 
 (declare fork-handle)
 
+(defn- ended-terminal-settlement? [room metadata]
+  (let [state (get metadata fork-transfer-state-key)
+        held (::settlement-claim metadata)
+        handle (fork-handle room)
+        authority (when handle @(:authority handle))
+        status (:status authority)]
+    (and (= :recovery-required (:state state))
+         (contains? #{:merge :discard} (:operation state))
+         held (false? (:active? held))
+         (= (:token handle) (:token authority))
+         (contains? #{:merged :discarded} status)
+         (= status (get-in held [:settlement :op])))))
+
 (defn- begin-room-quiescence!
   [room operation]
   (let [token (random-uuid)]
@@ -783,48 +799,64 @@
      room
      (fn [admitted active]
        (with-room-lock room
-         (if-let [state (get @(:meta room) fork-transfer-state-key)]
-           (throw (ex-info "Room is already fenced for lifecycle work"
-                           {:type ::room-lifecycle-in-progress
-                            :fork/id (:id room)
+         (swap! (:meta room)
+                (fn [metadata]
+                  (if-let [state (get metadata fork-transfer-state-key)]
+                    (if (and (= :close operation)
+                             (or (and (= :close (:operation state))
+                                      (= :recovery-required (:state state)))
+                                 (ended-terminal-settlement? room metadata)))
+                      ;; Preserve the original lifecycle token. A terminal
+                      ;; substrate plus an ended settlement attempt permits
+                      ;; explicit host cleanup, NOT another merge/discard.
+                      ;; claim-settlement! checks this same atom's :close fence,
+                      ;; so its retry and this takeover cannot both win.
+                      (update metadata fork-transfer-state-key assoc
+                              :state :tearing-down :operation :close)
+                      (throw (ex-info "Room is already fenced for lifecycle work"
+                                      {:type ::room-lifecycle-in-progress
+                                       :fork/id (:id room)
+                                       :operation operation
+                                       :fork/transfer-state state})))
+                    (assoc metadata fork-transfer-state-key
+                           {:state :tearing-down
+                            :token token
                             :operation operation
-                            :fork/transfer-state state}))
-           (swap! (:meta room) assoc fork-transfer-state-key
-                  {:state :tearing-down
-                   :token token
-                   :operation operation
-                   :admitted-run-ids admitted
-                   :admitted-trigger-ids (into #{} (keep :run/trigger) active)})))))))
+                            :admitted-run-ids admitted
+                            :admitted-trigger-ids (into #{} (keep :run/trigger) active)})))))))))
 
 (defn- drain-room-listeners!
   "Stop Room-owned listeners and wait for active callbacks to physically exit.
    Returns their callbacks so a recoverable transfer failure can reinstall them."
-  [room operation]
-  (begin-room-quiescence! room operation)
-  (if-let [owned (:dvergr/owned-listeners @(:meta room))]
-    (let [entries (vec @owned)]
-      (doseq [{:keys [subscription spin lifecycle]} entries]
-        (bus/unsubscribe! subscription)
-        (let [state (swap! lifecycle
-                           (fn [state]
-                             (case (:status state)
-                               :open {:status :closed}
-                               :active (assoc state :status :closing)
-                               state)))]
-          (cleanup-owned-spin! room spin)
-          (when-let [done (:done state)]
-            (when (= ::timeout (deref done 5000 ::timeout))
-              (swap! (:meta room) update fork-transfer-state-key
-                     assoc
-                     :state :recovery-required
-                     :operation operation
-                     :error "listener callback drain timed out")
-              (throw (ex-info "Timed out waiting for a Room listener callback"
-                              {:type ::listener-drain-timeout
-                               :room-id (:id room)}))))))
-      (reset! owned #{})
-      (mapv :callback entries))
-    []))
+  ([room operation] (drain-room-listeners! room operation nil))
+  ([room operation on-fenced!]
+   (begin-room-quiescence! room operation)
+   (when on-fenced!
+     (on-fenced! (get-in @(:meta room) [fork-transfer-state-key :token])))
+   (if-let [owned (:dvergr/owned-listeners @(:meta room))]
+     (let [entries (vec @owned)]
+       (doseq [{:keys [subscription spin lifecycle]} entries]
+         (bus/unsubscribe! subscription)
+         (let [state (swap! lifecycle
+                            (fn [state]
+                              (case (:status state)
+                                :open {:status :closed}
+                                :active (assoc state :status :closing)
+                                state)))]
+           (cleanup-owned-spin! room spin)
+           (when-let [done (:done state)]
+             (when (= ::timeout (deref done 5000 ::timeout))
+               (swap! (:meta room) update fork-transfer-state-key
+                      assoc
+                      :state :recovery-required
+                      :operation operation
+                      :error "listener callback drain timed out")
+               (throw (ex-info "Timed out waiting for a Room listener callback"
+                               {:type ::listener-drain-timeout
+                                :room-id (:id room)}))))))
+       (reset! owned #{})
+       (mapv :callback entries))
+     [])))
 
 (defn- seal-room-quiescence!
   "Retire the causal-post handoff after every admitted Run has acknowledged
@@ -935,14 +967,19 @@
    (telegram-chat-id, type, etc.); use this whenever it changes so
    restarts hydrate the same values."
   [room update-fn & args]
-  (let [new-meta (apply swap! (:meta room) update-fn args)]
+  (let [new-meta (swap! (:meta room)
+                        (fn [current]
+                          (let [updated (apply update-fn (dissoc current preparation/leases-key) args)]
+                            (if (contains? current preparation/leases-key)
+                              (assoc updated preparation/leases-key (get current preparation/leases-key))
+                              (dissoc updated preparation/leases-key)))))]
     (when-let [store (:store room)]
       (rstore/-store-room! store (:id room)
                            {:slug (:slug room)
                             :title (:title room)
                             :parent-id (:parent-id room)
-                            :meta new-meta}))
-    new-meta))
+                            :meta (dissoc new-meta preparation/leases-key)}))
+    (dissoc new-meta preparation/leases-key)))
 
 (defn- ensure-room-work-admitted!
   [room operation & [payload]]
@@ -976,12 +1013,15 @@
   (with-room-lock room
     (ensure-room-work-admitted! room :join)
     (binding [ec/*execution-context* (:ctx room)]
-      (let [inbox-sub     (bus/subscribe! (:bus room) [:to (:id p)])
+      (let [;; Every join owns fresh lifecycle handles, even when callers reuse
+            ;; the exact Participant value. A delayed leave must never close a
+            ;; replacement incarnation's handler, pumps, or obligations.
+            p (assoc p :active (atom nil)
+                     :obligations (atom {:pending {}})
+                     :pumps (atom {}) :subs (atom {})
+                     :deferred-inbox (atom clojure.lang.PersistentQueue/EMPTY))
+            inbox-sub     (bus/subscribe! (:bus room) [:to (:id p)])
             broadcast-sub (bus/subscribe! (:bus room) [:to nil])
-          ;; A Participant may be explicitly left and then joined again. Re-open
-          ;; its active-handler slot before the new process can receive work.
-            _ (reset! (:active p) nil)
-            _ (some-> (:obligations p) (swap! assoc :closed? false))
           ;; Merge all subscriptions into one mailbox so the spin awaits
           ;; a single source. Each sub gets a small pump.
             merge-mbx (sync/create-mailbox (:ctx room))
@@ -990,6 +1030,7 @@
             p' (-> p
                    (assoc :inbox-sub inbox-sub
                           :inbox-mbx merge-mbx
+                          :participant/incarnation (random-uuid)
                         ;; The participant carries the room it is JOINED to, so a
                         ;; handler operates on its actual room — not one baked
                         ;; into a closure. Critical for fork clones: the same
@@ -1066,34 +1107,45 @@
    Teardown is deterministic: the participant process, active handler, and
    every subscription pump are cancelled and detached from the engine; their
    bus subscriptions are closed. Calling leave repeatedly is safe."
-  [room participant-id]
-  (when-let [p (get @(:participants room) participant-id)]
+  ([room participant-id] (leave room participant-id nil))
+  ([room participant-id expected-incarnation]
+   (when-let [p (locking (:meta room)
+                  (let [current (get @(:participants room) participant-id)]
+                    (when (or (nil? expected-incarnation)
+                              (= expected-incarnation (:participant/incarnation current)))
+                      current)))]
     ;; Close the handler slot first. A concurrent participant slice can install
     ;; a handler only via CAS from nil, so no new handler escapes this boundary.
-    (let [active-spin (when-let [active (:active p)]
-                        (let [[before _after]
-                              (swap-vals! active (constantly ::participant-closed))]
-                          (when-not (= ::participant-closed before) before)))]
-      (cleanup-owned-spin! room (:process p))
-      (cleanup-owned-spin! room active-spin)
+     (let [active-spin (locking (:meta room)
+                         (when-let [active (:active p)]
+                           (let [[before _after]
+                                 (swap-vals! active (constantly ::participant-closed))]
+                             (when-not (= ::participant-closed before) before))))]
+       (preparation/cancel-participant! room p)
+       (cleanup-owned-spin! room (:process p))
+       (cleanup-owned-spin! room active-spin)
       ;; The cancelled handler cannot settle what it owes; the participant does.
-      (settle-obligations! p :abandoned nil true))
+       (settle-obligations! p :abandoned nil true))
     ;; Closing subscriptions releases their sequence waits; engine cleanup below
     ;; removes any pump continuation that has not observed closure yet.
-    (when-let [sub (:inbox-sub p)]
-      (bus/unsubscribe! sub))
-    (when-let [subs (:subs p)]
-      (doseq [[topic sub] @subs]
-        (bus/unsubscribe! sub)
-        (swap! subs dissoc topic)))
-    (when-let [pumps (:pumps p)]
-      (doseq [pump (vals @pumps)]
-        (cleanup-owned-spin! room pump))
-      (reset! pumps {}))
-    (when-let [deferred-inbox (:deferred-inbox p)]
-      (reset! deferred-inbox clojure.lang.PersistentQueue/EMPTY)))
-  (swap! (:participants room) dissoc participant-id)
-  nil)
+     (when-let [sub (:inbox-sub p)]
+       (bus/unsubscribe! sub))
+     (when-let [subs (:subs p)]
+       (doseq [[topic sub] @subs]
+         (bus/unsubscribe! sub)
+         (swap! subs dissoc topic)))
+     (when-let [pumps (:pumps p)]
+       (doseq [pump (vals @pumps)]
+         (cleanup-owned-spin! room pump))
+       (reset! pumps {}))
+     (when-let [deferred-inbox (:deferred-inbox p)]
+       (reset! deferred-inbox clojure.lang.PersistentQueue/EMPTY))
+     (swap! (:participants room)
+            #(if (and (= (:participant/incarnation p)
+                         (:participant/incarnation (get % participant-id)))
+                      (identical? (:active p) (:active (get % participant-id))))
+               (dissoc % participant-id) %)))
+   nil))
 
 (defn- leave-all!
   "Cancel and remove every participant currently registered in `room`."
@@ -1143,6 +1195,25 @@
       (finally
         (agent-run/unwatch-runs! watch-key)))))
 
+(defn- assert-context-unshared! [room]
+  (let [execution-context (:ctx room)
+        root (runtime-ctx/root-ctx execution-context)
+        root? (identical? execution-context root)
+        others (binding [ec/*execution-context* execution-context]
+                 (filterv #(and (not (identical? room %))
+                                (or (identical? execution-context (:ctx %))
+                                    ;; Spindel closes the running flag/executor
+                                    ;; only for a root; its :ctx forks still
+                                    ;; depend on those shared resources.
+                                    (and root?
+                                         (= (:fork-id root)
+                                            (:fork-id (runtime-ctx/root-ctx (:ctx %)))))))
+                          (rreg/list-rooms)))]
+    (when (seq others)
+      (throw (ex-info "Execution context is still owned by other registered Rooms"
+                      {:type ::context-still-owned :room-id (:id room)
+                       :other-room-ids (mapv :id others)})))))
+
 (defn close-room!
   "Tear down a room: leave every participant, unregister the Room, and close
    its execution context. Any in-flight drain completes before this returns.
@@ -1153,32 +1224,92 @@
    participants and unregisters it, but never closes the root context: `:none`
    forks share the exact parent context and `:ctx` forks share its executor.
 
+   A host shutting down several Rooms sharing an executor may pass
+   {:close-context? false}; it then owns closing their exact contexts AFTER
+   every Room has quiesced. This is not fork settlement/discard authority.
+
+   A failed merge/discard whose canonical substrate already settled and whose
+   attempt ended may be explicitly closed to finish physical teardown. Its
+   original settlement claim/outcome is preserved; transferred or partitioned
+   handles and active settlement attempts cannot be reclaimed this way.
+
    No-op on already-closed rooms."
-  [room]
-  (when (and room (not= :closed (get-in @(:meta room)
-                                        [fork-transfer-state-key :state])))
-    (let [fence-token* (volatile! nil)]
-      (try
-        (drain-room-listeners! room :close)
-        (vreset! fence-token*
-                 (get-in @(:meta room) [fork-transfer-state-key :token]))
-        (sandbox-work/close-room-work! room)
-        (drain-room-runs! room)
-        (seal-room-quiescence! room :close)
-        (leave-all! room)
-        (binding [ec/*execution-context* (room-home-ctx room)]
-          (rreg/unregister! (:id room)))
+  ([room] (close-room! room {}))
+  ([room {:keys [close-context?] :or {close-context? true}}]
+   (when (and room (not= :closed (get-in @(:meta room)
+                                         [fork-transfer-state-key :state])))
+     (let [fence-token* (volatile! nil)]
+       (try
+         (drain-room-listeners! room :close #(vreset! fence-token* %))
+         (preparation/drain-room! room)
+         (sandbox-work/close-room-work! room)
+         (drain-room-runs! room)
+         (seal-room-quiescence! room :close)
+         ;; A :none fork shares this exact context; :ctx forks share its root's
+         ;; running flag/executor. Failed fork cleanup keeps
+        ;; its canonical Room registered, even after its caller's native Run
+        ;; has physically exited; that owner must prevent premature root close.
+         (when (and close-context? (not (fork-room? room)))
+           (assert-context-unshared! room))
+         (leave-all! room)
+         (binding [ec/*execution-context* (room-home-ctx room)]
+           (rreg/unregister! (:id room)))
         ;; A branchless fork carries the exact root ctx, so Spindel cannot infer from
         ;; the context alone that closing it here would kill the parent. The durable
         ;; room marker is the ownership boundary.
-        (when-not (fork-room? room)
-          (when-let [room-ctx (:ctx room)]
-            (ctx/close-context! room-ctx)))
-        (swap! (:meta room) assoc fork-transfer-state-key
-               {:state :closed :operation :close})
-        (catch Throwable error
-          (mark-room-recovery-if-owned! room @fence-token* :close error)
-          (throw error)))))
+         (when (and close-context? (not (fork-room? room)))
+           (when-let [room-ctx (:ctx room)]
+             (ctx/close-context! room-ctx)))
+         (swap! (:meta room) assoc fork-transfer-state-key
+                {:state :closed :operation :close})
+         (catch Throwable error
+           (mark-room-recovery-if-owned! room @fence-token* :close error)
+           (throw error)))))
+   nil))
+
+(defn close-registered-rooms!
+  "Host shutdown boundary: close/drain this root registry's Rooms without
+   prematurely closing a shared executor. Return a process-local cleanup plan
+   for close-shutdown-contexts! AFTER stores are released. Refuse release when
+   work registered an unexpected Room during shutdown; callers may retry.
+   Ingress must already be stopped. No close/drain error is swallowed."
+  [execution-context]
+  (binding [ec/*execution-context* execution-context]
+    (let [rooms (vec (rreg/list-rooms))
+          root (runtime-ctx/root-ctx execution-context)
+          receipt (rreg/shutdown-context-receipt!)]
+      ;; Record BEFORE unregister. The host may retry after partial Room drain;
+      ;; otherwise contexts belonging to earlier unregistered Rooms are lost.
+      (swap! receipt
+             (fn [retained]
+               (reduce (fn [m context]
+                         (let [id (:fork-id context)]
+                           (when-let [previous (get m id)]
+                             (when-not (identical? previous context)
+                               (throw (ex-info "Shutdown context identity changed"
+                                               {:type ::shutdown-context-changed :fork-id id}))))
+                           (assoc m id context)))
+                       retained (concat [root execution-context] (map :ctx rooms)))))
+      (doseq [room rooms]
+        (close-room! room {:close-context? false}))
+      (when-let [remaining (seq (rreg/list-rooms))]
+        (throw (ex-info "Rooms were registered while shutdown was draining"
+                        {:type ::shutdown-not-quiescent
+                         :room-ids (mapv :id remaining)})))
+      {:receipt receipt
+       :contexts (conj (vec (remove #(identical? root %) (vals @receipt))) root)})))
+
+(defn close-shutdown-contexts!
+  "Finish an owned host shutdown plan after stores are released. Children go
+   first, owning root executor last; acknowledge only successful physical close.
+   The receipt is a host atom captured before closure, so root acknowledgement
+   needs no access to an already closed ExecutionContext."
+  [{:keys [contexts receipt]}]
+  (doseq [execution-context contexts]
+    (ctx/close-context! execution-context)
+    (swap! receipt
+           #(if (identical? execution-context (get % (:fork-id execution-context)))
+              (dissoc % (:fork-id execution-context)) %)))
   nil)
 
 ;; ============================================================================
@@ -1324,6 +1455,7 @@
           :or {isolation :none clone-participants? true}}]
    (with-room-lock room
      (ensure-room-work-admitted! room :fork-room)
+     (preparation/assert-quiescent! room)
      (let [short-uuid (subs (str (random-uuid)) 0 8)
            new-slug   (str (:slug room) "/fork-" short-uuid)
          ;; Use the canonical slug→id encoding so id ↔ slug stay in
@@ -1387,6 +1519,7 @@
                                   fork-store
                                   ;; a fork's own settlement is not its child's
                                   (atom (assoc (dissoc @(:meta room) :dvergr/owned-listeners
+                                                       preparation/leases-key
                                                        ::settlement-claim ::settled)
                                                :forked-from (:id room)
                                                ;; the durable room whose grants
@@ -1609,9 +1742,8 @@
                 ;; No worker may retain a capability into a substrate once
                 ;; ownership moves. Listener drain atomically installs the Room
                 ;; fence and closes Run admission at one lifecycle frontier.
-                (vreset! listeners* (drain-room-listeners! fork :transfer))
-                (vreset! fence-token*
-                         (get-in @(:meta fork) [fork-transfer-state-key :token]))
+                (vreset! listeners* (drain-room-listeners! fork :transfer #(vreset! fence-token* %)))
+                (preparation/drain-room! fork)
                 (try
                   (vreset! work-fence-token* (sandbox-work/close-room-work! fork))
                   (catch Throwable error
@@ -2114,14 +2246,21 @@
   (let [token (Object.)
         free? (fn [m]
                 (let [held (::settlement-claim m)]
-                  (or (nil? held)
-                      (and (= settlement (:settlement held)) (not (:active? held))
-                           (not (::settled m))))))
+                  (and (not= :close (get-in m [fork-transfer-state-key :operation]))
+                       (or (nil? held)
+                           (and (= settlement (:settlement held)) (not (:active? held))
+                                (not (::settled m)))))))
         [old _] (swap-vals! (:meta fork)
                             #(if (free? %)
                                (assoc % ::settlement-claim {:settlement settlement :token token :active? true})
                                %))]
-    (if (free? old) token (::settlement-claim old))))
+    (if (free? old)
+      token
+      (or (::settlement-claim old)
+          (throw (ex-info "Room is fenced for physical close"
+                          {:type ::room-lifecycle-in-progress
+                           :fork/id (:id fork) :operation :settlement
+                           :fork/transfer-state (get old fork-transfer-state-key)}))))))
 
 (defn- end-settlement!
   "End the attempt holding `token`: completed, or failed — then its claim is
@@ -2218,6 +2357,7 @@
               (let [callbacks (drain-room-listeners! fork :discard)
                     work-fence-token* (volatile! nil)]
                 (try
+                  (preparation/drain-room! fork)
                   (try
                     (vreset! work-fence-token* (sandbox-work/close-room-work! fork))
                     (catch Throwable error
@@ -2344,6 +2484,7 @@
          (let [callbacks (drain-room-listeners! fork :merge)
                work-fence-token* (volatile! nil)]
            (try
+             (preparation/drain-room! fork)
              (try
                (vreset! work-fence-token* (sandbox-work/close-room-work! fork))
                (catch Throwable error
@@ -2561,6 +2702,24 @@
 ;; Theory of Mind — fork + ask + discard
 ;; ============================================================================
 
+(defn- speculative-extent [room f]
+  (binding [ec/*execution-context* (:ctx room)]
+    ;; Preserve the ordinary public Spin shape. Like other ordinary Spins,
+    ;; awaiting it again before completion can re-enter its body; each such
+    ;; evaluation owns its own native extent, not a shared future.
+    (sp/spin
+     (sp/await
+      (blocking/blocking
+       (fn []
+       ;; Resolve only on the native bridge: program depends on discourse, and
+       ;; a cold facade load must never compile on the reactive engine.
+         ((requiring-resolve 'dvergr.agent.program/on-worker!)
+          room nil
+          (fn []
+            (let [fork (fork-room room)]
+              (try (f fork)
+                   (finally (discard fork))))))))))))
+
 (defn simulate-reply
   "Fork the room, ask `other-id` a hypothetical message, capture their reply,
    discard the fork. Parent room untouched. The operational ToM primitive
@@ -2570,20 +2729,23 @@
    e.g. inside an iterative-refinement step a participant can simulate the
    critic's response before committing."
   [room other-id hypothetical-msg]
-  (sp/spin
-   (let [fork  (fork-room room)
-         reply (sp/await (ask fork other-id hypothetical-msg))]
-     (discard fork)
-     reply)))
+  (speculative-extent
+   room
+   (fn [fork]
+     (let [task (ask fork other-id hypothetical-msg)]
+       ;; Deref is a native host boundary here, never inside a Spin. Explicit
+       ;; cancellation also unwinds ask's transient subscription on interruption.
+       (try @task
+            (finally (cleanup-owned-spin! fork task)))))))
 
 (defn imagine-conversation
   "Fork, run a workflow function (Room → Spin) in the fork, capture the
    imagined log, discard. Returns Spin yielding
      {:outcome any :imagined-log [Message]}."
   [room workflow-fn]
-  (sp/spin
-   (let [fork    (fork-room room)
-         outcome (sp/await (workflow-fn fork))
-         log     (log fork)]
-     (discard fork)
-     {:outcome outcome :imagined-log log})))
+  (speculative-extent
+   room
+   (fn [fork]
+     (let [task (workflow-fn fork)]
+       (try {:outcome @task :imagined-log (log fork)}
+            (finally (cleanup-owned-spin! fork task)))))))
