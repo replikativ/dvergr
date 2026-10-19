@@ -44,6 +44,9 @@ jobs:
       - run:
           name: Download dependencies
           command: |
+            # Immutable Git dependencies can require Java interface preparation.
+            # Cache the prepared gitlibs as well as the downloaded dependencies.
+            clojure -X:deps prep
             clojure -P -M:test
             clojure -P -M:cli
             clojure -P -T:build

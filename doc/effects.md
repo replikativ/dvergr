@@ -180,9 +180,11 @@ gate of its capability rather than per call site.
   `dvergr.rooms.files/write!`) is a `:git/commit` effect, decided before anything is written,
   under the room world's handlers (`files/host-boundary`). Inside it each path passes
   `workspace-write!` or `workspace-delete!` with `:expect` set to what the batch's snapshot saw,
-  so a file changed underneath fails the batch. On failure the batch's own changes are undone;
+  so a file changed underneath fails the batch. On prepublication failure the batch's own changes are undone;
   a path another writer changed meanwhile is left as they made it and named in the error's
-  `:conflicted`.
+  `:conflicted`. A host `:publication` uses an atomic durable commit/receipt: after
+  dispatch, uncertain results are recovered by exact scoped identity, never undone
+  or automatically replayed. Repeated outer effect forwarding is memoized per batch.
 - **Databases**: the tools' transacts (`task_create`, `task_update`, `knowledge_add`) are
   `:db/transact`, as the sandbox's `datahike.api/transact` is.
 - **The global registry**: actor rows and a prompt (`dvergr.actors/*`, `update_agent_profile`)
