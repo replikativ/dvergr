@@ -2662,9 +2662,10 @@
           (is (= {} (budget/spend-by-role room r))))
         (is @returned?))
       (testing "a ledger read that fails is not an empty wallet"
-        (with-redefs [kontor.resource/balance (fn [& _] (throw (ex-info "ledger unavailable" {})))]
+        (let [broken (reify room-store/PResourceReadView
+                       (-resource-read-view [_] (throw (ex-info "ledger unavailable" {}))))]
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ledger unavailable"
-                                (budget/spend-by-role room r)))))
+                                (budget/spend-by-role (assoc room :store broken) r)))))
       (finally
         (doseq [id [c r]] (run/finish! id :completed))
         (close-resource-test-room! room conn)))))

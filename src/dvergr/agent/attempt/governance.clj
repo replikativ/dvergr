@@ -5,7 +5,8 @@
    fully-resolved datoms. It prevents raw transactions, imports, and remote
    writers from mutating certification after the trusted transaction function
    creates it."
-  (:require [datahike.api :as d]))
+  (:require [datahike.api :as d]
+            [dvergr.room.store.governance :as governance]))
 
 (def ^:private attempt-required
   #{:attempt/id :attempt/chat :attempt/run :attempt/content-id
@@ -362,30 +363,8 @@
                      :summary/id (:scorecard.summary/id after)})))))
     report))
 
-(defonce ^:private installed (atom {}))
-
 (defn govern!
   "Compose certified Attempt/Scorecard validation with the store predicate."
   [conn]
-  (let [store-id (get-in @conn [:config :store :id])
-        tx-pred-for (requiring-resolve 'datahike.tx-preds/tx-pred-for)
-        register! (requiring-resolve 'datahike.tx-preds/register-tx-pred!)
-        current (tx-pred-for store-id)
-        entry (get @installed store-id)
-        {:keys [base composed]} entry]
-    (cond
-      (and entry (= current composed)) nil
-
-      ;; An idempotent subsystem install may re-register the same base
-      ;; predicate. Restore the existing composite identity rather than nesting
-      ;; or allocating a new closure.
-      (and entry composed (= current base))
-      (register! store-id composed)
-
-      :else
-      (let [composed' (fn [report]
-                        (when current (current report))
-                        (validate-report report))]
-        (swap! installed assoc store-id {:base current :composed composed'})
-        (register! store-id composed')))
-    store-id))
+  (governance/compose! conn ::attempt validate-report)
+  (get-in @conn [:config :store :id]))

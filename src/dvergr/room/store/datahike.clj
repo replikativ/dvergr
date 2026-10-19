@@ -16,6 +16,7 @@
             [dvergr.chat.schema :as schema]
             [dvergr.chat.persist :as persist]
             [dvergr.room.store :as store]
+            [dvergr.resource.ledger :as resource-ledger]
             [kontor.gate :as kontor-gate]
             [kontor.resource :as resource]
             [hasch.core :as hasch]
@@ -1569,7 +1570,7 @@
   store/PResourceStore
 
   (-open-resource-wallet! [_ spec]
-    (resource/open-account! conn spec))
+    (resource-ledger/open-account! conn spec))
 
   (-install-resource-unit! [_ spec]
     (resource/install-unit! conn spec))
@@ -1578,13 +1579,14 @@
     (if-let [existing (resource/receipt conn (:id transfer-spec))]
       ;; Let Kontor compare the complete semantic command so an id collision is
       ;; never mistaken for a successful replay.
-      (resource/transfer! conn transfer-spec)
+      (do (resource-ledger/assert-wallet! conn wallet-spec)
+          (resource/transfer! conn transfer-spec))
       (try
         (let [guard [[:db.fn/call assert-run-allocation-live
                       wallet-spec transfer-spec]]
               tx-data (into guard
                             (concat
-                             (resource/open-account-tx-data wallet-spec)
+                             (resource-ledger/account-tx-data wallet-spec)
                              (resource/transfer-tx-data transfer-spec)))]
           (kontor-gate/transact-with-validation conn tx-data))
         (assoc (resource/receipt conn (:id transfer-spec)) :status :committed)
@@ -1592,7 +1594,8 @@
           ;; Resolve the only benign race: another identical allocator may
           ;; have committed between the optimistic receipt read and this write.
           (if (resource/receipt conn (:id transfer-spec))
-            (resource/transfer! conn transfer-spec)
+            (do (resource-ledger/assert-wallet! conn wallet-spec)
+                (resource/transfer! conn transfer-spec))
             (throw error))))))
 
   (-resource-balance [_ account]
@@ -1603,6 +1606,10 @@
 
   (-resource-receipt [_ transfer-id]
     (resource/receipt conn transfer-id)))
+
+(extend-type DatahikeStore
+  store/PResourceReadView
+  (-resource-read-view [{:keys [conn]}] (resource-ledger/read-view conn)))
 
 (extend-protocol store/PFactFeed
   DatahikeStore
@@ -1685,5 +1692,7 @@
    (make conn (artifact/datahike-store conn)))
   ([conn artifacts]
    (schema/ensure-full-schema! conn)
+   (resource-ledger/ensure-schema! conn)
    (attempt-governance/govern! conn)
+   (resource-ledger/govern! conn)
    (->DatahikeStore conn artifacts)))

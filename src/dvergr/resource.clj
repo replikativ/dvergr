@@ -136,6 +136,7 @@
        :receipt (store/-allocate-resource-wallet!
                  resource-store
                  {:id (run-wallet-id run-id)
+                  :purpose :run
                   :owner [:run/id run-id]
                   :name (str "Run " run-id)}
                  transfer)})))
@@ -482,7 +483,7 @@
         reservation (stable-id [:dvergr/reservation id])]
     ;; an empty reservation left by a crash before the grant holds nothing
     (store/-open-resource-wallet! (resource-store! room)
-                                  {:id reservation :name (str "dispatch " id)})
+                                  {:id reservation :purpose :reservation :name (str "dispatch " id)})
     (store/-transfer-resources! (resource-store! room)
                                 {:id (stable-id [:dvergr/reserve id]) :kind :grant
                                  :source (kontor/account-ref wallet)
@@ -531,7 +532,7 @@
         hold (hold-wallet-id (:wallet payer))]
     (when (pos? cost)
       (store/-open-resource-wallet! (resource-store! (:room payer))
-                                    {:id hold :name (str "hold " (:wallet payer))})
+                                    {:id hold :purpose :hold :name (str "hold " (:wallet payer))})
       (move! payer wallet :grant (stable-id [:dvergr/hold id]) (kontor/account-ref hold) cost))
     (move! payer wallet :return (stable-id [:dvergr/release id])
            (kontor/account-ref (:wallet payer)) (- amount cost))))
