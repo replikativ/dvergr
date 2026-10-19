@@ -88,6 +88,23 @@ in dvergr. The CLI path is compatibility isolation, not delegation of the agent
 runtime to Codex. Dvergr does not switch paths automatically: replaying a request
 after streaming or a tool call has begun could duplicate effects.
 
+The native Codex subscription and Claude Code transports accept user message
+content as an ordered vector of `{:type "text" :text "…"}` and
+`{:type "image_url" :image_url {:url "data:image/png;base64,…"}}` parts.
+Codex sends native Responses image parts; Claude uses one structured stdin
+message with its existing native-tool restrictions unchanged. Inline PNG,
+JPEG, WebP and GIF data is accepted, with at most sixteen images and 20 MiB of
+encoded image URLs per message. This path never fetches URLs or reads local
+image paths. The Codex CLI compatibility transport remains text-only. Image
+input does not grant computer-control tools or permissions.
+
+Local Whisper uses `DVERGR_WHISPER_PYTHON` when configured, otherwise `python3`
+on the server's PATH. Install faster-whisper in that interpreter's environment,
+not merely in an interactive shell environment. Trusted host callers can bind
+`dvergr.audio.stt/*python-executable*` for an individual call. The existing
+`DVERGR_WHISPER_SCRIPT` and `DVERGR_WHISPER_MODEL` settings select the script
+and model; no interpreter is installed automatically.
+
 Never copy `auth.json` into a project or container image. Dvergr injects its
 tokens only after validating the exact `https://chatgpt.com` origin, refreshes
 expiring tokens in the host process, and persists rotations back to the auth

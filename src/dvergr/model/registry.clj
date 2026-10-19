@@ -160,7 +160,7 @@
     :name "Claude Sonnet 5.5 (Code CLI)"
     :provider :claude-code
     :api-type :claude-code-cli
-    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :capabilities #{:tools :vision :system-prompt :thinking :streaming}
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}  ;; subscription-based
@@ -172,7 +172,7 @@
     :name "Claude Opus 5.5 (Code CLI)"
     :provider :claude-code
     :api-type :claude-code-cli
-    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :capabilities #{:tools :vision :system-prompt :thinking :streaming}
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}
@@ -184,7 +184,7 @@
     :name "Claude Haiku 5.5 (Code CLI)"
     :provider :claude-code
     :api-type :claude-code-cli
-    :capabilities #{:tools :system-prompt :streaming}
+    :capabilities #{:tools :vision :system-prompt :streaming}
     :context 200000
     :max-output 32000
     :pricing {:input 0 :output 0}
@@ -356,7 +356,7 @@
     :name "Codex GPT-5.6 Sol (subscription default)"
     :provider :codex-subscription
     :api-type :openai-responses
-    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :capabilities #{:tools :vision :system-prompt :thinking :streaming}
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
@@ -368,7 +368,7 @@
     :name "Codex GPT-5.6 Sol (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
-    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :capabilities #{:tools :vision :system-prompt :thinking :streaming}
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
@@ -380,7 +380,7 @@
     :name "Codex GPT-5.6 Terra (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
-    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :capabilities #{:tools :vision :system-prompt :thinking :streaming}
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
@@ -392,7 +392,7 @@
     :name "Codex GPT-5.6 Luna (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
-    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :capabilities #{:tools :vision :system-prompt :thinking :streaming}
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
@@ -404,7 +404,7 @@
     :name "Codex GPT-6.1 Sol (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
-    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :capabilities #{:tools :vision :system-prompt :thinking :streaming}
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
@@ -416,7 +416,7 @@
     :name "Codex GPT-6 Luna (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
-    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :capabilities #{:tools :vision :system-prompt :thinking :streaming}
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}
@@ -428,7 +428,7 @@
     :name "Codex GPT-6 Astra (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
-    :capabilities #{:tools :system-prompt :thinking :streaming}
+    :capabilities #{:tools :vision :system-prompt :thinking :streaming}
     :context 272000
     :max-output 128000
     :pricing {:input 0 :output 0}

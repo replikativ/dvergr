@@ -1,7 +1,7 @@
 (ns dvergr.model.reservation-test
   "A funded model dispatch reserves a bound of its cost before it leaves and
    is settled once (doc/design/runs-as-worlds.md, Budgets as a tree)."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as dh]
             [dvergr.agent.run :as run]
             [dvergr.chat.schema :as schema]
@@ -22,6 +22,20 @@
             [kontor.resource]
             [dvergr.room.store.datahike :as datahike-store])
   (:import [java.io ByteArrayInputStream IOException]))
+
+(use-fixtures :each
+  (fn [f]
+    ;; Funded dispatch tests mock provider initialization, but still need the
+    ;; shipped model identities and prices. Keep the registry and its lazy-load
+    ;; flag together so neither this fixture nor an earlier test seeds the other.
+    (with-redefs-fn {#'registry/registry (atom registry/default-models)
+                     #'registry/aliases (atom @registry/aliases)
+                     #'registry/defaults (atom @registry/defaults)
+                     #'registry/models-loaded? (atom false)}
+      #(do
+         (registry/load-models-resource!)
+         (reset! @#'registry/models-loaded? true)
+         (f)))))
 
 (defn- with-funded-run
   "A Run whose allocation carries `dispatches` admissions and `md`

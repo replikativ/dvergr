@@ -10,6 +10,13 @@
 
 (def audio {:bytes (byte-array 10) :mime "audio/wav"})
 
+(deftest local-whisper-can-use-an-explicit-host-interpreter
+  (let [command (atom nil)]
+    (with-redefs [shell/sh (fn [& args] (reset! command args) {:exit 0 :out "test speech"})]
+      (binding [stt/*python-executable* "/opt/simmis-python/bin/python3"]
+        (is (= "test speech" (#'stt/transcribe-local (byte-array 10) "wav")))
+        (is (= "/opt/simmis-python/bin/python3" (first @command)))))))
+
 (defn- failure [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (ex-data e))))
 

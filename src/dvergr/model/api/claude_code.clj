@@ -27,6 +27,7 @@
             [dvergr.principal :as principal]
             [hasch.core :as hasch]
             [dvergr.model.cli-process :as cli-process]
+            [dvergr.model.image-content :as image-content]
             [jsonista.core :as json]
             [clojure.string :as str]
             [taoensso.telemere :as tel])
@@ -239,6 +240,38 @@
                                        "\">\n" content "\n</tool_result>")
                     (str (str/capitalize (name role)) ": " content))))
            (str/join "\n\n")))))
+
+(defn- image-input?
+  [messages]
+  (boolean (some #(vector? (:content %)) messages)))
+
+(defn- format-image-input
+  "One CLI turn, preserving ordered images without granting native tools."
+  [messages]
+  (doseq [{:keys [role content]} messages]
+    (when-not (or (nil? content) (string? content)
+                  (and (= "user" (name role)) (vector? content)))
+      (throw (ex-info "Inline content requires a user message containing image/text parts"
+                      {:type ::invalid-image-role}))))
+  (str (json/write-value-as-string
+        {:type "user"
+         :message {:role "user"
+                   :content
+                   (vec (mapcat
+                         (fn [{:keys [role content] :as message}]
+                           (when-not (= "system" (name role))
+                             (if (vector? content)
+                               (do (when-not (= "user" (name role))
+                                     (throw (ex-info "Inline images require a user message"
+                                                     {:type ::invalid-image-role})))
+                                   (into [{:type "text" :text "Human:\n"}]
+                                         (image-content/anthropic content)))
+                               [{:type "text"
+                                 :text (str "\n" (name role) " "
+                                            (or (:tool-use-id message) (:tool_call_id message) "")
+                                            ":\n" content "\n")}])))
+                         messages))}})
+       "\n"))
 
 (defn- extract-system-prompt
   "Extract system prompt from messages or opts."
@@ -611,6 +644,7 @@
       (not agent) (conj "--safe-mode")
       agent (into ["--allowedTools" (str/join " " (:allowed agent))])
       system (into ["--system-prompt" system])
+      (:image-input? opts) (into ["--input-format" "stream-json"])
       effort (into ["--effort" effort]))))
 
 ;; ============================================================================
@@ -733,7 +767,8 @@
                                             :stage stage
                                             :elapsed-ms (/ (- (System/nanoTime) started-nanos) 1000000.0)} data)})
                    (catch Throwable _ nil)))
-        prompt (format-conversation messages)
+        images? (image-input? messages)
+        prompt (if images? (format-image-input messages) (format-conversation messages))
         system-prompt (extract-system-prompt messages opts)
         ;; otherwise the tool definitions go into the system prompt as text
         tools (when-not agent (:tools opts))
@@ -742,6 +777,7 @@
         effective-system (some->> [system-prompt tools-prompt (when note (str "\n\n" note))]
                                   (remove nil?) seq (apply str) not-empty)
         opts-with-system (cond-> opts
+                           images? (assoc :image-input? true)
                            effective-system (assoc :system effective-system)
                            agent (assoc :agent agent))
         cmd (build-command opts-with-system)

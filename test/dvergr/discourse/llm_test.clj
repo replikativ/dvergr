@@ -1298,44 +1298,73 @@
       (finally
         (d/close-room! r)))))
 
+(defn- with-isolated-model-registry [f]
+  ;; Lazy loading updates these together; restoring only model definitions can
+  ;; leave a true loaded flag attached to an earlier, cold registry.
+  (with-redefs-fn {#'model-registry/registry (atom @model-registry/registry)
+                   #'model-registry/aliases (atom @model-registry/aliases)
+                   #'model-registry/defaults (atom @model-registry/defaults)
+                   #'model-registry/models-loaded? (atom @@#'model-registry/models-loaded?)
+                   #'model-providers/providers (atom @model-providers/providers)}
+    f))
+
 (deftest inferred-provider-reaches-the-default-formatter
-  (let [r (d/room :provider-formatter-room)
-        model-id "formatter-inference-test-model"
-        formatted (atom [])
-        calls (atom [])
-        original-models @model-registry/registry
-        original-providers @model-providers/providers
-        formatter (reify model-provider/MessageFormatter
-                    (format-messages [_ messages model]
-                      (swap! formatted conj {:messages messages :model model})
-                      messages))]
-    (try
-      (model-registry/register-model!
-       {:id model-id :provider :inferred-test-provider})
-      (model-providers/register! :inferred-test-provider formatter)
-      (with-redefs [model-chat/chat
-                    (fn [messages opts]
-                      (swap! calls conj {:messages messages :opts opts})
-                      {:content "formatted"
-                       :tool-calls []
-                       :usage {:input-tokens 1 :output-tokens 1}
-                       :stop-reason :end-turn})]
-        (binding [ec/*execution-context* (:ctx r)]
-          (d/join r (llm/llm-agent
-                     {:id :formatter-worker
-                      :spec {:model model-id}
-                      :tools {}})))
-        (is (= "formatted"
-               (:content
-                (await-spin r #(d/ask % :formatter-worker {:content "go"})
-                            10000))))
-        (is (= model-id (:model (first @formatted))))
-        (is (= {:provider :inferred-test-provider :model model-id}
-               (select-keys (:opts (first @calls)) [:provider :model]))))
-      (finally
-        (reset! model-registry/registry original-models)
-        (reset! model-providers/providers original-providers)
-        (d/close-room! r)))))
+  (with-isolated-model-registry
+    (fn []
+      (let [r (d/room :provider-formatter-room)
+            model-id "formatter-inference-test-model"
+            formatted (atom [])
+            calls (atom [])
+            formatter (reify model-provider/MessageFormatter
+                        (format-messages [_ messages model]
+                          (swap! formatted conj {:messages messages :model model})
+                          messages))]
+        (try
+          (model-registry/register-model!
+           {:id model-id :provider :inferred-test-provider})
+          (model-providers/register! :inferred-test-provider formatter)
+          (with-redefs [model-chat/chat
+                        (fn [messages opts]
+                          (swap! calls conj {:messages messages :opts opts})
+                          {:content "formatted"
+                           :tool-calls []
+                           :usage {:input-tokens 1 :output-tokens 1}
+                           :stop-reason :end-turn})]
+            (binding [ec/*execution-context* (:ctx r)]
+              (d/join r (llm/llm-agent
+                         {:id :formatter-worker
+                          :spec {:model model-id}
+                          :tools {}})))
+            (is (= "formatted"
+                   (:content
+                    (await-spin r #(d/ask % :formatter-worker {:content "go"})
+                                10000))))
+            (is (= model-id (:model (first @formatted))))
+            (is (= {:provider :inferred-test-provider :model model-id}
+                   (select-keys (:opts (first @calls)) [:provider :model]))))
+          (finally
+            (d/close-room! r)))))))
+
+(deftest isolated-formatter-scope-preserves-a-cold-model-registry
+  (with-redefs-fn {#'model-registry/registry (atom model-registry/default-models)
+                   #'model-registry/aliases (atom {})
+                   #'model-registry/defaults (atom {})
+                   #'model-registry/models-loaded? (atom false)
+                   #'model-providers/providers (atom {})}
+    #(let [fireworks-model "accounts/fireworks/models/kimi-k2p5"]
+       (with-isolated-model-registry
+         (fn []
+           (model-registry/ensure-models-loaded!)
+           (is (true? @@#'model-registry/models-loaded?))
+           (is (some? (model-registry/get-model fireworks-model)))))
+       (is (false? @@#'model-registry/models-loaded?)
+           "The outer lazy-load flag is restored with its model registry")
+       (is (= model-registry/default-models @model-registry/registry))
+       (is (empty? @model-registry/aliases))
+       (is (empty? @model-registry/defaults))
+       (model-registry/ensure-models-loaded!)
+       (is (some? (model-registry/get-model fireworks-model))
+           "Lazy model loading still works after the isolated scope"))))
 
 (deftest fork-snapshots-the-latest-switched-spec
   (let [parent (d/room :switched-fork-parent)
