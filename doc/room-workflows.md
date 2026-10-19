@@ -181,6 +181,12 @@ environment's metadata; `calibration.edn` names the case whose gold it scores ag
 (`:case`). `examples/workflows/contract-review/` is one: eight CUAD contracts
 (`dev/cuad_bundle.py` builds more).
 
+Forked rooms retain schedule definitions as data but do not start real-time
+scheduler handles or fire inherited schedules, including direct calls to
+`dvergr.rooms.scheduler/fire-due!`. The canonical `:forked-from` marker is
+present before registration hooks; the later Run-world tag is not required.
+This is fork containment, not an explicit simulated-clock execution capability.
+
 `catalog_deploy {room name agent every on? at? params?}` schedules the bundle's task for an
 agent of the room (the Scorecard's pick); the room's REPL lists and cancels it
 (`dvergr.scheduler/list`, `cancel`).
