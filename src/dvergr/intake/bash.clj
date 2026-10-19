@@ -238,7 +238,7 @@
    Callers can still pass `:workspace` explicitly to `make-host` to
    override this."
   []
-  (or (try (geschichte/current-workspace) (catch Throwable _ nil))
+  (or (geschichte/optional-workspace)
       ;; Never use the daemon source checkout as a fallback.
       (dgit/safe-workspace-root)))
 

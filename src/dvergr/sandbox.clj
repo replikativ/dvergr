@@ -1203,11 +1203,9 @@
         workspace-resolver
         (fn []
           (binding [rtc/*execution-context* (runtime-ctx/selected-context spindel-ctx)]
-            (try ((requiring-resolve 'dvergr.substrate.geschichte/current-workspace))
-                 (catch Throwable _ nil))))
+            ((requiring-resolve 'dvergr.substrate.geschichte/optional-workspace))))
         workspace  (binding [rtc/*execution-context* spindel-ctx]
-                     (try ((requiring-resolve 'dvergr.substrate.geschichte/current-workspace))
-                          (catch Throwable _ nil)))
+                     ((requiring-resolve 'dvergr.substrate.geschichte/optional-workspace)))
         filesystem (when workspace
                      ((requiring-resolve 'dvergr.substrate.geschichte/filesystem)
                       workspace))

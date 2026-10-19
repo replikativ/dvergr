@@ -81,6 +81,20 @@ This resolver is not permission to publish: callers must still check the human's
 current permissions, the full retained target identity and expected file state
 at each publication effect.
 
+Execution selection is separate from that registry resolver. A trusted host
+can call `dvergr.substrate.geschichte/select-workspace!` with the exact runtime
+system name in the **Run world's** context before constructing its tools.
+The portable selection is context-owned computation state, not a connection,
+permission grant or global default. Workspace/file/sandbox resolution then
+requires that exact registered Geschichte system; a missing, ambiguous or
+malformed selection throws instead of switching to another repository or a
+native fallback. Only unselected legacy callers retain their prior fallback.
+Following forks follow untouched computation state; writing the selection in
+the Run context pins that choice locally. Frozen forks snapshot it. Nested
+forks inherit it, while substrate merges publish system changes, not the
+child's computation selection. Review diffs resolve the parent's counterpart
+by the child's exact system identity, not by the parent's current selection.
+
 ### Shared, durable: the system DB
 
 One Datahike DB per home (`dvergr.system.db`), not per room and not forked:

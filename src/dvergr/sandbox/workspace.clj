@@ -22,8 +22,7 @@
 (defn- current-virtual-workspace
   "Virtual Geschichte workspace registered in the bound execution context."
   []
-  (try ((requiring-resolve 'dvergr.substrate.geschichte/current-workspace))
-       (catch Throwable _ nil)))
+  ((requiring-resolve 'dvergr.substrate.geschichte/optional-workspace)))
 
 (defn room-workspace-root
   "The workspace root of the bound ROOM (or fork), or nil when none is in scope:
