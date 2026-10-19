@@ -49,6 +49,9 @@
 (def max-file-bytes "The largest file one `room_write` writes." (* 8 1024 1024))
 (def max-batch-bytes "What one `room_write` writes in all." (* 16 1024 1024))
 (def max-batch-files "How many paths one `room_write` names." 200)
+(def write-capabilities
+  "Host embedding contracts supported by the canonical batch writer."
+  #{:expected-worktree :applied-receipt :file-modes})
 
 ;; ---------------------------------------------------------------------------
 ;; Paths and the workspace
@@ -354,6 +357,21 @@
   (effects/boundary-resolver nil sink {:world #(effects/world-handlers (:ctx room))
                                        :world-sink #(effects/world-sink (:ctx room))}))
 
+(defn- opened-worktree!
+  [paths opts]
+  (when (contains? opts :expected-worktree)
+    (let [expected (:expected-worktree opts)]
+      (when-not (and (map? expected) (= (set paths) (set (keys expected)))
+                     (every? (fn [[path entry]]
+                               (and (string? path)
+                                    (or (nil? entry)
+                                        (and (map? entry) (= #{:content :size :mode} (set (keys entry)))
+                                             (uuid? (:content entry))
+                                             (integer? (:size entry)) (<= 0 (:size entry))
+                                             (integer? (:mode entry)))))) expected))
+        (refuse "expected-worktree must describe exactly the batch's absolute paths" {}))
+      expected)))
+
 (defn write!
   "Write `files` (`{path content}`; content `{:text …}`, `{:base64 …}`, or nil
    to remove the file) into `room`'s workspace and commit exactly those paths
@@ -362,12 +380,21 @@
    removal is an effect too. Every path is checked first, and the index may
    hold nothing staged (`git add` without a commit). Each write and removal
    is a compare-and-write against the batch's snapshot (`:expect`), so a file
-   changed underneath fails the batch. When any step fails, the batch's
+   changed underneath fails the batch. When a prepublication step fails, the batch's
    changes are undone (`restore!`; what could not be put back is reported as
-   `:conflicted`) and nothing is committed. Returns `{:commit
-   :message :written [{:path :size :content-id}] :removed [path]}`;
-   `:commit` is nil when the files already were as given."
-  [room files {:keys [message boundary]}]
+   `:conflicted`) and nothing is committed. Returns `{:commit :applied?
+   :message :written [{:path :size :content-id :entry}] :removed [path]}`;
+   `:commit` is nil when the files already were as given. `:applied?` is true
+   only when the physical batch executor ran; an intercepting handler's answer
+   is not proof of publication. Written entries are immutable staged metadata.
+   Optional `:file-modes` maps absolute written paths to 33188 or 33261.
+
+   Optional `:expected-worktree` maps EVERY absolute batch path to the
+   worktree entry the caller opened (`{:content uuid :size n :mode n}`), or
+   nil for absent. Compared with the SAME snapshot used by compare-and-write,
+   before any effect/write. A stale opened version refuses the whole batch;
+   omission retains the ordinary unconditional client-write behavior."
+  [room files {:keys [message boundary file-modes] :as opts}]
   (let [entries (plan files)
         {:keys [conn] :as ws} (workspace! room)
         system-id (binding [ec/*execution-context* (:ctx room)]
@@ -382,6 +409,11 @@
         ;; `:workspace`: the gate's compare-and-write needs the repository
         ctx {:filesystem fs :workspace ws :system-id system-id :cwd "/" :effect-boundary boundary}
         paths (mapv first entries)
+        opened (opened-worktree! paths opts)
+        _ (when (and (contains? opts :file-modes)
+                     (not (and (map? file-modes)
+                               (every? (fn [[p mode]] (and (some #{p} paths) (#{33188 33261} mode))) file-modes))))
+            (refuse "file-modes names batch paths and regular file modes only" {}))
         message (or (not-empty (some-> message str str/trim))
                     (str "Write " (if (= 1 (count paths)) (rel (first paths)) (str (count paths) " files"))))
         expected (into {} (for [[p c] entries] [p (when (bytes? c) (str (blob/blob-id c)))]))]
@@ -397,39 +429,54 @@
                           {:type ::staged-changes :staged (vec staged)}))))
       (let [worktree (repo/worktree conn)
             before (into {} (keep (fn [p] (when-let [e (get worktree (rel p))] [p e]))) paths)
+            _ (when (and opened
+                         (not= opened (into {} (map (fn [p] [p (get before p)])) paths)))
+                (throw (ex-info "Files changed since they were opened; reload before saving"
+                                {:type ::stale-worktree :paths paths})))
             created (into #{} (comp (mapcat (fn [[p c]] (when (not= ::remove c) (ancestors-of p))))
                                     (remove #(mfs/exists? fs %)))
                           entries)
             touched (atom [])
             removed (atom [])
-            commit (effects/perform!
-                    boundary {:effect :git/commit :resource {:message message :system-id system-id}}
-                    (fn []
-                      (try
-                        (doseq [[p c] entries
+            applied (volatile! nil)
+            _answer (effects/perform!
+                     boundary {:effect :git/commit :resource {:message message :system-id system-id}}
+                     (fn []
+                       (try
+                         (doseq [[p c] entries
                                 ;; compare-and-write: what the snapshot saw, or fail
-                                :let [opts {:expect (some-> (get before p) :content str)}]]
-                          (if (= ::remove c)
-                            (when (tools/workspace-delete! ctx p opts)
-                              (swap! touched conj p)
-                              (swap! removed conj p))
-                            (do (tools/workspace-write! ctx p c opts)
-                                (swap! touched conj p))))
-                        (forks/commit-paths! room expected message)
-                        (catch Throwable e
-                          (let [conflicted (restore! conn before expected @touched created)]
-                            (throw (if (seq conflicted)
-                                     (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
-                                                   (str/join ", " conflicted))
-                                              (assoc (ex-data e) :conflicted conflicted) e)
-                                     e)))))))
+                                 :let [opts (cond-> {:expect (some-> (get before p) :content str)}
+                                              (contains? file-modes p) (assoc :mode (get file-modes p)))]]
+                           (if (= ::remove c)
+                             (when (tools/workspace-delete! ctx p opts)
+                               (swap! touched conj p)
+                               (swap! removed conj p))
+                             (do (tools/workspace-write! ctx p c opts)
+                                 (swap! touched conj p))))
+                         (let [{:keys [commit tree]} (forks/commit-paths! room expected message
+                                                                          {:receipt? true :expected-modes file-modes})
+                               entries (into {} (map (fn [p] [p (get tree (rel p))])) paths)]
+                          ;; Only the forwarded physical write path can produce
+                          ;; this receipt. A handler may answer without forwarding.
+                           (vreset! applied {:commit commit :entries entries})
+                           commit)
+                         (catch Throwable e
+                           (let [conflicted (restore! conn before expected @touched created)]
+                             (throw (if (seq conflicted)
+                                      (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
+                                                    (str/join ", " conflicted))
+                                               (assoc (ex-data e) :conflicted conflicted) e)
+                                      e)))))))
             ;; a directory a removal emptied goes too (git keeps none): a
             ;; later write may put a file in its place
             _ (when (seq @removed)
                 (d/transact conn [[:db.fn/call remove-empty-dirs-tx (vec (distinct (mapcat ancestors-of @removed)))]]))
-            ids (content-ids conn)]
-        {:commit commit
+            receipt @applied]
+        {:commit (when receipt (:commit receipt))
+         :applied? (boolean receipt)
          :message message
-         :written (vec (for [[p c] entries :when (not= ::remove c)]
-                         {:path p :size (size-of c) :content-id (get ids p)}))
+         :written (vec (for [[p c] entries :when (and receipt (not= ::remove c))
+                             :let [entry (get-in receipt [:entries p])]]
+                         {:path p :size (:size entry) :content-id (some-> (:content entry) str)
+                          :entry entry}))
          :removed @removed}))))
