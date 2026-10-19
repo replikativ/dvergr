@@ -5,6 +5,8 @@
             [datahike.api :as dh]
             [dvergr.agent.run :as run]
             [dvergr.chat.schema :as schema]
+            [dvergr.chat.agent :as agent]
+            [dvergr.chat.context :as chat-ctx]
             [dvergr.discourse :as d]
             [dvergr.model.api.openai :as openai]
             [dvergr.model.chat :as chat]
@@ -16,6 +18,7 @@
             [dvergr.model.api.anthropic]
             [dvergr.resource :as resource]
             [dvergr.room.store :as store]
+            [jsonista.core :as json]
             [kontor.resource]
             [dvergr.room.store.datahike :as datahike-store])
   (:import [java.io ByteArrayInputStream IOException]))
@@ -247,6 +250,54 @@
                (is (= (- 10000000M (bigdec (+ (* 100 input) (* 10 output))))
                       (left room run-id))
                    "settled at the usage's price, nothing else kept"))))))))
+
+(deftest a-funded-retired-model-call-reserves-settles-and-charges-the-successor
+  (with-funded-run
+    3M 10000000M
+    (fn [room run-id]
+      (let [ctx (chat-ctx/create-chat-context {:title "funded successor" :with-sci? false})
+            old "accounts/fireworks/models/kimi-k2p5"
+            successor "accounts/fireworks/models/kimi-k3"
+            sent (atom nil)
+            reserved (atom nil)
+            bounded-model (atom nil)
+            bound resource/dispatch-bound
+            sse (str "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"
+                     "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                     "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":0}}\n\n"
+                     "data: [DONE]\n\n")]
+        (try
+          (binding [gateway/*request-fn*
+                    (fn [request]
+                      (reset! sent (:model (json/read-value (:body request) json/keyword-keys-object-mapper)))
+                      (reset! reserved (- 10000000M (left room run-id)))
+                      {:status 200 :body (ByteArrayInputStream. (.getBytes sse "UTF-8"))})]
+            (with-redefs-fn {#'dvergr.model.providers/get-provider!
+                             (constantly (openai/create {:api-key "test" :base-url "https://model.test"}))
+                             #'dvergr.model.providers/ensure-initialized! (constantly nil)
+                             #'resource/dispatch-bound
+                             (fn [model & args]
+                               (reset! bounded-model (:id model))
+                               (apply bound model args))}
+              #(is (= :complete (agent/run-agent-turn! ctx {:provider :fireworks :model old :tools {}
+                                                            :auto-compact? false
+                                                            :model-opts {:max-tokens 100}})))))
+          (is (= successor @sent @bounded-model))
+          (is (< 3000M @reserved) "the successor's bound was reserved before egress")
+          (is (= {resource/model-dispatches 2M resource/microdollars 9997000M}
+                 (resource/run-balance room run-id)) "one admission and one usage charge")
+          (is (= 3000 (:used (chat-ctx/get-budget ctx))
+                 (dvergr.chat.accounting/get-total-cost (:db-conn ctx) (:chat-id ctx))))
+          (is (= #{[successor :input-tokens 3000] [successor :output-tokens 0]}
+                 (set (dh/q '[:find ?model ?resource ?cost :in $ ?chat-id
+                              :where [?c :chat/id ?chat-id] [?l :ledger/context ?c]
+                              [?l :ledger/resource ?resource]
+                              [?l :ledger/model ?model] [?l :ledger/cost-microdollars ?cost]]
+                            @(:db-conn ctx) (:chat-id ctx)))))
+          (is (zero? (get (resource/balance room (kontor.resource/account-ref
+                                                  (resource/hold-wallet-id (resource/run-wallet-id run-id))))
+                          resource/microdollars 0M)) "accounting consumed the settled hold")
+          (finally (chat-ctx/close-chat! ctx)))))))
 
 (deftest anthropic-usage-counts-cached-input-and-is-final-with-the-stop-reason
   (let [p (dvergr.model.api.anthropic/create {:api-key "test"})

@@ -627,7 +627,8 @@
                 (jobs/start! r (job-opts {:kind :workflow})
                              (fn [job-id]
                                (let [{:keys [spin] :as started}
-                                     (workflow/start r (assoc opts :parent-run job-id))]
+                                     (workflow/start r (assoc opts :parent-run job-id
+                                                              :daemon daemon :principal *principal*))]
                                  (deliver finish (:finish started))
                                  spin))
                              ;; The attempts' files, committed in their worlds.
@@ -1089,6 +1090,7 @@
                                                               :evidence (pr-str (:evidence c))})
                                                      (:review/checks rv))
                                        :reviewed_at (str (.toInstant ^java.util.Date (:review/reviewed-at rv)))}
+                                (:review/effective-policy rv) (assoc :effective_policy (:review/effective-policy rv))
                                 (:review/run-id rv) (assoc :run (str (:review/run-id rv)))
                                 (:review/verdict rv) (assoc :verdict (update (:review/verdict rv) :review/verdict name))
                                 (:review/spot-check? rv) (assoc :spot_check true)))
@@ -1369,7 +1371,8 @@
     :impl (fn [daemon {:keys [room] :as args}]
             (when-let [r (resolve-room daemon room)]
               (workflow-result daemon r (:task args)
-                               (workflow/attempt! r (dissoc args :room)))))}
+                               (workflow/attempt! r (select-keys args [:task :attempts :models :budget-dollars
+                                                                       :profile :timeout-ms :parallelism])))))}
 
    :workflow/start
    {:doc (str "Start workflow_attempt as a job and return at once: run a task several times "
@@ -1383,7 +1386,9 @@
     :schema WorkflowArgs
     :impl (fn [daemon {:keys [room] :as args}]
             (when-let [r (resolve-room daemon room)]
-              (start-workflow-job daemon r "workflow/start" (dissoc args :room))))}
+              (start-workflow-job daemon r "workflow/start"
+                                  (select-keys args [:task :attempts :models :budget-dollars
+                                                     :profile :timeout-ms :parallelism]))))}
 
    :catalog/start
    {:doc (str "Run a catalog workflow (catalog_list) as a job, scored by its own checker. "
@@ -1391,7 +1396,11 @@
               "scored against known answers: compare models and prompts. With `room`: on "
               "your room's own files, scored by what can be checked without answers. "
               "Poll job_status; adopt a world with room_merge.")
-    :authz {:action #(if (:room %) :admin :write)} ; a developer Run on the room's files; else a new fixture room
+    :authz {:action #(if (:room %) :admin :write)
+            :also (fn [_ {:keys [workflow]}]
+                    (when-not (get catalog/workflows (keyword workflow))
+                      (when-let [[_ source] (re-find #"^([^/]+)/([^/]+)$" workflow)]
+                        [[:admin [:room source]]])))}
     :kind :write
     :schema [:map
              [:workflow [:string {:description "catalog workflow id, e.g. wiki/v1"}]]
@@ -1402,10 +1411,15 @@
              [:timeout-ms {:optional true} [:int {:description "per attempt (default 10 minutes)"}]]
              [:parallelism {:optional true} [:int {:min 1 :max 8 :description "attempts running at once (default 4)"}]]]
     :impl (fn [daemon {:keys [workflow room] :as args}]
-            (let [wf (catalog/lookup workflow)
-                  benchmark? (nil? room)
-                  r (if room
-                      (resolve-room daemon room)
+            (let [wf (get catalog/workflows (keyword workflow))
+                  [_ source name] (when-not wf (re-find #"^([^/]+)/([^/]+)$" workflow))
+                  source-room (when source (resolve-room daemon source))
+                  bundle (when source-room (in-ctx daemon (room-wf/read-bundle source-room name)))
+                  wf (or wf (when bundle {:id (keyword source name) :title (get-in bundle [:definition :title])})
+                         (catalog/lookup workflow))
+                  benchmark? (and (nil? room) (nil? bundle))
+                  r (if (or room bundle)
+                      (if room (resolve-room daemon room) source-room)
                       (let [slug (str "bench-" (slugify (subs (str (:id wf)) 1)) "-"
                                       (subs (str (random-uuid)) 0 8))]
                         (in-ctx daemon
@@ -1414,12 +1428,11 @@
                                   (created! daemon [:room (id->str (:id r))])
                                   (catalog/seed! r ((get-in wf [:benchmark :fixtures])))
                                   r))))
-                  {:keys [task profile evaluator environment-id]} (catalog/plan wf {:benchmark? benchmark?})]
+                  plan (if bundle (room-wf/plan bundle {}) (catalog/plan wf {:benchmark? benchmark?}))]
               (when r
                 (-> (start-workflow-job daemon r "catalog/start"
-                                        (merge (select-keys args [:attempts :models :budget-dollars :timeout-ms :parallelism])
-                                               {:task task :profile profile :evaluator evaluator
-                                                :environment-id environment-id}))
+                                        (merge plan
+                                               (select-keys args [:attempts :models :budget-dollars :timeout-ms :parallelism])))
                     (assoc :workflow (subs (str (:id wf)) 1)
                            :mode (if benchmark? "benchmark" "room"))))))}
 

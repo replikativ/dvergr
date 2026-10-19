@@ -15,14 +15,20 @@
    Without a verifier of the task's own, an attempt is scored by completion:
    a reviewer chooses by the diff and the bill."
   (:require [clojure.string :as str]
+            [clojure.set :as set]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.evaluators :as evaluators]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.roster :as roster]
+            [dvergr.agent.program :as program]
             [dvergr.model.providers :as providers]
+            [dvergr.principal :as principal]
+            [dvergr.resource :as resource]
+            [dvergr.agent.run :as run]
             [dvergr.model.registry :as registry]
             [dvergr.room.registry :as rreg]
+            [dvergr.room.store :as room-store]
             [dvergr.rooms.forks :as forks]
             [dvergr.tools :as tools]
             [hasch.core :as hasch]
@@ -56,14 +62,32 @@
   (let [id (registry/resolve-alias model)]
     {:provider (:provider (registry/get-model! id)) :model id}))
 
+(defn admit-model!
+  "The same caller admission for candidates and reviewers. Registry aliases
+   are resolved before consulting the caller's model cap and host authorizer."
+  [opts model]
+  (let [policy (model-policy model)
+        caller (:principal opts)]
+    (when caller
+      (when-let [allowed (:principal/models caller)]
+        (when-not (contains? (set (map registry/resolve-alias allowed)) (:model policy))
+          (throw (ex-info "Model outside caller policy" {:model (:model policy)})))))
+    (when (and caller (not (principal/local? caller)))
+      ((requiring-resolve 'dvergr.ops/check!) (:daemon opts) caller
+                                              {:op :workflow/start :action :use :resource [:model (:model policy)]
+                                               :resolved (when-let [room (:room opts)]
+                                                           {:room (if (keyword? room) (subs (str room) 1) (str room))})
+                                               :args {:model (:model policy)}}))
+    policy))
+
 (defn candidates
   "AgentDefs, one per model: `{:team roster :ids [agent-id ...]}`."
-  [{:keys [models budget-dollars profile prompt]}]
+  [{:keys [models budget-dollars profile prompt] :as opts}]
   (let [policies (if (seq models)
-                   (mapv model-policy models)
-                   [(or (providers/default-spec)
-                        (throw (ex-info "No LLM provider is available"
-                                        {:type ::no-provider})))])
+                   (mapv #(admit-model! opts %) models)
+                   [(let [p (or (providers/default-spec)
+                                (throw (ex-info "No LLM provider is available" {:type ::no-provider})))]
+                      (admit-model! opts (:model p)))])
         tool-set (if (= "developer" profile)
                    tools/minimal-coding-tools
                    tools/minimal-readonly-tools)
@@ -92,7 +116,8 @@
    {:id (or environment-id (keyword "workflow" (str "task-" (subs (str (hasch/uuid task)) 0 8))))
     :task task
     :verifier (let [ref (evaluation/evaluator-ref (or evaluator completion-evaluator))]
-                {:id (:verifier/id ref) :version (:verifier/version ref)})
+                (cond-> {:id (:verifier/id ref) :version (:verifier/version ref)}
+                  (:verifier/basis ref) (assoc :basis (:verifier/basis ref))))
     :limits {:timeout-ms (or timeout-ms (* 10 60 1000)) :cancel-timeout-ms 30000
              :on-timeout :verdict}
     :world (cond-> {:isolation :ctx :settlement :review}
@@ -127,6 +152,195 @@
                :state state}
         (seq uncommitted) (assoc :uncommitted uncommitted)))))
 
+(defn- review-fn [name] (requiring-resolve (symbol "dvergr.agent.review" name)))
+
+(defn- authority
+  [room world opts run-id]
+  (let [daemon (or (:daemon opts) {:execution-ctx (:ctx room)})
+        caller (:principal opts)
+        claims (select-keys caller [:principal/delegation :principal/delegation-scope])
+        scoped? (and (:principal/delegation caller) (map? (:principal/delegation-scope caller)))
+        grant-args (when scoped? claims)
+        token (when scoped?
+                (principal/mint-run-token!
+                 {:actor :reviewer :room world
+                  :tools #{"room_merge" "room_discard"}
+                  :claims claims}))
+        delegated (when token (principal/run-token-principal token))
+        choose (fn [op]
+                 (some (fn [p]
+                         (when p
+                           (try
+                             ((requiring-resolve 'dvergr.ops/authorize!) daemon p op (merge {:room world} grant-args))
+                             p (catch Throwable _ nil))))
+                       [caller delegated]))
+        merge-p (choose :room/merge) discard-p (choose :room/discard)]
+    {:merge? (boolean merge-p) :discard? (boolean discard-p)
+     :close #(when token (principal/revoke-run-token! token))
+     :invoke (fn [op args]
+               (program/with-worker-decision!
+                 (fn []
+                   (when (or ((review-fn "decision") room run-id)
+                             (.isInterrupted (Thread/currentThread))
+                             (and (:parent-run opts) (run/cancel-requested? (:parent-run opts))))
+                     (throw (ex-info "Settlement cancelled before decision" {})))
+                   ((requiring-resolve 'dvergr.ops/invoke) daemon
+                                                           (case op :room/merge merge-p :room/discard discard-p nil) op (merge args grant-args)))))}))
+
+(defn effective-policy
+  "Bundle review is a request. The host adds the declared write scope and
+   conflict check; only an authorized principal can request automatic action."
+  [opts auth]
+  (let [spec (merge {:review/on-pass :merge :review/on-fail :escalate} (:review opts))
+        spec (-> spec
+                 (update :review/on-pass #(if (= :merge %) :merge :propose))
+                 (update :review/on-fail #(if (= :discard %) :discard :escalate)))
+        writes (:workflow/writes opts)
+        delegation (:principal/delegation-scope (:principal opts))
+        scoped? (and (:principal/delegation (:principal opts)) (map? delegation))
+        normalize (fn [p]
+                    (when (string? p)
+                      (let [p (str/replace p #"^/+" "")]
+                        (when (and (not (str/blank? p))
+                                   (not-any? #{"." ".."} (str/split p #"/"))) p))))
+        within? (fn [p parent]
+                  (or (= p parent)
+                      (str/starts-with? p (str (str/replace parent #"/+$" "") "/"))))
+        ;; A broad bundle prefix is attenuated to the delegated prefix. Neither
+        ;; a root nor an empty bundle path can grant anything beyond it.
+        paths (vec (distinct
+                    (when scoped?
+                      (for [raw (:repo writes)
+                            :when (string? raw)
+                            grant (:paths delegation)
+                            :let [g (normalize grant) p (normalize raw)]
+                            :when (and g (or (str/blank? (str/replace raw #"^/+" ""))
+                                             (and p (or (within? p g) (within? g p)))))]
+                        (if (and p (within? p g)) p g)))))
+        declared-kb (if (set? (:kb writes))
+                      (zipmap (:kb writes) (repeat #{:wiki/atom :wiki/overview :wiki/index}))
+                      (:kb writes))
+        kb-scope (into {} (when scoped?
+                            (for [[system kinds] declared-kb
+                                  :let [allowed (set/intersection (set kinds) (set (get-in delegation [:kb system])))]
+                                  :when (seq allowed)]
+                              [system allowed])))
+        kb (mapv (fn [[system kinds]] [:diff/only-kb-pages {:system system :kinds kinds}]) kb-scope)
+        scope? (or (seq paths) (seq kb))
+        downgrades (cond-> []
+                     (and (= :merge (:review/on-pass spec)) (not (:merge? auth)))
+                     (conj {:key :review/on-pass :from :merge :to :propose :reason "No principal authorized for room/merge"})
+                     (and (= :merge (:review/on-pass spec)) (not scope?))
+                     (conj {:key :review/on-pass :from :merge :to :propose :reason "No writes within delegated scope"})
+                     (and (= :discard (:review/on-fail spec)) (not (:discard? auth)))
+                     (conj {:key :review/on-fail :from :discard :to :escalate :reason "No principal authorized for room/discard"}))
+        ;; only-paths also forbids file changes for KB-only workflows.
+        checks (vec (distinct (concat [:fork/review-tier [:diff/only-paths paths]] kb
+                                      (:review/checks spec))))]
+    (reduce (fn [p {:keys [key to]}] (assoc p key to))
+            (assoc spec :review/checks checks :review/settlement? true
+                   :review/declared-writes writes
+                   :review/delegation-scope delegation
+                   :review/write-scope {:paths paths :kb kb-scope}
+                   :review/downgrades downgrades
+                   :review/host-checks (vec (concat [:fork/review-tier [:diff/only-paths paths]] kb)))
+            downgrades)))
+
+(defn bounded-reviewer-spec
+  [room opts policy]
+  (if-let [reviewer (when-not (:reviewer opts) (:review/reviewer policy))]
+    (let [caller (:principal opts)
+          model (:model (admit-model! (assoc opts :room (:id room)) (:model reviewer)))
+          cap (min (double (or (:budget-dollars opts) 0.50))
+                   (double (or (:principal/budget-dollars caller) 0.50)))
+          remaining (if-let [payer (:principal/run caller)]
+                      (/ (double (resource/wallet-microdollars room payer)) 1000000.0)
+                      cap)
+          budget (min (double (or (:budget-dollars reviewer) 0.50)) cap remaining)]
+      (when-not (pos? budget)
+        (throw (ex-info "Caller has no remaining reviewer budget" {})))
+      (cond-> (assoc policy :review/reviewer (assoc reviewer :model model :budget-dollars budget))
+        (< budget (double (or (:budget-dollars reviewer) 0.50)))
+        (update :review/downgrades (fnil conj [])
+                {:key [:review/reviewer :budget-dollars]
+                 :from (or (:budget-dollars reviewer) 0.50) :to budget
+                 :reason "Bounded by caller budget cap and remaining Run wallet"})))
+    policy))
+
+(defn- intent-policy [room opts result]
+  (let [world (get-in result [:run/result :run/world])
+        auth (authority room (if (keyword? world) (subs (str world) 1) (str world)) opts (:run/id result))]
+    (try
+      (let [policy (effective-policy opts auth)]
+        (try (bounded-reviewer-spec room opts policy)
+             (catch Throwable _ policy)))
+      (finally ((:close auth))))))
+
+(defn- settle!
+  [room opts result]
+  (let [world (get-in result [:run/result :run/world])
+        run-id (:run/id result)]
+    (if-not (:review opts)
+      (when-let [w (and world (rreg/lookup world))]
+        (forks/commit-workspace! w (str "Attempt " run-id))
+        (when (= :review (get-in result [:run/result :run/settlement-status]))
+          (when-let [hook (:on-settlement opts)]
+            (hook {:room room :world world :run-id run-id :result (:run/result result)}))))
+      (or ((review-fn "decision") room run-id)
+          (let [auth (authority room (if (keyword? world) (subs (str world) 1) (str world)) opts run-id)
+                requested (effective-policy opts auth)
+                bounded (try {:policy (bounded-reviewer-spec room opts requested)}
+                             (catch Throwable t {:policy requested :error t}))
+                policy (:policy bounded)]
+            (try
+              (if ((review-fn "claim!") room run-id world policy)
+                (try
+                  (when-let [error (:error bounded)] (throw error))
+                  (when-let [w (rreg/lookup world)]
+                    (forks/commit-workspace! w (str "Attempt " run-id)))
+                  (let [reviewer (or (:reviewer opts)
+                                     (when (:review/reviewer policy)
+                                       ((review-fn "model-reviewer") (:daemon opts) room world policy (:principal opts))))
+                        decision ((review-fn "review!") room world policy :run-id run-id
+                                                        :id ((review-fn "decision-id") run-id) :reviewer reviewer :invoke (:invoke auth))]
+                    (when-let [hook (:on-settlement opts)]
+                      (hook {:room room :world world :run-id run-id :result (:run/result result)}))
+                    decision)
+                  (catch Throwable t
+                    ;; Cancellation must still leave a durable decision.
+                    (Thread/interrupted)
+                    ((review-fn "failure!") room run-id world policy
+                                            (str "Settlement review failed: " (ex-message t)))))
+                (loop []
+                  (or ((review-fn "decision") room run-id)
+                      (do (Thread/sleep 10) (recur)))))
+              (finally ((:close auth)))))))))
+
+(defn- await-decision [room run-id]
+  (loop []
+    (or ((review-fn "decision") room run-id)
+        (do (Thread/sleep 10) (recur)))))
+
+(defn- settle-on-worker! [room opts result]
+  (if-not (:review opts)
+    (program/on-worker! room #(settle! room opts result))
+    (let [run-id (:run/id result)
+          world (get-in result [:run/result :run/world])]
+      (or ((review-fn "decision") room run-id)
+          (try
+            (program/on-worker! room (:parent-run opts) #(settle! room opts result))
+            (catch Throwable t
+              (let [decision (or ((review-fn "decision") room run-id)
+                                 (if ((review-fn "claim!") room run-id world (:review opts))
+                                   ((review-fn "failure!") room run-id world (:review opts)
+                                                           (str "Settlement worker failed: " (ex-message t)))
+                                   ;; Another finish owns this attempt and its
+                                   ;; failure handler owns the durable decision.
+                                   (await-decision room run-id)))]
+                (when (and (:parent-run opts) (run/cancel-requested? (:parent-run opts)))
+                  (throw t))
+                decision)))))))
+
 (defn start
   "Start `task` `attempts` times for each of `models` on forks of `room`.
    Returns `{:spin s :ctx c :finish f}`: `s` yields the evaluations (deref or
@@ -138,8 +352,14 @@
    a child of the daemon's, so evaluating in the latter loses every wakeup.
 
    At most `:parallelism` attempts (default 4) run at once. With `:parent-run`
-   every attempt's Run is that Run's child (a job, `dvergr.jobs`)."
+   every attempt's Run is that Run's child (a job, `dvergr.jobs`).
+   `:review` is a review spec; `:daemon` and `:principal` configure its model
+   reviewer (or supply `:reviewer`). `:on-settlement` is a host callback of
+   `{:room :world :run-id :result}`, called on a worker after commitment of a
+   world settled :review. Finish waits for these decisions at the boundary."
   [room {:keys [task attempts] :as opts}]
+  (when (and (:review opts) (not (satisfies? room-store/PReviewStore (:store room))))
+    (throw (ex-info "Automatic review requires a Review store" {})))
   (when (str/blank? (str task))
     (throw (ex-info "A workflow attempt needs a task" {:type ::no-task})))
   (let [n (or attempts 1)
@@ -147,7 +367,7 @@
             (throw (ex-info "attempts must be between 1 and 8" {:type ::attempts :attempts n})))
         _ (when (< (:models max-attempts) (count (:models opts)))
             (throw (ex-info "at most 4 models per call" {:type ::models})))
-        {:keys [team ids]} (candidates opts)
+        {:keys [team ids]} (candidates (assoc opts :room (:id room)))
         evaluator (or (:evaluator opts) completion-evaluator)
         env (environment-def task opts)
         ctx (:ctx room)
@@ -161,26 +381,38 @@
               (max 1 (or (:parallelism opts) 4))))
      :finish (fn [results]
                (binding [ec/*execution-context* ctx]
-                 (mapv (fn [r]
-                         (let [world (get-in r [:run/result :run/world])]
-                           ;; The attempt's files, committed in its world: what
-                           ;; the review shows and a merge adopts.
-                           (when-let [w (and world (rreg/lookup world))]
-                             (forks/commit-workspace!
-                              w (str "Attempt " (get-in r [:attempt :attempt/receipt :attempt/run-id]
-                                                        (name world)))))
-                           {:attempt (:attempt r)
-                            :world world
-                            :review (review world)}))
-                       results)))}))
+                 ;; All completed attempts must survive a crash in the first review.
+                 (let [intents (when (:review opts)
+                                 (mapv (fn [r]
+                                         (let [policy (intent-policy room opts r)]
+                                           ((review-fn "intent!") room (:run/id r)
+                                                                  (get-in r [:run/result :run/world]) policy)
+                                           policy)) results))]
+                   (try
+                     (mapv (fn [r]
+                             (let [world (get-in r [:run/result :run/world])
+                                   decision (settle-on-worker! room opts r)]
+                               (cond-> {:attempt (:attempt r)
+                                        :world world
+                                        :review (review world)}
+                                 (:review opts) (assoc :decision decision))))
+                           results)
+                     (catch Throwable t
+                       (when (:review opts)
+                         (Thread/interrupted)
+                         (doseq [[r policy] (map vector results intents)]
+                           ((review-fn "failure!") room (:run/id r)
+                                                   (get-in r [:run/result :run/world]) policy
+                                                   (str "Settlement interrupted: " (ex-message t)))))
+                       (throw t))))))}))
 
 (defn attempt!
   "Run `task` `attempts` times for each of `models` on forks of `room` and
    block until all are certified. Call at a boundary (not inside a Spin).
 
    Returns `[{:attempt certified-Attempt :world world-id :review review-map}]`,
-   the retained worlds still open: adopt one with `forks/merge!`, drop the rest
-   with `forks/discard!`."
+   with worlds retained unless a review spec or settlement hook decided them.
+   Adopt an open world with `forks/merge!`, drop it with `forks/discard!`."
   [room opts]
   (let [{:keys [spin ctx finish]} (start room opts)]
     (finish (binding [ec/*execution-context* ctx] @spin))))

@@ -37,6 +37,7 @@
               "your own room by structure, citations and links.")
     :params wiki/params
     :profile "developer"
+    :workflow/writes {:repo ["wiki/"]}
     :task wiki/task
     :evaluator (fn [params gold] (wiki/evaluator (assoc params :gold gold)))
     :benchmark {:fixtures wiki/fixtures :gold wiki/gold}
@@ -51,6 +52,7 @@
               "structural checks.")
     :params wiki/params
     :profile "developer"
+    :workflow/writes {:repo ["wiki/"]}
     :task wiki/task-v2
     :evaluator (fn [params gold]
                  (if gold
@@ -68,6 +70,7 @@
               "test split; on your own room: v1's structural checks.")
     :params wiki/params
     :profile "developer"
+    :workflow/writes {:repo ["wiki/"]}
     :task wiki/task-v2
     :evaluator (fn [params gold]
                  (if gold
@@ -86,6 +89,7 @@
               "front matter, tiers, links, grounding).")
     :params v4/params
     :profile "developer"
+    :workflow/writes {:repo ["wiki/"]}
     :task v4/task
     :evaluator (fn [params gold]
                  (v4/evaluator (if gold (assoc params :gold gold) (assoc params :structure? true))))
@@ -114,6 +118,8 @@
     {:task ((:task wf) params)
      :profile (:profile wf)
      :evaluator ((:evaluator wf) params gold)
+     :review (:review wf)
+     :workflow/writes (:workflow/writes wf)
      :environment-id (keyword "catalog" (str (namespace (:id wf)) "-" (name (:id wf))
                                              (when benchmark? "-bench")))}))
 

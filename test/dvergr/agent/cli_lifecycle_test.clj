@@ -20,6 +20,9 @@
   (json/write-value-as-string {:type "result" :result text
                                :usage {:input_tokens 3 :output_tokens 2}}))
 
+(defn- receipt-pids [receipt]
+  (mapv parse-long (remove str/blank? (str/split-lines (slurp receipt)))))
+
 (defn- fixture-script [mode receipt]
   (str "#!/bin/sh\n"
        "if test \"$1\" = --version; then echo fixture-version; exit 0; fi\n"
@@ -63,7 +66,11 @@
               env (environment/make-environment
                    {:id :test/cli-lifecycle :task "Use clojure_eval to calculate (+ 1 2), then finish."
                     :verifier {:id :test/cli-lifecycle :version 1}
-                    :limits {:timeout-ms (if (= :stall mode) 2000 5000) :cancel-timeout-ms 3000}
+                    ;; This test exercises subprocess outcomes, not startup
+                    ;; speed. Admission and cold SCI initialization share the
+                    ;; evaluation deadline; deadline enforcement has its own
+                    ;; deterministic evaluation tests.
+                    :limits {:timeout-ms 60000 :cancel-timeout-ms 10000}
                     :world {:isolation :ctx :settlement :discard
                             :resources {resource/cli-run-admissions 1M}}})
               evaluator (evaluation/make-evaluator
@@ -77,11 +84,19 @@
             (binding [ec/*execution-context* (:ctx room)]
               (let [attempt (evaluation/evaluate room team :candidate env evaluator)
                     waiting (future @attempt)]
-                (is (#'fixtures/wait-until #(not (str/blank? (slurp receipt))) 3000))
+                (is (#'fixtures/wait-until #(= 2 (count (receipt-pids receipt))) 30000)
+                    "the CLI reaches its second exchange, including on a cold JVM")
                 (is (= :heartbeat (deref (sp/spin :heartbeat) 1000 ::timeout))
                     "blocking subprocess I/O must not hold the Room's drain")
-                (let [result (deref waiting 10000 ::timeout)
-                      pids (mapv parse-long (remove str/blank? (str/split-lines (slurp receipt))))
+                (when (= :stall mode)
+                  ;; Cancel only after the real tool loop has dispatched the
+                  ;; stalled subprocess, never while initialization is racing
+                  ;; a short whole-evaluation deadline.
+                  (let [active (run/active-runs (:id room))]
+                    (is (= 1 (count active)))
+                    (is (true? (run/cancel-room-run! (:id room) (:run/id (first active)))))))
+                (let [result (deref waiting 30000 ::timeout)
+                      pids (receipt-pids receipt)
                       status (get-in result [:run/result :run/status])
                       spend (get-in result [:attempt-receipt :attempt/metrics :spend])]
                   (is (not= ::timeout result))
