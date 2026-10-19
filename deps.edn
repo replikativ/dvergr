@@ -139,7 +139,7 @@
         ;; Reviewed listener-ACK fix (Datahike #1120), pending upstream release.
         ;; A throwing observer must not strand an already committed publication.
         org.replikativ/datahike    {:git/url "https://github.com/replikativ/datahike.git"
-                                   :git/sha "d29181c7882671f4ed68292904d9b0b5118fac10"}
+                                  :git/sha "5ea54328ad0704aa7053abea067b9434de5015d6"}
         ;; 0.1.37 provides conserved resource vectors, durable receipts, and
         ;; mandatory Datahike invariants for Run resource delegation.
         ;; 0.1.38 settles a world's book by replay (ADR-172, `kontor.settlement`):

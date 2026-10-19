@@ -1,5 +1,6 @@
 (ns dvergr.system.default-workspace-test
   (:require [clojure.test :refer [deftest is]]
+            [datahike.api :as d]
             [dvergr.system.db :as db]
             [dvergr.system.rooms :as rooms]
             [dvergr.substrate.geschichte :as geschichte]
@@ -42,6 +43,60 @@
        (is (= (:id system) (:runtime-system resolved)))
        (is (identical? (:conn system) (:conn resolved)))
        (is (= :db (get-in resolved [:repository :workspace-branch])))))))
+
+(defn- registry-fixture [f]
+  ;; Keep the runtime facade small, but exercise the actual immutable registry
+  ;; queries instead of teaching the doubles how snapshot selection should work.
+  (let [default-repository db/default-repository
+        all-systems db/all-systems]
+    (fixture
+     (fn [{:keys [room registry] :as state}]
+       (let [cfg {:store {:backend :memory :id (random-uuid)}
+                  :schema-flexibility :write :keep-history? false}
+             grant (random-uuid)]
+         (d/create-database cfg)
+         (let [conn (d/connect cfg)]
+           (try
+             (d/transact conn db/schema)
+             (d/transact conn [registry
+                               {:room/id room :room/slug "snapshot-default"
+                                :room/default-repository [:system/id (:system/id registry)]}
+                               {:grant/id grant :grant/room [:room/id room]
+                                :grant/system [:system/id (:system/id registry)]
+                                :grant/permission :owner}])
+             (with-redefs [db/default-repository default-repository
+                           db/all-systems all-systems
+                           db/get-conn (fn [] (throw (AssertionError. "Explicit snapshot read the ambient registry")))]
+               (f (assoc state :conn conn :grant grant)))
+             (finally
+               (d/release conn)
+               (d/delete-database cfg)))))))))
+
+(deftest explicit-registry-snapshot-controls-ownership-even-after-the-live-grant-changes
+  (registry-fixture
+   (fn [{:keys [room conn grant repository system]}]
+     (let [admitted @conn]
+       (d/transact conn [[:db/add [:grant/id grant] :grant/permission :read-write]])
+       (is (= repository (:registry-system (rooms/default-workspace admitted room))))
+       (is (identical? (:conn system) (:conn (rooms/default-workspace admitted room))))
+       (is (= ::rooms/default-repository-unconfigured
+              (try (rooms/default-workspace @conn room) nil
+                   (catch clojure.lang.ExceptionInfo error (:type (ex-data error))))))
+       (is (= repository (:registry-system (rooms/default-workspace admitted room))))))))
+
+(deftest physical-alias-check-uses-the-same-explicit-snapshot-as-default-ownership
+  (registry-fixture
+   (fn [{:keys [room conn registry repository]}]
+     (let [admitted @conn]
+       (d/transact conn [(assoc registry :system/id (random-uuid)
+                                :system/scope "/virtual/else/../room-repo")])
+       ;; The raw scopes differ, so only the resolver's canonical path check
+       ;; detects this ambiguity. It must read aliases from the supplied DB too.
+       (is (= repository (:system/id (db/default-repository @conn room))))
+       (is (= ::rooms/default-workspace-mismatch
+              (try (rooms/default-workspace @conn room) nil
+                   (catch clojure.lang.ExceptionInfo error (:type (ex-data error))))))
+       (is (= repository (:registry-system (rooms/default-workspace admitted room))))))))
 
 (deftest missing-marker-or-context-cannot-select-an-attached-workspace
   (fixture
