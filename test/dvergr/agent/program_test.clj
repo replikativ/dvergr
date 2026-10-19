@@ -14,6 +14,7 @@
             [dvergr.model.chat :as model-chat]
             [dvergr.model.gateway :as gateway]
             [dvergr.model.api.openai :as openai]
+            [dvergr.model.api.claude-code :as claude-code]
             [dvergr.model.providers :as providers]
             [dvergr.agent.spend :as spend]
             [dvergr.resource :as resource]
@@ -77,6 +78,154 @@
 (defn- close-resource-test-room! [room conn]
   (kontor-governance/ungovern! conn)
   (d/close-room! room))
+
+(deftest explicit-text-policy-is-closed-and-content-addressed
+  (let [policy {:kind :llm :execution-mode :text :single-use? true :auto-compact? false}
+        agent {:agent/model-policy {:provider :claude-code :model "claude-code-haiku"}}]
+    (is (= policy (@#'program/validate-program! policy :test agent)))
+    (doseq [bad [(assoc policy :execution-mode :agent)
+                 (assoc policy :auto-compact? true)
+                 (assoc policy :single-use? false)]]
+      (is (thrown? clojure.lang.ExceptionInfo (@#'program/validate-program! bad :test agent))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (@#'program/validate-program! policy :test
+                                               {:agent/model-policy {:provider :openai :model "gpt-test"}})))))
+
+(deftest single-use-cli-run-consumes-admission-and-corrective-replies-consume-steps
+  (let [[room conn] (resource-test-room :cli-single-use)
+        calls (atom [])
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :worker :tools #{} :model-policy {:provider :claude-code :model "claude-code-haiku"}
+               :program {:kind :llm :execution-mode :text :single-use? true
+                         :max-model-steps 2 :auto-compact? false}})]
+    (try
+      (resource/install-unit! room {:symbol resource/cli-run-admissions :name "CLI Run admissions" :precision 0})
+      (resource/mint! room {:id (random-uuid) :resources {resource/cli-run-admissions 1M}})
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    providers/get-provider! (constantly (claude-code/create {}))
+                    claude-code/execution-policy (constantly {:version 1 :mode :text :cli-version "test"})
+                    model-chat/chat (fn [_ opts]
+                                      (swap! calls conj opts)
+                                      {:content "" :usage {:input-tokens 0 :output-tokens 0}
+                                       :stop-reason :end-turn})]
+        (let [handle (binding [ec/*execution-context* (:ctx room)]
+                       (program/hire! room team :worker
+                                      {:task "No hidden calls" :settlement :discard
+                                       :resources {resource/cli-run-admissions 1M}}))
+              result (binding [ec/*execution-context* (:ctx room)] @handle)]
+          (is (= :failed (:run/status result)))
+          (is (= 2 (count @calls)) (pr-str result))
+          (is (every? #(= :text (:execution-mode %)) @calls))
+          (is (= 2 (get-in result [:run/metrics :model-steps])))
+          (is (= 0M (get (resource/run-balance room (program/run-id handle)) resource/cli-run-admissions 0M)))
+          (is (= ::program/resume-denied
+                 (try (program/resume! room room (program/run-id handle)) nil
+                      (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))))
+      (finally (close-resource-test-room! room conn)))))
+
+(deftest in-flight-or-cancelled-model-steps-never-certify-previous-usage
+  (doseq [budget [{} {:used 0 :by-type {:input-tokens 0 :output-tokens 0}}
+                  {:used 0 :by-type {:input-tokens 10 :output-tokens 2}}]]
+    (let [usage (#'program/model-step-usage budget true)
+          result (spend/of-budget "claude-code-haiku" usage)]
+      (is (= #{:input-tokens :output-tokens} (:unreported-types usage)))
+      (is (false? (:priced? result)))
+      (is (nil? (:notional-microdollars result)))
+      (is (empty? (:tokens result)))))
+  (let [known {:used 0 :by-type {:input-tokens 0 :output-tokens 0}}
+        usage (#'program/model-step-usage known false)]
+    (is (= known usage))
+    (is (true? (:priced? (spend/of-budget "claude-code-haiku" usage)))))
+  (is (= #{:input-tokens}
+         (:unreported-types (#'program/model-step-usage {:unreported-types #{:input-tokens}} false)))))
+
+(deftest measured-model-failure-is-not-an-unmeasured-provider-call
+  (let [known {:used 10 :by-type {:input-tokens 500 :output-tokens 0}}]
+    (doseq [outcome [:continue :complete :error]]
+      (is (= known (#'program/completed-model-step-usage known outcome false {:kind :model}))))
+    (doseq [outcome [:cancelled ::program/worker-cancelled {::program/worker-error (Exception.)}]]
+      (is (= #{:input-tokens :output-tokens}
+             (:unreported-types (#'program/completed-model-step-usage known outcome false nil)))))
+    (doseq [failure [nil {:kind :infrastructure}]]
+      (is (= #{:input-tokens :output-tokens}
+             (:unreported-types (#'program/completed-model-step-usage known :error false failure)))))
+    (is (= #{:input-tokens :output-tokens}
+           (:unreported-types (#'program/completed-model-step-usage known :complete true nil))))
+    (is (= #{:input-tokens :output-tokens}
+           (:unreported-types
+            (#'program/completed-model-step-usage
+             (assoc known :unreported-types #{:input-tokens :output-tokens}) :error false {:kind :model}))))))
+
+(deftest expired-worker-entry-still-acknowledges-and-runs-cleanup
+  (let [room (test-room :deadline-worker)
+        called (atom 0) cleaned (atom 0)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [supervisor (assoc (#'program/make-supervisor (:ctx room))
+                                :deadline-nanos (dec (System/nanoTime)))
+              _ (#'program/register-cleanup! supervisor #(swap! cleaned inc))
+              worker (#'program/start-worker! supervisor #(swap! called inc))
+              result (deref (#'program/worker-result-spin worker) 2000 ::timeout)]
+          (is (= ::program/deadline-expired (:type (ex-data (::program/worker-error result)))))
+          (is (zero? @called) "physical entry checks expiry without waiting for an engine timer")
+          (#'program/seal-supervisor! supervisor)
+          (#'program/mark-cleanup-safe! supervisor)
+          (is (.await ^java.util.concurrent.CountDownLatch (:quiesced-latch supervisor)
+                      2000 java.util.concurrent.TimeUnit/MILLISECONDS))
+          (is (= 1 @cleaned) "cleanup is exempt from the execution deadline")
+          (is (empty? (:workers @(:state supervisor))))))
+      (finally (d/close-room! room)))))
+
+(deftest expired-allocation-cannot-enter-candidate-with-delayed-engine-timer
+  (let [[room conn] (resource-test-room :deadline-allocation)
+        entered (promise) release (promise)
+        allocate resource/allocate-run!
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :program {:kind :scripted :reply "must not run"}})]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 100M}})
+      (binding [ec/*execution-context* (:ctx room)]
+        (with-redefs [resource/allocate-run!
+                      (fn [& args] (deliver entered true) @release (apply allocate args))]
+          (let [handle (program/hire-prepared-in!
+                        room room team :candidate
+                        {:task "work" :settlement :discard :resources {resource/microdollars 100M}}
+                        (constantly nil) nil {:deadline-nanos (+ (System/nanoTime) 500000000)})]
+            (is (= true (deref entered 2000 ::timeout)))
+            ;; Deliberately no evaluation timer: the physical entry fence
+            ;; must prevent execution even when graph cancellation is late.
+            (Thread/sleep 600)
+            (deliver release true)
+            (let [result (deref handle 5000 ::timeout)]
+              (is (not= ::timeout result))
+              (is (= :failed (:run/status result)))
+              (is (= :world-setup-cancelled
+                     (:run/reason (program/observe room handle)))
+                  "expired allocation is not a model-quality verdict"))
+            (is (= {resource/microdollars 100M} (resource/balance room)))
+            (is (empty? (filter #(= :candidate (:from %)) (d/messages room)))))))
+      (finally
+        (deliver release true)
+        (close-resource-test-room! room conn)))))
+
+(deftest concurrent-cli-entries-cannot-share-one-conserved-admission
+  (let [[room conn] (resource-test-room :cli-admission-race)
+        id (random-uuid)]
+    (try
+      (resource/install-unit! room {:symbol resource/cli-run-admissions :name "CLI Run admissions" :precision 0})
+      (resource/mint! room {:id (random-uuid) :resources {resource/cli-run-admissions 1M}})
+      (run/start! room :test (d/post! room (d/message :test :_runs "CLI admission fixture" nil {:role :user})) nil {:id id})
+      (resource/allocate-run! room id nil {resource/cli-run-admissions 1M})
+      (let [enter #(try (resource/consume! room id {:id (random-uuid) :resources {resource/cli-run-admissions 1M}})
+                        :admitted (catch clojure.lang.ExceptionInfo _ :refused))
+            a (future (enter)) b (future (enter))]
+        (is (= {:admitted 1 :refused 1} (frequencies [@a @b])))
+        (is (= :refused (enter)) "Crash/re-entry cannot replay a consumed physical admission"))
+      (finally
+        (when (some #(= id (:run/id %)) (run/active-runs (:id room)))
+          (run/finish! id :completed))
+        (close-resource-test-room! room conn)))))
 
 (defn- fail-terminal-store [delegate fail-terminal?]
   (reify room-store/PRoomStore
@@ -1171,7 +1320,8 @@
               (is (= :cancelled (:run/status result)))
               (is (= {:provider :test
                       :model "stub"
-                      :usage {:used 0 :by-type {}}}
+                      :usage {:used 0 :by-type {}
+                              :unreported-types #{:input-tokens :output-tokens}}}
                      (dissoc (:run/metrics result)
                              :prompt-id :inputs-id :model-steps)))
               (is (<= 1 (get-in result [:run/metrics :model-steps]) 2)

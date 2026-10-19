@@ -23,6 +23,7 @@
             [dvergr.discourse :as d]
             [dvergr.model.providers :as providers]
             [dvergr.model.registry :as registry]
+            [dvergr.model.api.claude-code :as claude-code]
             [dvergr.resource :as resource]
             [dvergr.room.store :as room-store]
             [dvergr.system.rooms :as system-rooms]
@@ -120,6 +121,18 @@
     (f)))
 
 (declare start-worker!)
+
+(defn- deadline-expired? [supervisor]
+  (when-let [deadline (:deadline-nanos supervisor)]
+    (>= (System/nanoTime) deadline)))
+
+(defn- check-deadline! [supervisor]
+  (when (deadline-expired? supervisor)
+    (throw (ex-info "Run execution deadline expired"
+                    {:type ::deadline-expired}))))
+
+(defn- cancelled-or-expired? [supervisor run-id]
+  (or (deadline-expired? supervisor) (run/cancel-requested? run-id)))
 
 (defn- make-supervisor
   ([execution-ctx] (make-supervisor execution-ctx execution-ctx))
@@ -221,6 +234,15 @@
                (update :cleanup-error #(or % (::worker-error result)))))))
   (advance-supervisor! supervisor))
 
+(defn- worker-stage! [supervisor worker-id kind stage started-nanos]
+  (try
+    (tel/log! {:level :debug :id ::worker-stage
+               :data {:run/id (:run-id supervisor) :worker/id worker-id :kind kind :stage stage
+                      :fork/id (:fork-id (:execution-ctx supervisor))
+                      :elapsed-ms (/ (- (System/nanoTime) started-nanos) 1000000.0)}})
+    ;; Diagnostics must never suppress result publication or a physical ack.
+    (catch Throwable _ nil)))
+
 (defn- start-worker!
   "Register and start blocking/native work under the process-local supervisor.
    Cancellation is sticky: registration and the cancellation check share the
@@ -229,6 +251,7 @@
   ([supervisor f kind]
    (let [done       (sync/deferred)
          worker-id  (random-uuid)
+         started-nanos (System/nanoTime)
          phase      (atom :new)
          result     (atom nil)
          callable   (reify Callable
@@ -243,6 +266,11 @@
                                     ec/*spin-id* nil
                                     *worker-supervisor* supervisor]
                             (try
+                              (worker-stage! supervisor worker-id kind :entered started-nanos)
+                              ;; Absolute deadlines are host-owned coordination,
+                              ;; not forkable AgentDef state. Check at physical
+                              ;; entry even if the engine's timer is delayed.
+                              (when (= :normal kind) (check-deadline! supervisor))
                               (reset! result (f))
                               (catch Throwable t
                                 (reset! result {::worker-error t}))
@@ -253,10 +281,12 @@
                                 (binding [ec/*execution-context*
                                           (:execution-ctx supervisor)]
                                   (try
+                                    (worker-stage! supervisor worker-id kind :publishing started-nanos)
                                     (done @result)
                                     (finally
                                       (worker-finished! supervisor worker-id kind
-                                                        @result))))))))))
+                                                        @result)
+                                      (worker-stage! supervisor worker-id kind :acknowledged started-nanos))))))))))
          task       (proxy [FutureTask] [callable]
                       (done []
                        ;; Cancellation before the executor begins means the
@@ -272,7 +302,7 @@
                                 (finally
                                   (worker-finished! supervisor worker-id kind
                                                     value))))))))
-         worker     {:id worker-id :task task :done done :kind kind}
+         worker     {:id worker-id :task task :done done :kind kind :started-nanos started-nanos}
          cancel-now?
          (locking supervisor
            (let [{:keys [sealed? cancelled?]} @(:state supervisor)]
@@ -774,8 +804,11 @@
      (= :llm (get-in agent [:agent/program :kind]))
      (let [tool-map (tools/normalize-tools (or (:agent/tools agent) #{}))]
        (let [spec (resolve-model-spec agent)]
-         (llm-inputs (llm-instructions agent tool-map) tool-map spec (compaction-spec agent spec)
-                     (:agent/sandbox agent))))
+         (cond-> (llm-inputs (llm-instructions agent tool-map) tool-map spec (compaction-spec agent spec)
+                             (:agent/sandbox agent))
+           (get-in agent [:agent/program :execution-mode])
+           (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
+                  :provider-policy (claude-code/execution-policy)))))
 
      :else nil)))
 
@@ -920,6 +953,21 @@
                     :on-error (fn [e] (binding [ec/*execution-context* caller] (done {::savepoint-error e})))}))
     (sp/spin (sp/await done))))
 
+(defn- model-step-usage [budget uncertain?]
+  (cond-> (select-keys budget [:used :by-type :unreported-types])
+    uncertain? (update :unreported-types (fnil into #{}) [:input-tokens :output-tokens])))
+
+(defn- completed-model-step-usage [budget outcome cancelled? failure]
+  ;; :error is also a model-quality verdict after a measured response (e.g.
+  ;; repeated empty output). Provider failures already mark the chat budget
+  ;; incomplete at the call boundary. Only explicit :model verdicts occur
+  ;; after response accounting: :error may also be an exception during that
+  ;; accounting (malformed usage). Never treat that as an acknowledged step.
+  (model-step-usage budget
+                    (or cancelled?
+                        (not (or (contains? #{:continue :complete} outcome)
+                                 (and (= :error outcome) (= :model (:kind failure))))))))
+
 (defn- execute-llm-program
   "Run a bounded Dvergr-native model/tool loop. Each blocking model round-trip
    runs under a supervised worker; this Spin retains orchestration, activity
@@ -956,6 +1004,15 @@
            (start-worker!
             supervisor
             (fn []
+              (when-let [expected (get-in agent [:agent/program :provider-policy])]
+                (when-not (= expected (claude-code/execution-policy))
+                  (throw (ex-info "Admitted Claude Code policy changed" {:type ::provider-policy-drift}))))
+              (when (get-in agent [:agent/program :single-use?])
+                ;; Each physical entry needs a fresh debit. The Run owns
+                ;; exactly ONE conserved admission, so concurrent/replayed
+                ;; initialization cannot both pass Kontor's atomic validation.
+                (resource/consume! control-room run-id
+                                   {:id (random-uuid) :resources {resource/cli-run-admissions 1M}}))
               (let [{:keys [chat-ctx owned-db?]}
                     (new-llm-context control-room work-room run-id agent
                                      budget-dollars chat-id supervisor)
@@ -985,7 +1042,10 @@
                     ;; what the model is presented with: the system prompt it
                     ;; is sent (a resumed Run's is the one it started with)
                     compaction (compaction-spec agent model-spec)
-                    inputs (llm-inputs sent tool-map model-spec compaction (:agent/sandbox agent))]
+                    inputs (cond-> (llm-inputs sent tool-map model-spec compaction (:agent/sandbox agent))
+                             (get-in agent [:agent/program :execution-mode])
+                             (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
+                                    :provider-policy (claude-code/execution-policy)))]
                 (update-llm-metrics!
                  supervisor
                  (constantly
@@ -1010,6 +1070,7 @@
                  :tool-ctx tool-ctx
                  :compaction compaction
                  :model-inputs [(:model inputs) (:compaction inputs)]
+                 :provider-policy (:provider-policy inputs)
                  :model-spec model-spec})))
            initialized (sp/await (worker-result-spin init-worker))]
        (when (or (= ::worker-cancelled initialized)
@@ -1020,7 +1081,7 @@
                          {:type ::runtime-initialization-failed
                           :agent/id (:agent/id agent)}
                          (::worker-error initialized))))
-       (let [{:keys [chat-ctx tool-map tool-ctx model-spec model-inputs compaction]} initialized
+       (let [{:keys [chat-ctx tool-map tool-ctx model-spec model-inputs compaction provider-policy]} initialized
              posted (ratom/create-atom 0)
              ;; whether this Run's model called tools, and whether it then
              ;; ended silently (`chat-agent/*run-activity*`); a resumed Run
@@ -1030,10 +1091,16 @@
            (when (run/cancel-requested? run-id)
              (cancelled! run-id))
            (let [failure (volatile! nil)
+                 ;; An in-flight call has no complete usage report yet. If
+                 ;; cancellation bypasses the post-worker snapshot, terminal
+                 ;; metrics must not retain the previous step's known totals.
+                 _ (update-llm-metrics! supervisor update :usage model-step-usage true)
                  call
                  (start-worker!
                   supervisor
                   (fn []
+                    (when (and provider-policy (not= provider-policy (claude-code/execution-policy)))
+                      (throw (ex-info "Claude Code execution policy changed" {:type ::provider-policy-drift})))
                     (binding [chat-agent/*turn-failure* failure
                               chat-agent/*run-activity* activity
                               ;; the step is the charge scope: its debits have
@@ -1044,7 +1111,7 @@
                                       (resource/spending [:llm-step run-id model-step]))
                               resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
-                                      (assoc :cancel? #(run/cancel-requested? run-id)))]
+                                      (assoc :cancel? #(cancelled-or-expired? supervisor run-id)))]
                       (with-model-entry-checked supervisor run-id model-inputs [model-spec compaction]
                         (chat-agent/run-agent-turn!
                          chat-ctx
@@ -1056,7 +1123,7 @@
                           :tool-ctx tool-ctx
                           :cancel? (turn/cancel?-fn
                                     chat-ctx (:ctx work-room)
-                                    (fn [] (run/cancel-requested? run-id)))
+                                    (fn [] (cancelled-or-expired? supervisor run-id)))
                           :auto-compact? auto-compact?
                           ;; the one its inputs id names
                           :compaction-model (:model compaction)
@@ -1068,15 +1135,20 @@
                         ;; The world this Run works in, for an adapter whose
                         ;; model is an external agent (claude -p): it invokes
                         ;; that agent INTO this room over MCP.
-                          :model-opts {:room-id (let [id (:id work-room)]
-                                                  (if (keyword? id) (subs (str id) 1) (str id)))
+                          :model-opts (cond-> {:room-id (let [id (:id work-room)]
+                                                          (if (keyword? id) (subs (str id) 1) (str id)))
                                        ;; whose run token it gets (dvergr.principal)
-                                       :actor (:agent/id agent)}})))))
+                                               :actor (:agent/id agent) :run-id run-id}
+                                        (get-in agent [:agent/program :execution-mode])
+                                        (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
+                                               :expected-provider-policy provider-policy))})))))
                  outcome (sp/await (worker-result-spin call))
+                 _ (worker-stage! supervisor (:id call) :normal :resumed (:started-nanos call))
                  budget (chat-context/get-budget chat-ctx)]
              (update-llm-metrics!
               supervisor merge {:model-steps (inc model-step)
-                                :usage (select-keys budget [:used :by-type])})
+                                :usage (completed-model-step-usage budget outcome
+                                                                   (run/cancel-requested? run-id) @failure)})
              ;; posting the turn's rows is a durable write: off the drain
              (sp/await (blocking/blocking
                         #(turn/post-turn-activity! control-room (:agent/id agent) chat-ctx posted
@@ -1205,7 +1277,7 @@
                     supervisor
                     (constantly {:inputs-id (inputs-id inputs)}))
                    (let [scope (some-> (resource/model-scope control-room run-id)
-                                       (assoc :cancel? #(run/cancel-requested? run-id)))]
+                                       (assoc :cancel? #(cancelled-or-expired? supervisor run-id)))]
                      (binding [resource/*model-scope* scope
                                ;; the protocol's model calls, the candidate's
                                ;; and its driver's, are paid from the Run's
@@ -1225,7 +1297,7 @@
                            :task task
                            :limits (::limits agent)
                            :model-scope scope
-                           :cancelled? (fn [] (run/cancel-requested? run-id))})))))))
+                           :cancelled? (fn [] (cancelled-or-expired? supervisor run-id))})))))))
          outcome (sp/await (worker-result-spin call))]
      (cond
        (or (= ::worker-cancelled outcome)
@@ -1272,13 +1344,13 @@
   #{:task :from :parent-run :settlement :resources :limits :role})
 
 (defn- validate-program!
-  [{:keys [kind delay-ms max-model-steps budget-dollars auto-compact? compaction-model]
+  [{:keys [kind delay-ms max-model-steps budget-dollars auto-compact? compaction-model execution-mode single-use? provider-policy]
     :as program} agent-ref agent]
   (let [allowed (case kind
                   :scripted #{:kind :delay-ms :reply :result}
                   :echo #{:kind :delay-ms}
                   :llm #{:kind :max-model-steps :budget-dollars
-                         :auto-compact? :compaction-model}
+                         :auto-compact? :compaction-model :execution-mode :single-use? :provider-policy}
                   nil)]
     (when-not allowed
       (throw (ex-info "hire! does not have an interpreter for this program"
@@ -1314,6 +1386,16 @@
     (when (and (= :llm kind) compaction-model (not (string? compaction-model)))
       (throw (ex-info "LLM program :compaction-model must be a string"
                       {:type ::invalid-compaction-model :compaction-model compaction-model})))
+    (when (and execution-mode
+               (not (and (= :text execution-mode)
+                         (= :claude-code (get-in agent [:agent/model-policy :provider])))))
+      (throw (ex-info "Explicit text mode requires Claude Code" {:type ::invalid-execution-mode})))
+    (when (and (contains? program :single-use?)
+               (not (and (true? single-use?) (= :text execution-mode) (false? auto-compact?))))
+      (throw (ex-info "Single-use CLI Runs require text mode and disabled compaction" {:type ::invalid-single-use})))
+    (when (and provider-policy (not (and (= :text execution-mode) (map? provider-policy)
+                                         (roster/data-value? provider-policy))))
+      (throw (ex-info "Provider policy requires text mode and portable data" {:type ::invalid-provider-policy})))
     (when (= :llm kind)
       (let [policy (:agent/model-policy agent)]
         (when (and policy
@@ -1383,6 +1465,10 @@
                   (throw (ex-info "Unknown AgentRef"
                                   {:type ::unknown-agent :agent-ref agent-ref})))]
     (validate-program! (:agent/program agent) agent-ref agent)
+    (when (and (get-in agent [:agent/program :single-use?])
+               (not= {resource/cli-run-admissions 1M} resources))
+      (throw (ex-info "Single-use CLI Runs require exactly one CLI admission, no other provider grants"
+                      {:type ::invalid-cli-grant})))
     (when (and (seq limits) (not= :llm (get-in agent [:agent/program :kind])))
       (throw (ex-info "hire! model limits require an LLM AgentDef"
                       {:type ::limits-require-llm
@@ -1731,16 +1817,21 @@
                     (throw t)))))
              allocation (sp/await (worker-result-spin allocation-worker))]
          (when (or (= ::worker-cancelled allocation)
-                   (run/cancel-requested? id))
+                   (run/cancel-requested? id)
+                   (deadline-expired? supervisor))
            (throw (ex-info "Run cancelled during resource allocation"
                            {:type ::world-setup-cancelled :run/id id})))
          (when (worker-error? allocation)
            (throw (ex-info "Run resource allocation failed"
                            {:type ::resource-allocation-failed :run/id id}
                            (::worker-error allocation))))))
-     (when (run/cancel-requested? id)
+     ;; Setup/allocation expiry is a host failure before candidate entry,
+     ;; even in an environment that scores candidate timeouts as verdicts.
+     (when (or (run/cancel-requested? id) (deadline-expired? supervisor))
        (throw (ex-info "Run cancelled after world setup"
                        {:type ::world-setup-cancelled :run/id id})))
+     ;; Allocation may have blocked beyond the deadline after setup passed.
+     ;; Do not enter candidate execution while waiting for a timer event.
      (swap! (:state supervisor) assoc :execution-phase :candidate)
      (sp/await
       (execution-spin control-room work-room agent task trigger id chat-id
@@ -1785,7 +1876,11 @@
     :or {from :repl settlement :automatic}
     :as raw-opts}
    prepare-world! & [protocol {resume-from :resume snapshots :snapshots preset-id :id
-                               on-world :on-world resources-from :resources-from}]]
+                               on-world :on-world resources-from :resources-from
+                               deadline-nanos :deadline-nanos}]]
+  (when-not (or (nil? deadline-nanos) (integer? deadline-nanos))
+    (throw (ex-info "Run deadline must be an absolute monotonic timestamp"
+                    {:type ::invalid-deadline})))
   (when-not (or (nil? prepare-world!) (fn? prepare-world!))
     (throw (ex-info "Run world preparer must be a function"
                     {:type ::invalid-world-preparer})))
@@ -1804,7 +1899,8 @@
         run-world (world/open! world-parent id settlement control-room
                                (when snapshots {:snapshots snapshots}))
         work-room (:work run-world)
-        supervisor (make-supervisor (:ctx world-parent) (:ctx work-room))
+        supervisor (cond-> (assoc (make-supervisor (:ctx world-parent) (:ctx work-room)) :run-id id)
+                     deadline-nanos (assoc :deadline-nanos deadline-nanos))
         session-close (atom nil)
         _ (when (and (= :llm (get-in agent [:agent/program :kind])) (:store control-room))
             (when-let [session (install-turn-savepoints! control-room work-room)]
@@ -2069,6 +2165,9 @@
     (when-not data
       (throw (ex-info "The Run has no savepoint to resume from" {:type ::no-savepoint :run/id run-id})))
     (let [{:keys [agent task step]} (:savepoint/payload data)
+          _ (when (get-in agent [:agent/program :single-use?])
+              (throw (ex-info "Single-use CLI Runs require a new explicitly admitted task"
+                              {:type ::resume-denied :run/id run-id})))
           new-id (random-uuid)
           ;; excludes a concurrent resume; nothing durable changes until the
           ;; new Run is admitted and holds the old Run's wallet

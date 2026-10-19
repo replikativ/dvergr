@@ -279,17 +279,23 @@
           ;; Call LLM using new model abstraction. :cancel? is polled
           ;; per SSE event inside model-chat/chat so Esc closes the
           ;; socket mid-stream and stops billed-token generation.
-          response (model-chat/chat
-                    api-messages
-                    (merge
-                     model-opts
-                     {:model model
-                      :provider provider
-                      :tools (if tools
-                               (tools/tool-definitions tools)
-                               (tools/tool-definitions))
-                      :on-text (or on-text (fn [_]))
-                      :cancel? cancel?}))
+          response (try (model-chat/chat
+                         api-messages
+                         (merge
+                          model-opts
+                          {:model model
+                           :provider provider
+                           :tools (if tools
+                                    (tools/tool-definitions tools)
+                                    (tools/tool-definitions))
+                           :on-text (or on-text (fn [_]))
+                           :cancel? cancel?}))
+                        (catch Throwable error
+                          ;; A failed/partial exchange can have generated
+                          ;; tokens without delivering an authoritative report.
+                          (try (chat-ctx/mark-usage-incomplete! chat-ctx nil)
+                               (catch Throwable marking (.addSuppressed error marking)))
+                          (throw error)))
 
           ;; Extract from new response format
           {:keys [content tool-calls usage stop-reason reasoning]} response
@@ -322,6 +328,7 @@
           reply-notes (:notes reply-hook)
 
           ;; Account for token usage and capture threshold warnings
+          _ (chat-ctx/mark-usage-incomplete! chat-ctx usage)
           ;; cached input (inside :input-tokens, as Codex and Claude Code
           ;; report it) is billed at its own rate, apart
           cache-read (long (or (:cache-read-tokens usage) 0))

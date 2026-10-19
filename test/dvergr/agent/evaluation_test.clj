@@ -12,6 +12,7 @@
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms.forks :as forks]
             [org.replikativ.spindel.core :as sp]
+            [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.protocols :as rtp]
             [org.replikativ.spindel.spin.combinators :as comb]
@@ -559,7 +560,9 @@
         team (roster/make-agent (roster/make-roster)
                                 {:id :candidate :program {:kind :echo}})
         env (definition :test/setup-timeout
-              {:limits {:timeout-ms 20 :cancel-timeout-ms 2000}
+              ;; Admission now consumes this same budget; allow real fork and
+              ;; store setup before exercising the blocked setup worker.
+              {:limits {:timeout-ms 1000 :cancel-timeout-ms 2000}
                :world {:isolation :ctx :settlement :discard
                        :setup {:setup/id :test/slow :setup/version 1}}})
         entered (promise)
@@ -587,7 +590,7 @@
           (is (= true (deref interrupted 1000 ::timeout)))
           (is (= ::evaluation/world-setup-failed
                  (:type (ex-data error))))
-          (is (< (- (System/currentTimeMillis) started) 2000))))
+          (is (< (- (System/currentTimeMillis) started) 5000))))
       (let [[cancelled] (run/runs room)]
         (is (= :cancelled (:run/status cancelled)))
         (is (= :world-setup-cancelled (:run/reason cancelled)))
@@ -798,10 +801,10 @@
         team (roster/make-agent
               (roster/make-roster)
               {:id :slow
-               :program {:kind :scripted :delay-ms 1000 :reply :late}})
+               :program {:kind :scripted :delay-ms 10000 :reply :late}})
         env (definition :test/timeout
               {:task :late
-               :limits {:timeout-ms 10 :cancel-timeout-ms 2000}})
+               :limits {:timeout-ms 1000 :cancel-timeout-ms 2000}})
         timeout-evaluator
         (evaluation/make-evaluator
          {:id :test/exact :version 1 :basis "test:v1"
@@ -822,6 +825,43 @@
           (is (empty? (run/active-runs (:id room))))))
       (finally
         (d/close-room! room)))))
+
+(deftest overdue-completion-is-a-host-fault-and-discards-its-world
+  (doseq [policy [:fault :verdict] mode [:timer-wins :observer-delayed]]
+    (let [room (test-room (keyword (str "overdue-" (name policy) "-" (name mode))))
+          team (roster/make-agent (roster/make-roster) {:id :candidate :program {:kind :echo}})
+          env (definition :test/overdue
+                {:limits {:timeout-ms 1000 :cancel-timeout-ms 2000 :on-timeout policy}})
+          calls (atom 0) timeout-calls (atom 0) timeout comb/timeout
+          evaluator (evaluation/make-evaluator
+                     {:id :test/exact :version 1 :basis "test:v1"
+                      :observe (fn [_] (swap! calls inc) {})
+                      :verify (fn [_ _] (swap! calls inc) {:checks {:ok? true} :reward 1.0})})]
+      (try
+        (binding [ec/*execution-context* (:ctx room)]
+          ;; The second timeout is the owned-result observer, after admission.
+          ;; Force both legal races without changing the candidate's outcome.
+          (with-redefs [comb/timeout
+                        (fn [source ms fallback]
+                          (if (= 2 (swap! timeout-calls inc))
+                            (sp/spin
+                             (let [result (sp/await source)]
+                               (if (= :timer-wins mode)
+                                 fallback
+                                 (do (sp/await (blocking/blocking #(Thread/sleep 1100))) result))))
+                            (timeout source ms fallback)))]
+            (let [error (try @(evaluation/evaluate room team :candidate env evaluator)
+                             nil (catch clojure.lang.ExceptionInfo e e))
+                  [durable] (run/runs room)]
+              (is (= ::evaluation/certification-failed (:type (ex-data error))))
+              (is (= ::evaluation/overdue-completion (:type (ex-data (ex-cause error)))))
+              (is (zero? @calls) "late observation is not evidence for an authored quality verifier")
+              (is (empty? (episode/attempts room)))
+              (is (= :completed (:run/status durable)) "do not rewrite the completed durable Run")
+              (is (nil? (registry/lookup (:run/world durable))))
+              (is (true? (evaluation/await-cleanups! room 2000)))
+              (is (empty? (run/active-runs (:id room)))))))
+        (finally (d/close-room! room))))))
 
 (defrecord BlockingStartStore [delegate entered release]
   store/PRoomStore
@@ -844,6 +884,62 @@
   (-store-attempt! [_ room-id value] (store/-store-attempt! delegate room-id value))
   (-load-attempt [_ room-id attempt-id] (store/-load-attempt delegate room-id attempt-id))
   (-list-attempts [_ room-id opts] (store/-list-attempts delegate room-id opts)))
+
+(deftest deadline-covers-blocked-admission-and-keeps-late-run-owned
+  (let [entered (promise) release (promise)
+        group (evaluation/cleanup-group)
+        room (d/make-room {:id :evaluation-admission-deadline
+                           :store (->BlockingStartStore (memory/make) entered release)})
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :program {:kind :echo}})
+        env (definition :test/admission-deadline
+              {:limits {:timeout-ms 250 :cancel-timeout-ms 2000}})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [attempt (evaluation/evaluate room team :candidate env exact-evaluator
+                                           {:cleanup-group group})
+              result (future (try @attempt (catch Throwable t t)))
+              id (deref entered 2000 ::timeout)
+              error (deref result 3000 ::timeout)]
+          (is (uuid? id))
+          (is (= ::evaluation/admission-timeout (:type (ex-data error))))
+          (is (= :admission (:phase (ex-data error))))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (evaluation/await-cleanups-for! room group 1))
+              "timing out the observer does not release blocked admission")
+          (deliver release true)
+          (is (true? (evaluation/await-cleanups-for! room group 5000)))
+          (is (not= :running (:run/status (run/run room id))))
+          (is (empty? (run/active-runs (:id room))))
+          (is (empty? (episode/attempts room)))
+          (is (empty? (filter #(= :candidate (:from %)) (d/messages room)))
+              "a late admitted Run never performs candidate work")))
+      (finally
+        (deliver release true)
+        (d/close-room! room)))))
+
+(deftest admission-and-execution-share-one-budget
+  (let [entered (promise) release (promise)
+        room (d/make-room {:id :evaluation-shared-deadline
+                           :store (->BlockingStartStore (memory/make) entered release)})
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :program {:kind :scripted :delay-ms 800 :reply "late"}})
+        env (definition :test/shared-deadline
+              {:limits {:timeout-ms 1000 :cancel-timeout-ms 2000}})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [result (future @(evaluation/evaluate room team :candidate env exact-evaluator))]
+          (is (uuid? (deref entered 2000 ::timeout)))
+          (Thread/sleep 500)
+          (deliver release true)
+          (let [attempt (deref result 5000 ::timeout)]
+            (is (not= ::timeout attempt))
+            (is (true? (get-in attempt [:attempt-receipt :attempt/metrics :timed-out?])))
+            (is (not= :completed (get-in attempt [:run/result :run/status]))))
+          (is (empty? (run/active-runs (:id room))))))
+      (finally
+        (deliver release true)
+        (d/close-room! room)))))
 
 (deftest cancellation-during-admission-leaves-no-live-run
   ;; admission runs off the drain and is not interrupted half way: a cell

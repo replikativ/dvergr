@@ -67,6 +67,19 @@
                  (accounting/get-total-cost (:db-conn ctx) (:chat-id ctx)))))
         (finally (chat-ctx/close-chat! ctx))))))
 
+(deftest provider-failure-does-not-turn-previous-known-usage-into-a-complete-total
+  (let [ctx (chat-ctx/create-chat-context {:title "failed-usage" :with-sci? false})]
+    (try
+      (chat-ctx/account-tokens! ctx :input-tokens 10 {:model "claude-code-haiku"})
+      (chat-ctx/account-tokens! ctx :output-tokens 2 {:model "claude-code-haiku"})
+      (with-redefs [agent/messages->api-format (fn [messages _ _] messages)
+                    model-chat/chat (fn [& _] (throw (ex-info "Fixture provider timed out" {:status 504})))]
+        (agent/run-agent-turn! ctx {:provider :test :model "claude-code-haiku" :tools {}
+                                    :auto-compact? false :turn-number 1})
+        (is (= #{:input-tokens :output-tokens} (:unreported-types (chat-ctx/get-budget ctx))))
+        (is (= {:input-tokens 10 :output-tokens 2} (:by-type (chat-ctx/get-budget ctx)))))
+      (finally (chat-ctx/close-chat! ctx)))))
+
 (deftest response-execution-id-determines-the-charge
   (let [ctx (chat-ctx/create-chat-context {:title "execution identity" :with-sci? false})
         old "accounts/fireworks/models/kimi-k2p5"
