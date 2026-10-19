@@ -66,6 +66,10 @@
                 (ec/current-execution-context))]
     (cond
       (descendant-context? bound owner) bound
+      ;; A coordinator can itself own a Session. Its presence does not turn
+      ;; an ancestor accessing a child-owned handle into a fresh particle.
+      ;; Retain the owner, never the ancestor's projection of its state.
+      (descendant-context? owner bound) owner
       (and bound (some? (rtp/get-state bound [:savepoint/session])))
       (throw (ex-info (str "A model in a fresh inference world cannot reach room state; "
                            "run it with {:world-policy :fork}")

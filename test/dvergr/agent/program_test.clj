@@ -18,6 +18,7 @@
             [dvergr.model.providers :as providers]
             [dvergr.agent.spend :as spend]
             [dvergr.resource :as resource]
+            [dvergr.resource.authority :as authority]
             [dvergr.room.registry :as registry]
             [dvergr.rooms.forks :as forks]
             [dvergr.room.store :as room-store]
@@ -30,8 +31,11 @@
             [kontor.governance :as kontor-governance]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.effects.await :refer [await]]
+            [org.replikativ.spindel.effects.savepoint :as savepoint]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.spin.sync :as sync]
+            [org.replikativ.spindel.world.scope :as world-scope]
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.spin.combinators :as comb]
@@ -1329,6 +1333,195 @@
               (is (uuid? (get-in result [:run/metrics :prompt-id])))))))
       (finally
         (d/close-room! room)))))
+
+(deftest session-recovery-retains-supervisor-until-close-acknowledges
+  (let [room (test-room :program-session-recovery)
+        supervisor (binding [ec/*execution-context* (:ctx room)]
+                     (#'program/make-supervisor (:ctx room)))
+        attempts (atom 0)
+        second-attempt (promise)
+        first-error (ex-info "refund unavailable" {})]
+    (try
+      (with-redefs [savepoint/close!
+                    (fn [_]
+                      (fn [resolve reject]
+                        (if (= 1 (swap! attempts inc))
+                          (reject first-error)
+                          (deliver second-attempt resolve))))]
+        (binding [ec/*execution-context* (:ctx room)]
+          (#'program/register-cleanup!
+           supervisor #(#'program/close-session-reconciled! {:id ::session}))
+          (#'program/mark-cleanup-safe! supervisor)
+          (#'program/seal-supervisor! supervisor)
+          (let [ack (deref second-attempt 5000 ::timeout)]
+            (is (fn? ack))
+            (is (= 2 @attempts) "a rejected close retries")
+            (is (false? (:quiesced? @(:state supervisor))))
+            (is (= :running (:cleanup-phase @(:state supervisor))))
+            (is (= 1 (count (:workers @(:state supervisor))))
+                "the cleanup lease retains the session and fences wallet return")
+            (when (fn? ack) (ack :closed))
+            (is (.await ^java.util.concurrent.CountDownLatch
+                 (:quiesced-latch supervisor) 5000
+                        java.util.concurrent.TimeUnit/MILLISECONDS))
+            (is (nil? (:cleanup-error @(:state supervisor)))))))
+      (finally
+        (when-let [ack (deref second-attempt 1000 nil)] (ack :closed))
+        (d/close-room! room)))))
+
+(deftest session-installation-failure-disposes-only-the-unadmitted-world
+  (let [room (test-room :program-session-install-failure)
+        parent-session (savepoint/open! (:ctx room) {:seed 7})
+        opened (atom nil)
+        original-open savepoint/open!]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (with-redefs [savepoint/open!
+                      (fn [world opts]
+                        (reset! opened (original-open world opts))
+                        (throw (ex-info "session installation acknowledgement lost" {})))]
+          (is (thrown-with-msg?
+               clojure.lang.ExceptionInfo #"acknowledgement lost"
+               (program/hire! room (test-roster) :analyst {:task :never-admitted}))))
+        (is (some? @opened))
+        (is (empty? (:activities @(:scope @opened))))
+        (is (= :discarded (:status @(:scope @opened))))
+        (is (empty? (registry/children (:id room))))
+        (is (empty? (registry/structural-children (:id room))))
+        (is (empty? (run/active-runs (:id room))))
+        (is (identical? parent-session (savepoint/session (:ctx room))))
+        (is (false? @(:closing? parent-session))))
+      (finally
+        (let [done (promise)]
+          ((savepoint/close! parent-session) #(deliver done %) #(deliver done %))
+          (deref done 5000 nil))
+        (d/close-room! room)))))
+
+(deftest early-admission-failures-close-the-owned-session
+  (doseq [stage [:trigger :allocation :watcher]]
+    (let [room (test-room (keyword (str "program-session-early-" (name stage))))
+          captured (atom nil)
+          original-open savepoint/open!
+          original-post d/post!
+          failure (ex-info "admission interrupted" {:stage stage})
+          injected (case stage
+                     :trigger {#'d/post! (fn [& args] (apply original-post args) (throw failure))}
+                     :allocation {#'resource/allocate-run! (fn [& _] (throw failure))}
+                     :watcher {#'program/finalize-execution-external! (fn [& _] (throw failure))})]
+      (try
+        (with-redefs-fn
+          (assoc injected #'savepoint/open!
+                 (fn [world opts] (let [session (original-open world opts)]
+                                    (reset! captured session)
+                                    session)))
+          (fn []
+            (binding [ec/*execution-context* (:ctx room)]
+              (is (thrown-with-msg? clojure.lang.ExceptionInfo #"admission interrupted"
+                                    (program/hire! room (test-roster) :analyst {:task :fail-early})))
+              (is (some? @captured))
+              (is (true? @(:closing? @captured)))
+              (is (empty? (:activities @(:scope @captured))))
+              (is (= :discarded (:status @(:scope @captured))))
+              (is (empty? (registry/children (:id room))))
+              (is (empty? (run/active-runs (:id room)))))))
+        (finally (d/close-room! room))))))
+
+(deftest nested-run-settles-its-own-worlds-before-returning-its-wallet
+  (let [[room conn] (resource-test-room :program-nested-session-funding)
+        team (-> (roster/make-roster)
+                 (roster/make-agent {:id :parent :program {:kind :echo}})
+                 (roster/make-agent {:id :child :program {:kind :echo}}))
+        parent-runtime (promise)
+        child-runtime (promise)
+        blocked-world (atom nil)
+        blocked? (atom true)
+        refund-entered (promise)
+        original-authority authority/authority
+        cps (fn [op]
+              (let [done (promise)]
+                (op #(deliver done [:ok %]) #(deliver done [:error %]))
+                (let [[kind value] (deref done 5000 [:error (ex-info "fork timed out" {})])]
+                  (if (= :ok kind) value (throw value)))))
+        execute (fn [_ work-room _ _ agent _ _ supervisor]
+                  (let [done (sync/deferred)
+                        done-context ec/*execution-context*]
+                    (sp/spin
+                     (deliver (if (= :parent (:agent/id agent)) parent-runtime child-runtime)
+                              [supervisor work-room done done-context])
+                     (sp/await done)
+                     {::program/status :completed ::program/value :done})))]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10M}})
+      (with-redefs-fn
+        {#'program/execute-program execute
+         #'authority/authority
+         (fn [control-room]
+           (let [delegate (original-authority control-room)]
+             (reify world-scope/PResourceAuthority
+               (grant! [_ source child grant] (world-scope/grant! delegate source child grant))
+               (return! [_ child]
+                 (when (and @blocked? (= @blocked-world (:fork-id child)))
+                   (deliver refund-entered true)
+                   (throw (ex-info "refund backend unavailable" {})))
+                 (world-scope/return! delegate child))
+               (balance [_ context] (world-scope/balance delegate context))
+               (escrow! [_ context key] (world-scope/escrow! delegate context key))
+               (claim! [_ key context] (world-scope/claim! delegate key context)))))}
+        (fn []
+          (binding [ec/*execution-context* (:ctx room)]
+            (let [parent (program/hire! room team :parent
+                                        {:task :coordinate :resources {resource/microdollars 10M}})
+                  [supervisor parent-work parent-done parent-done-context] (deref parent-runtime 5000 nil)
+                  parent-session (savepoint/session (:ctx parent-work))
+                  parent-world (:child-ctx
+                                (cps #(world-scope/fork! (:scope parent-session) (:ctx parent-work)
+                                                         {:grant {resource/microdollars 2M}} %1 %2)))
+                  child (binding [ec/*execution-context* (:ctx parent-work)]
+                          (#'program/with-owned-child!
+                           supervisor
+                           #(program/hire-in! room parent-work team :child
+                                              {:task :work :parent-run (program/run-id parent)
+                                               :resources {resource/microdollars 4M}})))
+                  [_ child-work child-done child-done-context] (deref child-runtime 5000 nil)
+                  child-session (savepoint/session (:ctx child-work))
+                  child-world (:child-ctx
+                               (cps #(world-scope/fork! (:scope child-session) (:ctx child-work)
+                                                        {:grant {resource/microdollars 3M}} %1 %2)))]
+              (is (not= (:id parent-session) (:id child-session)))
+              (reset! blocked-world (:fork-id child-world))
+              (binding [ec/*execution-context* child-done-context] (child-done :finish))
+              (is (= true (deref refund-entered 5000 ::timeout)))
+              (is (= ::timeout
+                     (binding [ec/*execution-context* (:ctx parent-work)] (deref child 100 ::timeout))))
+              (is (= {resource/microdollars 1M} (resource/run-balance room (program/run-id child))))
+              (is (= {resource/microdollars 4M} (resource/run-balance room (program/run-id parent))))
+              (is (= 1 (count (world-scope/handles @(:scope parent-session))))
+                  "child cleanup leaves the parent's unrelated world live")
+              (is (= (:id parent-session) (:id (savepoint/session (:ctx parent-work)))))
+              (is (false? @(:closing? parent-session)))
+              (is (ygg/open-fork? (first (world-scope/handles @(:scope parent-session)))))
+              (is (= {resource/microdollars 2M}
+                     (world-scope/balance (:authority @(:scope parent-session)) parent-world)))
+              (is (binding [ec/*execution-context* (:ctx parent-work)] (program/cancel! child)))
+              (is (= ::timeout
+                     (binding [ec/*execution-context* (:ctx parent-work)] (deref child 100 ::timeout)))
+                  "cancellation cannot abandon a pending financial cleanup")
+              (reset! blocked? false)
+              (is (map? (binding [ec/*execution-context* (:ctx parent-work)] (deref child 5000 ::timeout))))
+              (is (= {} (resource/run-balance room (program/run-id child))))
+              (is (= {resource/microdollars 8M} (resource/run-balance room (program/run-id parent))))
+              (is (= 1 (count (world-scope/handles @(:scope parent-session)))))
+              (binding [ec/*execution-context* parent-done-context] (parent-done :finish))
+              (is (= :completed (:run/status (deref parent 5000 ::timeout))))
+              (is (= {resource/microdollars 10M} (resource/balance room)))
+              (is (= {} (resource/run-balance room (program/run-id parent))))
+              (is (empty? (run/active-runs (:id room))))))))
+      (finally
+        (reset! blocked? false)
+        (doseq [runtime [parent-runtime child-runtime]]
+          (when-let [[_ _ done done-context] (deref runtime 100 nil)]
+            (binding [ec/*execution-context* done-context] (done :cleanup))))
+        (close-resource-test-room! room conn)))))
 
 (deftest llm-cleanup-failure-retains-collected-metrics
   (let [room (test-room :program-llm-cleanup-failure)

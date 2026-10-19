@@ -394,6 +394,7 @@
   (let [{:keys [team definition]} (fixture)
         room (d/make-room {:id :experiment-partial-failure
                            :store (memory/make)})
+        cleanup-group (evaluation/cleanup-group)
         failing-evaluator
         (evaluation/make-evaluator
          {:id :test/exact
@@ -410,7 +411,11 @@
              clojure.lang.ExceptionInfo #"certification failed"
              @(experiment/run room team definition
                               {(:ref failing-evaluator) failing-evaluator}
-                              {:parallelism 1})))
+                              {:parallelism 1 :cleanup-group cleanup-group})))
+        ;; Failure is fail-fast: a newly admitted sibling can still own native
+        ;; cleanup. Join this operation's documented host barrier before
+        ;; asserting physical quiescence, not merely delivery of the error.
+        (is (true? (evaluation/await-cleanups-for! room cleanup-group 5000)))
         (is (empty? (run/active-runs (:id room))))
         (let [runs (run/runs room {:limit 20})]
           (is (seq runs))

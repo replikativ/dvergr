@@ -99,8 +99,9 @@
         ;; ExecutionContext; clojure.lang.Var/Namespace are closed classes;
         ;; bound-fn runs in the fork it is called in (#121).
         ;; Nil-grant authority initialization is required, including forks of
-        ;; plain Room contexts (spindel#145, released as 0.1.132).
-        org.replikativ/spindel     {:mvn/version "0.1.132"}
+        ;; plain Room contexts, source-preserving failed-copy recovery, and
+        ;; independent Sessions at fork creation (spindel#145/#146).
+        org.replikativ/spindel     {:mvn/version "0.1.133"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,

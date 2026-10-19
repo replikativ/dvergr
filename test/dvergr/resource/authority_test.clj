@@ -22,6 +22,8 @@
             [org.replikativ.spindel.effects.savepoint :as savepoint]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.protocols :as rtp]
+            [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.world.scope :as world-scope]))
 
 (defn- ledger-room []
@@ -308,6 +310,108 @@
           (context/stop-context! root)
           (kontor-governance/ungovern! conn)
           (d/close-room! room))))))
+
+(deftest unreadable-committed-grants-retain-live-recovery-ownership
+  (doseq [copy? [false true]]
+    (let [[room conn] (ledger-room)
+          root (context/create-execution-context)
+          blocked? (atom false)
+          armed? (atom false)
+          grants (atom 0)
+          st (:store room)
+          fault-store (reify room-store/PResourceStore
+                        (-open-resource-wallet! [_ spec] (room-store/-open-resource-wallet! st spec))
+                        (-install-resource-unit! [_ spec] (room-store/-install-resource-unit! st spec))
+                        (-allocate-resource-wallet! [_ wallet transfer]
+                          (room-store/-allocate-resource-wallet! st wallet transfer))
+                        (-resource-balance [_ account]
+                          (when @blocked? (throw (ex-info "ledger unavailable" {})))
+                          (room-store/-resource-balance st account))
+                        (-resource-receipt [_ id]
+                          (when @blocked? (throw (ex-info "ledger unavailable" {})))
+                          (room-store/-resource-receipt st id))
+                        (-transfer-resources! [_ command]
+                          (let [result (room-store/-transfer-resources! st command)]
+                            (when (and @armed? (= :grant (:kind command))
+                                       (= (if copy? 2 1) (swap! grants inc)))
+                              (reset! blocked? true)
+                              (throw (ex-info "committed grant acknowledgement lost" {})))
+                            result)))
+          auth (authority/authority (assoc room :store fault-store))
+          scope (open-scope auth)]
+      (try
+        (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10M}})
+        (let [source (when copy?
+                       (:child-ctx (cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2))))]
+          (reset! armed? true)
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires cleanup"
+                                (if copy?
+                                  (cps #(world-scope/copy! scope source 2 {:split? true} %1 %2))
+                                  (cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2)))))
+          (is @blocked?)
+          (is (zero? (:pending-forks @scope)))
+          (is (= (if copy? 2 1) (count (:recovery @scope))))
+          (is (= (if copy? 1 0) (count (world-scope/handles @scope))))
+          (is (every? (comp ygg/open-fork? :handle val) (:recovery @scope)))
+          (let [contexts (map (comp :child-ctx :handle val) (:recovery @scope))
+                accounts (map #(rtp/get-state % [:dvergr/wallet :account]) contexts)]
+            (is (= 4M (reduce + (map #(usd room %) accounts))) "funds remain owned, not silently refunded or lost")
+            (doseq [ctx contexts
+                    :when (= :pending (rtp/get-state ctx [:dvergr/wallet :funding]))]
+              (binding [ec/*execution-context* ctx]
+                (is (thrown? clojure.lang.ExceptionInfo (resource/charge-spend! 1M))))))
+          (when copy? (is (ygg/open-fork? (first (world-scope/handles @scope)))))
+          (reset! blocked? false)
+          (cps (world-scope/recover! scope))
+          (is (empty? (:recovery @scope)))
+          (when copy? (is (= 4M (usd room (authority/wallet-of room source)))))
+          (close-scope scope)
+          (is (= 10M (get (resource/balance room) resource/microdollars))))
+        (finally
+          (reset! blocked? false)
+          (close-scope scope)
+          (context/stop-context! root)
+          (kontor-governance/ungovern! conn)
+          (d/close-room! room))))))
+
+(deftest missing-receipt-does-not-retire-a-still-pending-grant
+  (let [[room conn] (ledger-room)
+        root (context/create-execution-context)
+        pending (atom nil)
+        calls (atom 0)
+        st (:store room)
+        fault-store (reify room-store/PResourceStore
+                      (-open-resource-wallet! [_ spec] (room-store/-open-resource-wallet! st spec))
+                      (-install-resource-unit! [_ spec] (room-store/-install-resource-unit! st spec))
+                      (-allocate-resource-wallet! [_ wallet transfer]
+                        (room-store/-allocate-resource-wallet! st wallet transfer))
+                      (-resource-balance [_ account] (room-store/-resource-balance st account))
+                      (-resource-receipt [_ id] (room-store/-resource-receipt st id))
+                      (-transfer-resources! [_ command]
+                        (if (and (= :grant (:kind command)) (= 1 (swap! calls inc)))
+                          (do (reset! pending command)
+                              (throw (ex-info "wait interrupted before queued grant commits" {})))
+                          (do
+                            (when-let [original @pending]
+                              ;; The original writer completes after the failed wait.
+                              (room-store/-transfer-resources! st original)
+                              (reset! pending nil))
+                            (room-store/-transfer-resources! st command)))))
+        auth (authority/authority (assoc room :store fault-store))
+        scope (open-scope auth)]
+    (try
+      (resource/mint! room {:id (random-uuid) :resources {resource/microdollars 10M}})
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"wait interrupted"
+                            (cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2))))
+      (is (nil? @pending) "cleanup fenced the original command by identical replay")
+      (is (empty? (:recovery @scope)))
+      (is (empty? (world-scope/handles @scope)))
+      (is (= 10M (get (resource/balance room) resource/microdollars)))
+      (finally
+        (close-scope scope)
+        (context/stop-context! root)
+        (kontor-governance/ungovern! conn)
+        (d/close-room! room)))))
 
 (deftest a-scope-fork-moves-ledger-budget
   (let [[room conn] (ledger-room)
