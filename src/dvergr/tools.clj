@@ -170,13 +170,11 @@
 ;; config (plain data), should you want one.
 
 (defn- resolve-default-workspace []
-  (try
-    (when-let [workspace ((requiring-resolve
-                           'dvergr.substrate.geschichte/current-workspace))]
-      {:workspace workspace
-       :filesystem ((requiring-resolve 'dvergr.substrate.geschichte/filesystem)
-                    workspace)})
-    (catch Throwable _ nil)))
+  (when-let [workspace ((requiring-resolve
+                         'dvergr.substrate.geschichte/optional-workspace))]
+    {:workspace workspace
+     :filesystem ((requiring-resolve 'dvergr.substrate.geschichte/filesystem)
+                  workspace)}))
 
 (defn- resolve-default-cwd
   "Working directory for tool calls when none is supplied. Priority:

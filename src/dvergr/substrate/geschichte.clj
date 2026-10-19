@@ -147,16 +147,67 @@
     (when (d/database-exists? cfg)
       (sdh/delete-database! cfg))))
 
-(defn current-system
-  "The room-owned Geschichte system in the bound Spindel context."
+(def ^:private selection-path [:dvergr :workspace :selected-system])
+
+(defn- selection-state []
+  (let [state (ec/get-state (pop selection-path))]
+    (when-not (or (nil? state) (map? state))
+      (throw (ex-info "Workspace selection state is malformed"
+                      {:type ::invalid-workspace-selection})))
+    state))
+
+(defn workspace-selected?
+  "Whether this context has an explicit selection marker. Presence matters:
+   a corrupt nil/invalid selected id must never enable legacy fallback."
   []
-  (let [systems (->> (ygg/registered-systems)
-                     vals
-                     (filter #(= :geschichte (p/system-type %))))]
-    (or (first (filter #(some-> (p/system-id %) str
-                                (str/starts-with? "room-repo-"))
-                       systems))
-        (first systems))))
+  (contains? (selection-state) (peek selection-path)))
+
+(defn selected-system-id
+  "The explicit logical workspace selection in the bound execution context,
+   or nil when no host selection was made. Portable data only: forks inherit
+   the identity, not a parent connection or filesystem handle."
+  []
+  (get (selection-state) (peek selection-path)))
+
+(defn- selected-system! [id]
+  (when-not (and (string? id) (<= 1 (count id) 4096) (not (str/blank? id)))
+    (throw (ex-info "Workspace selection requires an exact logical system id"
+                    {:type ::invalid-workspace-selection})))
+  (let [matches (filterv #(= id (str (p/system-id %)))
+                         (vals (ygg/registered-systems)))]
+    (when-not (and (= 1 (count matches))
+                   (= :geschichte (p/system-type (first matches))))
+      (throw (ex-info "Selected Geschichte workspace is missing or ambiguous"
+                      {:type ::selected-workspace-unavailable :system/id id})))
+    (first matches)))
+
+(defn select-workspace!
+  "HOST API: select one registered Geschichte system by its exact string id
+   in the bound Spindel context. This is resolution, NOT authorization. It
+   neither changes registry ownership nor returns a connection/capability.
+   The selection is fork-local computation state and follows async work that
+   binds that context. Missing selections never fall back to another repo.
+   Validation is a snapshot, not a lease against concurrent unregistration."
+  [id]
+  (selected-system! id)
+  (ec/swap-state! selection-path (constantly id)))
+
+(defn current-system
+  "The selected Geschichte system in the bound Spindel context. An explicit
+   host selection must resolve exactly, including after a fork; unavailable
+   selections throw. Only unselected legacy callers use the room-prefix/first
+   registered fallback."
+  []
+  (let [selection (selection-state)]
+    (if (contains? selection (peek selection-path))
+      (selected-system! (get selection (peek selection-path)))
+      (let [systems (->> (ygg/registered-systems)
+                         vals
+                         (filter #(= :geschichte (p/system-type %))))]
+        (or (first (filter #(some-> (p/system-id %) str
+                                    (str/starts-with? "room-repo-"))
+                           systems))
+            (first systems))))))
 
 ;; Small named accessors keep dvergr.system.rooms independent of Geschichte's
 ;; record fields while it resolves a specific attached repository by system id.
@@ -174,6 +225,21 @@
        :repository {:conn conn
                     :config (:config @conn)
                     :workspace-branch (get-in @conn [:config :branch])}})))
+
+(defn optional-workspace
+  "Compatibility boundary for legacy callers that have no workspace. Resolve
+   the current virtual workspace, or nil after an unselected resolution error.
+   An explicit marker before OR after a failed lookup makes the error fatal,
+   including a corrupt nil/invalid selection: never switch those callers to a
+   native or other-repository fallback."
+  []
+  (when (ec/execution-context-bound?)
+    (let [selected? (workspace-selected?)]
+      (try
+        (current-workspace)
+        (catch Throwable e
+          (when (or selected? (workspace-selected?)) (throw e))
+          nil)))))
 
 (defn filesystem
   "Create a Muschel MountFS rooted in a workspace descriptor. The returned
@@ -240,10 +306,23 @@
   Excludes `review-excluded-prefixes` — media travels with the fork, it just
   does not show up as something to review."
   [fork-ctx]
-  (let [in-ctx (fn [ctx]
-                 (binding [ec/*execution-context* ctx] (current-system)))
-        fork-system (in-ctx fork-ctx)
-        parent-system (some-> fork-ctx :parent-ctx in-ctx)]
+  (let [{fork-system :system explicit? :explicit?}
+        (binding [ec/*execution-context* fork-ctx]
+          {:system (current-system) :explicit? (workspace-selected?)})
+        parent-system
+        (when fork-system
+          (if-let [parent (:parent-ctx fork-ctx)]
+            (binding [ec/*execution-context* parent]
+              (let [id (str (p/system-id fork-system))
+                    matches (filterv #(= id (str (p/system-id %)))
+                                     (vals (ygg/registered-systems)))]
+                ;; A legacy child-only workspace has an empty baseline. An
+                ;; explicitly selected workspace must have its exact parent
+                ;; counterpart, never the parent's differently selected repo.
+                (when (or explicit? (seq matches)) (selected-system! id))))
+            (when explicit?
+              (throw (ex-info "Selected workspace diff requires its parent context"
+                              {:type ::selected-workspace-unavailable})))))]
     (when fork-system
       (let [conn (gy/connection fork-system)
             parent-conn (some-> parent-system gy/connection)
