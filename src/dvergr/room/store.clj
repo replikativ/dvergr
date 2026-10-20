@@ -93,6 +93,13 @@
      with :status or :actor; callers should project the bounded subtree and
      filter it explicitly."))
 
+(defprotocol PRunSavepointStore
+  "Optional fixed Run checkpoint publication; no caller callbacks or authority."
+  (-record-run-savepoint! [this room-id run-id origin expected data prepared]
+    "Publish exact typed conversation root+descriptor against expected latest checkpoint.")
+  (-load-run-conversation [this room-id run-id expected]
+    "Load and validate the conversation for one exact current checkpoint before admission."))
+
 (defprotocol PMessageBatchStore
   "Several messages of one Room in one durable write, in order."
   (-store-messages! [store room-id msgs]
@@ -418,7 +425,7 @@
     :run/role
     ;; resuming (doc/runs.md, Resuming a Run): the latest portable savepoint, as EDN,
     ;; and the Run that continued from it
-    :run/savepoint :run/resumed-by
+    :run/savepoint :run/conversation-ref :run/resumed-by
     ;; a search's record on each member (dvergr.agent.search), as EDN
     :run/search})
 

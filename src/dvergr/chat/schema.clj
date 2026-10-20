@@ -688,6 +688,11 @@
     :db/cardinality :db.cardinality/one
     :db/doc "The Run's latest portable savepoint (spindel savepoint.portable/persist), EDN: what resuming it continues from (doc/runs.md, Resuming a Run)"}
 
+   {:db/ident :run/conversation-ref
+    :db/valueType :db.type/store-ref
+    :db/cardinality :db.cardinality/one
+    :db/doc "GC-tracked exact working conversation for the latest turn savepoint"}
+
    {:db/ident :run/resumed-by
     :db/valueType :db.type/uuid
     :db/cardinality :db.cardinality/one
