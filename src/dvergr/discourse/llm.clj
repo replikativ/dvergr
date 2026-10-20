@@ -49,6 +49,7 @@
             [dvergr.chat.context :as cc]
             [dvergr.chat.agent :as ca]
             [dvergr.agent.run :as run]
+            [dvergr.agent.program :as program]
             [dvergr.agent.turn :as turn]
             [dvergr.agent.room-context :as room-context]
             [dvergr.sandbox.extensions :as extensions]
@@ -59,6 +60,7 @@
             [dvergr.participant.context :as pctx]
             [dvergr.agent.process :as proc]
             [dvergr.room.store :as rstore]
+            [dvergr.runtime.preparation :as preparation]
             [dvergr.system.rooms :as srooms]
             [dvergr.model.registry :as model-registry]
             [dvergr.model.quirks :as quirks]
@@ -84,6 +86,60 @@
     (if-let [provider (some-> (:model spec) model-registry/get-model :provider)]
       (assoc spec :provider provider)
       spec)))
+
+(defn- prepare-participant
+  "One owned native preparation, admitted before dispatch and awaited reactively."
+  [participant execution-ctx construct publish]
+  (sp/spin
+   (let [scope (program/preparation-scope execution-ctx)
+         consumed? (atom false)
+         room (:room participant)
+         lease (when room
+                 (preparation/admit!
+                  room participant
+                  {:cancel! #(program/cancel-preparation! scope)
+                   :join! #(program/await-preparation! scope %)
+                   :admission-ready? #(and @consumed? (program/preparation-admission-ready? scope))
+                   :finished? #(program/preparation-finished? scope)}))]
+     (let [result
+           (try
+             (let [worker (program/start-preparation!
+                           scope #(construct lease (partial program/register-preparation-cleanup! scope)))
+                   prepared (sp/await (program/preparation-result worker))
+                   result (if lease
+                            (preparation/with-current!
+                              lease #(program/with-preparation-decision! scope (fn [] (publish prepared))))
+                            (program/with-preparation-decision! scope #(publish prepared)))]
+               (reset! consumed? true)
+               result)
+             (catch Throwable error
+               (program/cancel-preparation! scope)
+               (throw error))
+             (finally
+               (program/complete-preparation! scope)))]
+       (sp/await (program/preparation-completion scope))
+       result))))
+
+(defn- turn-runtime
+  [room chat-ctx configured-tool-ctx configured-tools spec actor db-conn interpreter]
+  (let [tool-map (tools/normalize-tools configured-tools)]
+    {:chat-ctx chat-ctx
+     :tool-map tool-map
+     :tool-ctx (or configured-tool-ctx
+                   (-> (tools/make-context
+                        {:db-conn (or (:db-conn chat-ctx) db-conn)
+                         :chat-ctx chat-ctx :sci-ctx (or interpreter (cc/sci-context chat-ctx))
+                         :tools tool-map :isolation (or (:isolation spec) :sci)
+                         :actor actor})
+                       (assoc :workspace-roots
+                              (when room
+                                (srooms/roots-for-slug
+                                 (rstore/room-id->slug (:id room)))))
+                       (assoc :kb-conn
+                              (when room
+                                (srooms/kb-conn-for-slug
+                                 (rstore/room-id->slug (:id room)))))
+                       (assoc :room room)))}))
 
 (defn- assistant-text
   "Extract a string from an assistant message entity. Handles plain-string
@@ -353,14 +409,25 @@
                    ;; room store, updated by explicit attention admission, stable id (budget +
                    ;; persistence across restart/fork). Room-less → the fallback ctx.
                    ;; Directives AND the turn loop share this resolved chat-ctx.
-                     chat-ctx (if room
-                                (room-context/ensure-ctx! room id
-                                                          {:system-prompt  (:system-prompt spec)
-                                                           :budget-dollars (:dollars budget 1.0)
-                                                           ;; the agent's own set, so a context built
-                                                           ;; for more is rebuilt
-                                                           :sandbox        (or sandbox #{})})
-                                @fallback-chat-ctx)]
+                     runtime
+                     (sp/await
+                      (prepare-participant
+                       p turn-ctx
+                       (fn [lease own-cleanup!]
+                         (let [stage (when room
+                                       (room-context/stage-ctx!
+                                        room id {:system-prompt (:system-prompt spec)
+                                                 :budget-dollars (:dollars budget 1.0)
+                                                 :sandbox (or sandbox #{})}
+                                        lease own-cleanup!))
+                               chat-ctx (if stage (get-in stage [:entry :chat-ctx]) @fallback-chat-ctx)]
+                           (model-registry/ensure-models-loaded!)
+                           (assoc (turn-runtime room chat-ctx tool-ctx tools spec id db-conn (:interpreter stage))
+                                  :stage stage)))
+                       (fn [{:keys [stage] :as runtime}]
+                         (when stage (room-context/publish-staged! stage))
+                         runtime)))
+                     chat-ctx (:chat-ctx runtime)]
                  (case (:type msg)
 
                ;; --- directive: extend the dollar budget ---
@@ -408,40 +475,8 @@
                          sci-ctx  (cc/sci-context chat-ctx)
                      ;; Normalize once: name→tool-def map (also the execute-side
                      ;; authoritative allowlist below).
-                         tool-map (tools/normalize-tools tools)
-                         tool-ctx (or tool-ctx
-                                      (-> (tools/make-context
-                                        ;; The RESOLVED ctx's conn (a fork's isolated
-                                        ;; conn under a fork) so KB/tool writes land in
-                                        ;; the fork, not the parent — fork isolation.
-                                           {:db-conn   (or (:db-conn chat-ctx) db-conn)
-                                            :chat-ctx  chat-ctx
-                                            :sci-ctx   sci-ctx
-                                         ;; AUTHORITATIVE allowlist — execute refuses
-                                         ;; any tool outside this set (defense in depth
-                                         ;; vs. hallucinated / injected tool names).
-                                            :tools     tool-map
-                                            :isolation (or (:isolation spec) :sci)
-                                         ;; the agent its tool calls run for
-                                            :actor     id})
-                                      ;; P2c: the room's own + attached code repos for
-                                      ;; the SCI load-fn (resolved first, base after).
-                                          (assoc :workspace-roots
-                                                 (when room
-                                                   (srooms/roots-for-slug
-                                                    (rstore/room-id->slug (:id room)))))
-                                      ;; RF4: the room's OWN KB conn (fork-aware) —
-                                      ;; knowledge_add/search write/read
-                                      ;; here, while :task/logging tools keep :db-conn
-                                      ;; (the chat DB). nil when room-less or the room
-                                      ;; isn't provisioned → tools fall back to :db-conn.
-                                          (assoc :kb-conn
-                                                 (when room
-                                                   (srooms/kb-conn-for-slug
-                                                    (rstore/room-id->slug (:id room)))))
-                                      ;; RF5: the Room itself, so room-scoped tools
-                                      ;; (schedule_*) write into THIS room's store.
-                                          (assoc :room room)))
+                         tool-map (:tool-map runtime)
+                         tool-ctx (:tool-ctx runtime)
                          run-ref           (when room (run/start! room id msg chat-ctx))
                          run-id            (:run/id run-ref)
                          ;; This handler's Spin was cancelled (the participant

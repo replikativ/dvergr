@@ -103,7 +103,7 @@
    writer). Returns the ChatContext."
   [{:keys [execution-ctx chat-id title budget-dollars db-conn kb-conn room-id
            room-runtime-id room-incarnation capability-id agent-program-ceiling
-           durable? allowed-domains agent-id effects sandbox-extensions]}]
+           durable? allowed-domains agent-id effects sandbox-extensions own-cleanup!]}]
   (binding [rtc/*execution-context* execution-ctx]
     (let [capability-id (or capability-id (random-uuid))
           cctx (assoc (cond-> (chat-ctx/create-chat-context
@@ -121,12 +121,22 @@
                       ;; the AgentDef's sandbox extensions, installed on every rebind
                       :sandbox-extensions (set sandbox-extensions)
                       ;; every effect the sandbox performs, newest last
-                      :receipts (effects/make-sink))]
+                      :receipts (effects/make-sink))
+          cctx (chat-ctx/reset-extension-owners cctx execution-ctx sandbox-extensions)
+          cleanup-transferred? (atom false)]
       ;; create-chat-context forks a sci-ctx but does NOT inject the ctx-bound
       ;; namespaces — do it here so clojure_eval has the room/kb/intake nses
       ;; everywhere. `db-conn` is the room's OWN messages store (= `*room*`);
       ;; `kb-conn` its OWN knowledge base (= `*kb*`) — both fork-aware, never sdb.
       (try
+        ;; An owned setup worker must retain even a partially bound interpreter
+        ;; until its physical exit acknowledgement. Ordinary synchronous callers
+        ;; keep the lexical cleanup behavior below.
+        (when own-cleanup!
+          (when-not (true? (own-cleanup! cctx))
+            (throw (ex-info "Preparation cleanup ownership was not acknowledged"
+                            {:type ::cleanup-transfer-refused})))
+          (reset! cleanup-transferred? true))
         (rebind-working-ctx! cctx {:execution-ctx execution-ctx
                                    :db-conn db-conn :kb-conn kb-conn
                                    :room-id room-id :room-runtime-id room-runtime-id
@@ -140,10 +150,11 @@
         (catch Throwable error
           ;; Namespace/resource installation is part of construction. A caller
           ;; must never receive—or lose track of—a half-bound interpreter.
-          (try
-            (chat-ctx/release-sci-in! cctx execution-ctx)
-            (catch Throwable cleanup-error
-              (.addSuppressed error cleanup-error)))
+          (when-not @cleanup-transferred?
+            (try
+              (chat-ctx/release-sci-in! cctx execution-ctx)
+              (catch Throwable cleanup-error
+                (.addSuppressed error cleanup-error))))
           (throw error))))))
 
 ;; Reserved `:to` id for agent tool-activity messages posted into a room.

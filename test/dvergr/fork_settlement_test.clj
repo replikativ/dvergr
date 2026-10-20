@@ -11,7 +11,9 @@
             [dvergr.ops :as ops]
             [dvergr.room.registry :as rreg]
             [dvergr.rooms.forks :as forks]
+            [dvergr.runtime.preparation :as preparation]
             [dvergr.sandbox.work :as sandbox-work]
+            [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]))
 
 (defn- paused-close
@@ -224,7 +226,89 @@
                 "the retry passes the ended attempt's claim and meets the recovery fence")
             (is (= {:op :merged :parent (:id parent)} (d/settlement-claim fork)) "the claim still stays")
             (is (= :lost (:outcome (d/discard-outcome fork)))))))
-      (finally (d/close-room! parent)))))
+      (let [claim (d/settlement-claim fork)]
+        (d/close-room! fork)
+        (is (= claim (d/settlement-claim fork)) "explicit cleanup preserves the failed merge's claim")
+        (is (nil? (d/settlement fork)) "cleanup does not pretend the semantic merge completed"))
+      (finally
+        (d/close-room! fork)
+        (d/close-room! parent)))))
+
+(deftest post-settlement-close-joins-cleanup-without-stealing-an-active-retry
+  (let [parent (d/room :settle-close-recovery)
+        fork (d/fork-room parent {:isolation :ctx})
+        leave-all @#'d/leave-all!
+        begin @#'d/begin-room-quiescence!
+        retry-entered (promise)
+        retry-go (promise)
+        release? (atom false)
+        releases (atom 0)
+        failure-type #(try (%) nil
+                           (catch clojure.lang.ExceptionInfo error (:type (ex-data error))))
+        registered? #(binding [ec/*execution-context* (:ctx parent)]
+                       (identical? % (rreg/lookup (:id %))))]
+    (try
+      (with-redefs-fn {#'d/leave-all! (fn [room]
+                                        (if (identical? room fork)
+                                          (throw (ex-info "post-settlement cleanup failed" {}))
+                                          (leave-all room)))}
+        #(is (thrown-with-msg? clojure.lang.ExceptionInfo #"post-settlement cleanup failed"
+                               (d/merge-room parent fork))))
+      (let [claim (d/settlement-claim fork)
+            handle! d/fork-handle
+            handle (d/fork-handle fork)]
+        (doseq [authority [(assoc @(:authority handle) :token (random-uuid))
+                           (assoc @(:authority handle) :status :partitioned)
+                           (assoc @(:authority handle) :status :transferred)]]
+          (with-redefs [d/fork-handle
+                        (fn [room]
+                          (if (identical? room fork)
+                            (assoc handle :authority (atom authority))
+                            (handle! room)))]
+            (is (= ::d/room-lifecycle-in-progress (failure-type #(d/close-room! fork)))
+                "stale or partitioned affine authority cannot be reclaimed")))
+        (with-redefs-fn {#'d/begin-room-quiescence!
+                         (fn [room operation]
+                           (when (and (identical? room fork) (= :merge operation))
+                             (deliver retry-entered true)
+                             @retry-go)
+                           (begin room operation))}
+          (fn []
+            (let [retry (future (failure-type #(d/merge-room parent fork)))]
+              (is (= true (deref retry-entered 3000 ::timeout)))
+              (is (= ::d/room-lifecycle-in-progress (failure-type #(d/close-room! fork)))
+                  "an active retry retains its original settlement authority")
+              (deliver retry-go true)
+              (is (= ::d/room-lifecycle-in-progress (deref retry 3000 ::timeout))))))
+        (preparation/retain-room-cleanup!
+         fork {:agent {:resource :exact-post-settlement-owner}}
+         (fn [_]
+           (swap! releases inc)
+           (when-not @release? (throw (ex-info "native cleanup has not acknowledged" {})))))
+        (is (= ::preparation/drain-failed (failure-type #(d/close-room! fork))))
+        (is (registered? fork) "failed physical cleanup retains the exact canonical child")
+        (is (= claim (d/settlement-claim fork)))
+        (is (nil? (d/settlement fork)))
+        (is (= ::d/already-settled (failure-type #(d/merge-room parent fork)))
+            "close takeover fences later settlement admission")
+        (is (= ::d/context-still-owned (failure-type #(d/close-room! parent))))
+        (is (registered? parent))
+        (let [alive (promise)]
+          (binding [ec/*execution-context* (:ctx parent)]
+            (sp/spawn! (sp/spin (deliver alive :alive))))
+          (is (= :alive (deref alive 3000 ::timeout))))
+        (reset! release? true)
+        (d/close-room! fork)
+        (is (= 2 @releases) "only the retained failed cleanup is retried")
+        (is (not (registered? fork)))
+        (is (= claim (d/settlement-claim fork)))
+        (is (nil? (d/settlement fork)))
+        (d/close-room! parent))
+      (finally
+        (deliver retry-go true)
+        (reset! release? true)
+        (d/close-room! fork)
+        (d/close-room! parent)))))
 
 (deftest the-client-refuses-a-discard-that-lost
   (let [parent (d/room :settle-client)

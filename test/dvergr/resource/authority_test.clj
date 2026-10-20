@@ -529,8 +529,11 @@
               "the budget records what the calls cost, not the budget it ended")
           (is (= {resource/microdollars 9000000M} (resource/balance room)) "$1 spent on models, nothing created or lost")))
       (finally
-        (kontor-governance/ungovern! conn)
-        (d/close-room! room)))))
+        ;; Exhaustion retains a waiting Run world. Quiesce every owned runtime
+        ;; before releasing its writer governance and finally the root executor.
+        (let [shutdown (d/close-registered-rooms! (:ctx room))]
+          (try (kontor-governance/ungovern! conn)
+               (finally (d/close-shutdown-contexts! shutdown))))))))
 
 (deftest a-charge-scope-debits-each-charge-once
   (let [[room conn] (ledger-room)

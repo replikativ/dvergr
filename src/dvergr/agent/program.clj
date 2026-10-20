@@ -353,7 +353,27 @@
          supervisor (assoc (make-supervisor (:ctx room)) :lifecycle-run id)
          key [::settlement id]
          cancelled? (atom false)
+         interrupted? (atom false)
+         failure (atom nil)
          cancel #(do (reset! cancelled? true) (cancel-supervisor! supervisor))
+         join! (fn []
+                 ;; Future cancellation is not a physical acknowledgement. An
+                 ;; outer blocking Spin may interrupt this host waiter again;
+                 ;; retain the Run and clear/remember interrupts until native
+                 ;; workers and cleanup have actually left.
+                 (when (Thread/interrupted)
+                   (reset! interrupted? true)
+                   (cancel))
+                 (loop []
+                   (when-not
+                    (try
+                      (.await ^CountDownLatch (:quiesced-latch supervisor))
+                      true
+                      (catch InterruptedException _
+                        (reset! interrupted? true)
+                        (cancel)
+                        false))
+                     (recur))))
          outcome (promise)]
      (try
        (run/register-cancel-hook! id key cancel)
@@ -364,19 +384,37 @@
                                    #(deliver outcome (try {:value (f)}
                                                           (catch Throwable t {:error t}))))]
          (try (.get ^FutureTask (:task worker))
-              (catch java.util.concurrent.CancellationException _ nil))
+              (catch java.util.concurrent.CancellationException _ nil)
+              (catch InterruptedException error
+                (reset! interrupted? true)
+                (cancel)
+                (throw error)))
          (mark-cleanup-safe! supervisor)
          (seal-supervisor! supervisor)
-         (.await ^CountDownLatch (:quiesced-latch supervisor))
+         (join!)
          (when @cancelled? (throw (ex-info "Settlement cancelled" {:run/id id})))
+         (when-let [error (:cleanup-error @(:state supervisor))]
+           (throw (ex-info "Settlement cleanup failed" {:run/id id} error)))
+         (when-not (realized? outcome)
+           (throw (ex-info "Settlement worker exited without an outcome"
+                           {:type ::missing-worker-outcome :run/id id})))
          (let [{:keys [value error]} @outcome]
            (if error (throw error) value)))
+       (catch Throwable error
+         (reset! failure error)
+         (throw error))
        (finally
-         (mark-cleanup-safe! supervisor)
-         (seal-supervisor! supervisor)
-         (.await ^CountDownLatch (:quiesced-latch supervisor))
-         (when owner (run/unregister-cancel-hook! owner key))
-         (run/finish! id (if @cancelled? :cancelled :completed)))))))
+         (try
+           (mark-cleanup-safe! supervisor)
+           (seal-supervisor! supervisor)
+           (join!)
+           (when owner (run/unregister-cancel-hook! owner key))
+           (run/finish! id (cond @cancelled? :cancelled @failure :failed :else :completed))
+           (finally
+             ;; Restoring earlier could interrupt durable Run retirement and
+             ;; falsely leave an otherwise quiescent lifecycle owner behind.
+             (when @interrupted?
+               (.interrupt (Thread/currentThread))))))))))
 
 (defn- cancel-supervisor! [supervisor]
   (let [[tasks cancel-children]
@@ -442,6 +480,100 @@
 
 (defn- await-supervisor! [supervisor]
   (.await ^CountDownLatch (:quiesced-latch supervisor))
+  nil)
+
+(defn preparation-scope
+  "Create a host-owned native preparation scope bound to `execution-ctx`.
+
+   The caller must register this scope with its lifecycle owner BEFORE calling
+   `start-preparation!`. This is the same physical-worker supervisor used by
+   interpreted programs; cancelling a Future is never a physical completion
+   acknowledgement. Preparation is not itself a provider-admitted Run."
+  [execution-ctx]
+  (binding [ec/*execution-context* execution-ctx]
+    (make-supervisor execution-ctx)))
+
+(defn start-preparation!
+  "Dispatch one owned initialization worker. Admission is cancellation fenced."
+  [scope f]
+  (binding [ec/*execution-context* (:execution-ctx scope)]
+    (start-worker! scope f)))
+
+(defn preparation-result
+  "Reactively await an initialization worker without blocking the engine."
+  [worker]
+  (sp/spin
+   (let [result (sp/await (:done worker))]
+     (cond
+       (worker-error? result) (throw (::worker-error result))
+       (= ::worker-cancelled result)
+       (throw (ex-info "Preparation cancelled before execution"
+                       {:type ::preparation-cancelled}))
+       :else result))))
+
+(defn register-preparation-cleanup!
+  "Register cleanup before handing an acquired resource out of its worker.
+   Cleanup cannot run until every worker has physically acknowledged exit."
+  [scope f]
+  (register-cleanup! scope f))
+
+(defn with-preparation-decision!
+  "Serialize publication against cancellation of the preparation owner.
+   `f` must only perform a short publication decision, never blocking setup."
+  [scope f]
+  (binding [*worker-supervisor* scope]
+    (with-worker-decision! f)))
+
+(defn complete-preparation!
+  "Seal a preparation after its consumer can no longer touch private resources."
+  [scope]
+  (mark-cleanup-safe! scope)
+  (seal-supervisor! scope))
+
+(defn cancel-preparation!
+  "Fence further decisions and request cancellation without waiting on workers."
+  [scope]
+  (cancel-supervisor! scope)
+  (complete-preparation! scope))
+
+(defn preparation-finished?
+  "True only after physical worker/cleanup acknowledgement, without failure."
+  [scope]
+  (and (zero? (.getCount ^CountDownLatch (:quiesced-latch scope)))
+       (nil? (:cleanup-error @(:state scope)))))
+
+(defn preparation-admission-ready?
+  "Logical work and cleanup are finished; the physical lease may still be
+   publishing its acknowledgement and must remain retained for native drain."
+  [scope]
+  (let [state @(:state scope)]
+    (and (:quiesced? state) (nil? (:cleanup-error state)))))
+
+(defn preparation-completion
+  "Reactively await logical worker/cleanup quiescence. Native teardown must
+   still use await-preparation!, whose physical latch follows publication."
+  [scope]
+  (sp/spin
+   (let [state (sp/await (:quiesced scope))]
+     (when-let [error (:cleanup-error state)]
+       (throw (ex-info "Preparation cleanup failed"
+                       {:type ::preparation-cleanup-failed} error)))
+     state)))
+
+(defn await-preparation!
+  "Join physical preparation and cleanup off the reactive engine.
+   A failed/timed-out join does not relinquish ownership of live resources."
+  [scope timeout-ms]
+  (when ec/*spin-id*
+    (throw (ex-info "Cannot physically join preparation on the reactive engine"
+                    {:type ::blocking-preparation-join})))
+  (when-not (.await ^CountDownLatch (:quiesced-latch scope)
+                    (long timeout-ms) java.util.concurrent.TimeUnit/MILLISECONDS)
+    (throw (ex-info "Preparation has not physically quiesced"
+                    {:type ::preparation-drain-timeout})))
+  (when-let [error (:cleanup-error @(:state scope))]
+    (throw (ex-info "Preparation cleanup failed"
+                    {:type ::preparation-cleanup-failed} error)))
   nil)
 
 (deftype RunHandle [id room-id owner-fork-id execution completion worker-execution]

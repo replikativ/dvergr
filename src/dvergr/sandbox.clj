@@ -427,6 +427,12 @@
   (when ref
     (sci-world/context-in spindel-ctx ref)))
 
+(defn replace-spindel-sci-context!
+  "Publish a privately prepared interpreter under the same stable world ref.
+   The caller owns quiescence, expected-identity fencing and resource leases."
+  [spindel-ctx ref expected replacement]
+  (sci-world/replace-context! spindel-ctx ref expected replacement))
+
 (defn release-spindel-sci-world!
   "Remove stable SCI world `ref` from `spindel-ctx`.
 

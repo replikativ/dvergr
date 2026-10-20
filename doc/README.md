@@ -20,6 +20,7 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 - **[Architecture](architecture.md)** — the L0–L7 layer map, subsystem graph, inbound message flow, per-namespace table
 - **[Runs](runs.md)** — durable execution identity, kinds, lifecycle and reasons, how a turn ends, cancellation, processes, resuming from savepoints
 - **[Agent programs](agent-programs.md)** — immutable specialized-agent rosters, Run-backed hiring, Spindel composition, and fork-safe state placement
+- **[Participant preparation](participant-preparation.md)** — supervised off-engine initialization, interpreter expansion, cancellation and native lifecycle ownership
 - **[Worlds, forks and state](worlds-and-forks.md)** — where every kind of state lives, what a fork forks, the fork contract, worlds, savepoints and budgets
 - **[Effects](effects.md)** — one boundary between sandbox code and the world: handlers, faults, recording, replay, secrets at the boundary
 

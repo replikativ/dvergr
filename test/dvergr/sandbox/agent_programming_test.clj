@@ -447,13 +447,18 @@
     (with-redefs [sdb/room-by-slug (fn [_] {:room/id :sci-work-purge-order :room/archived-at (java.util.Date.)})
                   room-registry/lookup (fn [_] room)
                   room-registry/unregister! (fn [_] nil)
-                  d/close-room! (fn [target]
-                                  (swap! order conj :quiesce)
-                                  (close-room! target))
+                  d/close-room! (fn
+                                  ([target]
+                                   (swap! order conj :quiesce)
+                                   (close-room! target {}))
+                                  ([target opts]
+                                   (swap! order conj :quiesce)
+                                   (close-room! target opts)))
                   srooms/delete-room! (fn [_]
                                         (swap! order conj :delete)
                                         {:owned-systems-removed 0})]
-      (is (:ok? (rooms/purge-room! "sci-work-purge-order"))))
+      (let [result (rooms/purge-room! "sci-work-purge-order")]
+        (is (:ok? result) (pr-str result))))
     (is (= [:quiesce :delete] @order)
         "the stores go only after the runtime quiescence fence")))
 

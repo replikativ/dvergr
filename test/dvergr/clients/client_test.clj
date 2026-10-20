@@ -9,9 +9,12 @@
             [dvergr.actors :as actors]
             [dvergr.chat.schema :as schema]
             [dvergr.clients.client :as client]
+            [dvergr.discourse :as d]
             [dvergr.orchestration.daemon :as daemon]
+            [dvergr.room.registry :as registry]
             [dvergr.substrate.paths :as paths]
             [dvergr.system.db :as sdb]
+            [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.context :as sctx]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -64,9 +67,37 @@
              :config        {}
              :status        (atom :running)})
     (try (f)
-         (finally (reset! daemon/current-daemon saved)))))
+         (finally
+           (try (d/close-shutdown-contexts! (d/close-registered-rooms! ctx))
+                (finally (reset! daemon/current-daemon saved)))))))
 
 (use-fixtures :each mem-db-fixture sys-db-fixture with-daemon-mock)
+
+(deftest closing-a-client-room-preserves-the-daemon-owned-world
+  (let [root (:execution-ctx @daemon/current-daemon)]
+    (doseq [facade? [false true]]
+      (let [context (if facade? (assoc root :metadata {:test/facade true}) root)
+            left (d/make-room {:id (keyword (str "client-close-left-" facade?)) :ctx context})
+            right (d/make-room {:id (keyword (str "client-close-right-" facade?)) :ctx root})]
+        (is (= :closed (client/close! left)))
+        (is @(:running root))
+        (is (binding [ec/*execution-context* root]
+              (identical? right (registry/lookup (:id right)))))
+        (is (= :closed (client/close! right)))
+        (is @(:running root) "even its final Room cannot release the daemon's executor")
+        (let [alive (promise)]
+          (binding [ec/*execution-context* root]
+            (sp/spawn! (sp/spin (deliver alive :alive))))
+          (is (= :alive (deref alive 3000 ::timeout))))))))
+
+(deftest closing-a-standalone-client-room-releases-its-own-context
+  (let [room (d/make-room {:id :client-close-standalone})
+        root (:execution-ctx @daemon/current-daemon)]
+    (try
+      (is (= :closed (client/close! room)))
+      (is (false? @(:running (:ctx room))))
+      (is @(:running root))
+      (finally (d/close-room! room)))))
 
 ;; ============================================================================
 ;; Unboxing semantics
