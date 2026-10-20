@@ -289,9 +289,9 @@
         n (get cfg "user.name") e (get cfg "user.email")]
     (cond (and n e) (str n " <" e ">") n n :else "unknown")))
 
-(defn commit-paths!
-  "Commit exactly the paths of `expected` (`{path content-id}`, nil for a
-   removed path) in `room`'s workspace as one commit with `message`, under
+(defn commit-paths-in-workspace!
+  "HOST API: commit exactly the paths of `expected` (`{path content-id}`, nil
+   for a removed path) in one retained, registered workspace descriptor, under
    the workspace lock. The paths are staged by name (`repo/stage!`, no
    pathspec parsing). The index must hold nothing else staged, and once the
    paths are staged they must hold the expected content: otherwise nothing is
@@ -299,17 +299,17 @@
    commit id, or nil when the paths already match HEAD. With `:receipt? true`,
    returns {:commit id-or-nil :tree validated-index}; the tree is captured
    BEFORE publication, so obtaining a receipt requires no postcommit read.
-   Optional :expected-modes is checked against that same staged index."
-  ([room expected message] (commit-paths! room expected message {}))
-  ([room expected message {:keys [receipt? expected-modes publication]}]
+   Optional :expected-modes is checked against that same staged index. The
+   exact descriptor is revalidated; ambient selection is never consulted."
+  ([room workspace expected message] (commit-paths-in-workspace! room workspace expected message {}))
+  ([room workspace expected message {:keys [receipt? expected-modes publication]}]
    (binding [ec/*execution-context* (:ctx room)]
-     (let [{:keys [conn]} (or (git/current-workspace)
-                              (throw (ex-info "Room has no workspace"
-                                              {:type ::no-workspace :room (:id room)})))
+     (let [{:keys [conn]} (git/assert-workspace-current! workspace)
            rel #(str/replace (str %) #"^/+" "")
            expected (update-keys expected rel)
            paths (vec (sort (keys expected)))]
        (locking (git/workspace-lock conn)
+         (git/assert-workspace-current! workspace)
          (let [staged (:staged (repo/status conn))]
            (when (seq (remove (set paths) staged))
              (throw (ex-info (str "The workspace of " (name (:id room)) " has staged changes ("
@@ -356,15 +356,29 @@
                                                 :resource {:system-id (srooms/connection-system-id conn)}})]
                          (throw (ex-info "Room policy changed before publication"
                                          {:type ::publication-policy-changed :reason reason})))
+                       (git/assert-workspace-current! workspace)
                        (before-dispatch! candidate)
                        (publication/publish! conn plan candidate)))
                    commit (if publication
                             (some-> (:publication/commit published) str)
                             (when (seq staged)
+                              (git/assert-workspace-current! workspace)
                               (some-> (repo/commit! conn options) :geschichte.commit/id str)))]
                (if receipt?
                  (cond-> {:commit commit :tree index} published (assoc :publication published))
                  commit)))))))))
+
+(defn commit-paths!
+  "Commit exactly `expected` paths in the room's ambient workspace. Legacy
+   resolution happens once; the explicit host implementation retains that same
+   validated descriptor through staging and commit. See commit-paths-in-workspace!."
+  ([room expected message] (commit-paths! room expected message {}))
+  ([room expected message opts]
+   (binding [ec/*execution-context* (:ctx room)]
+     (let [workspace (or (git/current-workspace)
+                         (throw (ex-info "Room has no workspace"
+                                         {:type ::no-workspace :room (:id room)})))]
+       (commit-paths-in-workspace! room workspace expected message opts)))))
 
 (defn- refuse-dirty-parent! [parent]
   (when-let [dirty (workspace-changes parent)]

@@ -53,7 +53,7 @@
 (def max-batch-files "How many paths one `room_write` names." 200)
 (def write-capabilities
   "Host embedding contracts supported by the canonical batch writer."
-  #{:expected-worktree :applied-receipt :file-modes :durable-publication})
+  #{:expected-worktree :applied-receipt :file-modes :durable-publication :explicit-workspace})
 
 ;; ---------------------------------------------------------------------------
 ;; Paths and the workspace
@@ -367,37 +367,12 @@
    :removed (mapv :publication.entry/path
                   (filter #(= :deleted (:publication.entry/state %)) (:publication/entries receipt)))})
 
-(defn write!
-  "Write `files` (`{path content}`; content `{:text …}`, `{:base64 …}`, or nil
-   to remove the file) into `room`'s workspace and commit exactly those paths
-   as one commit with `message` (`forks/commit-paths!`). The batch is a
-   `:git/commit` effect, decided before anything is written; each write and
-   removal is an effect too. Every path is checked first, and the index may
-   hold nothing staged (`git add` without a commit). Each write and removal
-   is a compare-and-write against the batch's snapshot (`:expect`), so a file
-   changed underneath fails the batch. When a prepublication step fails, the batch's
-   changes are undone (`restore!`; what could not be put back is reported as
-   `:conflicted`) and nothing is committed. Returns `{:commit :applied?
-   :message :written [{:path :size :content-id :entry}] :removed [path]}`;
-   `:commit` is nil when the files already were as given. `:applied?` is true
-   only when the physical batch executor ran; an intercepting handler's answer
-   is not proof of publication. Written entries are immutable staged metadata.
-   Optional `:file-modes` maps absolute written paths to 33188 or 33261.
-
-   Host-only `:publication` supplies a complete scoped receipt `:identity`, a
-   current `:authorize!` callback and a durable `:before-dispatch!` journal hook.
-   Repeated operations recover their recorded result before modifying files.
-   Post-dispatch uncertainty NEVER restores files or authorizes an automatic
-   retry; keep the journal until scoped recovery establishes the result.
-
-   Optional `:expected-worktree` maps EVERY absolute batch path to the
-   worktree entry the caller opened (`{:content uuid :size n :mode n}`), or
-   nil for absent. Compared with the SAME snapshot used by compare-and-write,
-   before any effect/write. A stale opened version refuses the whole batch;
-   omission retains the ordinary unconditional client-write behavior."
-  [room files {:keys [message boundary file-modes publication] :as opts}]
+(defn- write-workspace!
+  "Shared native batch writer. Every physical operation retains this exact
+   descriptor; neither file effects nor commit re-resolve ambient selection."
+  [room workspace files {:keys [message boundary file-modes publication] :as opts}]
   (let [entries (plan files)
-        {:keys [conn] :as ws} (workspace! room)
+        {:keys [conn] :as ws} (gs/assert-workspace-current! workspace)
         system-id (binding [ec/*execution-context* (:ctx room)]
                     (srooms/connection-system-id conn))
         _ (binding [ec/*execution-context* (:ctx room)]
@@ -426,6 +401,7 @@
     ;; filesystem or external repository writers. Writer-side basis checks are
     ;; the atomic publication guard against those other writers.
     (locking (gs/workspace-lock conn)
+      (gs/assert-workspace-current! ws)
       (when publication
         (publication/authorize! publication)
         (publication/install! conn))
@@ -455,6 +431,13 @@
                 ;; A handler may forward more than once. This one invocation
                 ;; owns exactly one physical batch, including its exception.
                 execute (delay
+                          ;; An outer effect handler can change registration
+                          ;; before forwarding. Refuse before the first write,
+                          ;; without even issuing a compensating index mutation.
+                          (try (gs/assert-workspace-current! ws)
+                               (catch Throwable error
+                                 (vreset! execution-error error)
+                                 (throw error)))
                           (try
                             (doseq [[p c] entries
                                 ;; compare-and-write: what the snapshot saw, or fail
@@ -466,9 +449,10 @@
                                   (swap! removed conj p))
                                 (do (tools/workspace-write! ctx p c opts)
                                     (swap! touched conj p))))
-                            (let [{:keys [commit tree publication]} (forks/commit-paths! room expected message
-                                                                                         {:receipt? true :expected-modes file-modes
-                                                                                          :publication publication})
+                            (let [{:keys [commit tree publication]} (forks/commit-paths-in-workspace!
+                                                                     room ws expected message
+                                                                     {:receipt? true :expected-modes file-modes
+                                                                      :publication publication})
                                   entries (into {} (map (fn [p] [p (get tree (rel p))])) paths)]
                           ;; Only the forwarded physical write path can produce
                           ;; this receipt. A handler may answer without forwarding.
@@ -519,3 +503,42 @@
                                       :entry entry}))
                      :removed @removed}
               (:publication receipt) (assoc :publication (:publication receipt)))))))))
+
+(defn write!
+  "Write `files` (`{path content}`; content `{:text …}`, `{:base64 …}`, or nil
+   to remove the file) into `room`'s workspace and commit exactly those paths
+   as one commit with `message`. Ambient resolution happens once; files,
+   staging, restore and commit use the same validated workspace descriptor.
+
+   The batch is a `:git/commit` effect decided before anything is written;
+   each write/removal is an effect too. Paths are checked first and the index
+   must have nothing staged. Writes compare against the batch snapshot; on a
+   prepublication failure its changes are restored unless changed meanwhile
+   (reported as `:conflicted`). Returns `{:commit :applied? :message
+   :written [{:path :size :content-id :entry}] :removed [path]}`. `:applied?`
+   is true only when the physical executor ran, not an interceptor's answer;
+   `:commit` is nil for an unchanged batch. Entries are immutable staged data.
+   Optional `:file-modes` maps absolute batch paths to 33188 or 33261.
+
+   Host-only `:publication` supplies a complete scoped receipt `:identity`,
+   current `:authorize!` and durable `:before-dispatch!` hooks. Repeated ops
+   recover before writing. Post-dispatch uncertainty NEVER restores files or
+   authorizes automatic retry; retain the journal until scoped recovery.
+
+   Optional `:expected-worktree` describes EVERY absolute batch path as an
+   opened `{:content uuid :size n :mode n}` entry, or nil if absent. The SAME
+   snapshot used by compare-and-write checks it before any effect/write. A
+   stale opened version refuses the batch; omission retains unconditional
+   client-write behavior."
+  [room files opts]
+  (binding [ec/*execution-context* (:ctx room)]
+    (write-workspace! room (workspace! room) files opts)))
+
+(defn write-to!
+  "HOST API: write/commit a batch to this exact registered Geschichte system
+   object in room's context, independent of its selected workspace. Same
+   options, effects, permissions, receipts and recovery contract as write!.
+   No selection mutation, Room facade or serializable descriptor capability."
+  [room system files opts]
+  (binding [ec/*execution-context* (:ctx room)]
+    (write-workspace! room (gs/workspace-for-system! system) files opts)))

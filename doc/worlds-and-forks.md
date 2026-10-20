@@ -81,6 +81,32 @@ This resolver is not permission to publish: callers must still check the human's
 current permissions, the full retained target identity and expected file state
 at each publication effect.
 
+To publish to that exact resolved system without changing a Room's execution
+selection, trusted hosts can use `dvergr.rooms.files/write-to!` with the Room,
+its exact registered Geschichte object, the file batch and ordinary write
+options. `dvergr.substrate.geschichte/workspace-for-system!` rejects missing,
+replaced, ambiguous, wrong-type and foreign-world objects, including distinct
+logical identities aliasing one native connection. One validated native
+descriptor follows the filesystem, canonical connection lock, compare/write,
+staging, restoration and `dvergr.rooms.forks/commit-paths-in-workspace!` commit.
+The commit helper validates its descriptor independently, including the canonical
+filesystem configuration: an EDN descriptor is not a capability. Repository UUID,
+store/backend, Datahike branch and checked-out Git ref remain pinned; unrelated
+HEAD advances are still governed by the existing file/index basis checks.
+
+These host operations neither select another workspace nor add a permission,
+SCI function or RPC. Existing world effects, current authorization callbacks,
+expected-worktree checks and atomic durable publication receipts still apply.
+Registration/target checks run again under the workspace lock and at physical
+dispatch boundaries, but they are snapshots, not a lifetime lease against
+uncoordinated trusted-host registry mutation. Participating hosts must coordinate
+such mutations. In particular, a trusted inner filesystem-effect handler that
+changes registration before forwarding can cross a prior snapshot: the later
+commit validation refuses and compensates the retained target, but does not
+promise zero temporary writes or zero rollback transactions. Arbitrary repository writers remain covered by writer-side basis
+checks, not by the process-local monitor. Legacy `dvergr.rooms.files/write!`
+still resolves ambient selection once and uses this same pinned implementation.
+
 Execution selection is separate from that registry resolver. A trusted host
 can call `dvergr.substrate.geschichte/select-workspace!` with the exact runtime
 system name in the **Run world's** context before constructing its tools.
