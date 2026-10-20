@@ -21,6 +21,7 @@
             [dvergr.rooms.forks :as forks]
             [dvergr.rooms.publication :as publication]
             [dvergr.rooms.file-tx :as file-tx]
+            [dvergr.rooms.subtree :as subtree]
             [dvergr.sandbox.ns.io :as sio]
             [dvergr.substrate.geschichte :as gs]
             [dvergr.tools :as tools]
@@ -58,7 +59,7 @@
 (def max-batch-files "How many paths one `room_write` names." 200)
 (def write-capabilities
   "Host embedding contracts supported by the canonical batch writer."
-  #{:expected-worktree :applied-receipt :file-modes :durable-publication :explicit-workspace})
+  #{:expected-worktree :applied-receipt :file-modes :durable-publication :explicit-workspace :expected-subtree})
 
 ;; ---------------------------------------------------------------------------
 ;; Paths and the workspace
@@ -484,7 +485,8 @@
                            {:path p :size (:size entry) :content-id (some-> (:content entry) str)
                             :entry entry}))
            :removed removed}
-    (:publication receipt) (assoc :publication (:publication receipt))))
+    (:publication receipt) (assoc :publication (:publication receipt))
+    (:subtree receipt) (assoc :subtree (:subtree receipt))))
 
 (defn- completion-gate []
   {:owner (Thread/currentThread)
@@ -527,12 +529,50 @@
 (defn- receipt-schema-present? [db]
   (some? (d/q '[:find ?e . :where [?e :db/ident :publication/id]] db)))
 
+(declare interrupted-failure?)
+
 (defn- write-workspace!
   "Shared native batch writer. Every physical operation retains this exact
    descriptor; neither file effects nor commit re-resolve ambient selection."
-  [room workspace files {:keys [message boundary file-modes publication] :as opts} completion]
+  [room workspace files {:keys [message boundary file-modes publication expected-subtree] :as opts} completion]
   (let [entries (plan files)
         planned entries
+        _ (when (contains? opts :expected-subtree) (subtree/validate! expected-subtree))
+        ;; This option is fixed data, never a caller predicate. Validate native
+        ;; accessible paths and derive AFTER without a raced repository reread.
+        _ (when expected-subtree
+            (when-not (= (subs (:prefix expected-subtree) 0 (dec (count (:prefix expected-subtree))))
+                         (workspace-path (:prefix expected-subtree)))
+              (refuse "Invalid subtree prefix" {}))
+            (doseq [[path _] (:entries expected-subtree)]
+              (when-not (= (str (:prefix expected-subtree) path)
+                           (workspace-path (str (:prefix expected-subtree) path)))
+                (refuse "Invalid subtree entry" {})))
+            (when-not (every? #(str/starts-with? (first %) (:prefix expected-subtree)) entries)
+              (refuse "The write batch escapes its expected subtree" {})))
+        ;; Preserve the original mode under this new contract; legacy options
+        ;; and behavior remain unchanged when no subtree was supplied.
+        file-modes (if expected-subtree
+                     (reduce (fn [m [path value]]
+                               (if (= ::remove value) m
+                                   (if (contains? m path) m
+                                       (assoc m path (or (get-in expected-subtree
+                                                                 [:entries (subs path (count (:prefix expected-subtree))) :mode])
+                                                         33188)))))
+                             (or file-modes {}) entries)
+                     file-modes)
+        required-subtree
+        (when expected-subtree
+          (subtree/validate!
+           (update expected-subtree :entries
+                   (fn [original]
+                     (reduce (fn [tree [path value]]
+                               (let [relative (subs path (count (:prefix expected-subtree)))]
+                                 (if (= ::remove value) (dissoc tree relative)
+                                     (assoc tree relative {:content (blob/blob-id value) :size (long (alength ^bytes value))
+                                                           :mode (get file-modes path)})))) original entries)))))
+        subtree-basis (when expected-subtree (volatile! nil))
+        stage-witness (when expected-subtree (volatile! false))
         {:keys [conn] :as ws} (gs/assert-workspace-current! workspace)
         system-id (binding [ec/*execution-context* (:ctx room)]
                     (srooms/connection-system-id conn))
@@ -575,22 +615,36 @@
       (gs/assert-workspace-current! ws)
       (when publication
         (publication/authorize! publication)
-        (if completion
+        (if (or completion expected-subtree)
           (publication/validate-identity! (:identity publication))
           (publication/install! conn)))
       (if-let [recovered (when (and publication
-                                    (or (nil? completion) (receipt-schema-present? @conn)))
+                                    (or (and (nil? completion) (nil? expected-subtree))
+                                        (receipt-schema-present? @conn)))
                            (publication/recover @conn (:identity publication)))]
         (observe-positive! completion (publication-result recovered message))
         (do
+          ;; Exact scoped dedup above precedes NEW source validation. A past
+          ;; receipt is not a fresh inspection of a later changed workflow.
+          (when expected-subtree
+            ;; A clean HEAD/index proof and original rows from ONE immutable
+            ;; snapshot, never a fresh index captured after a loose check.
+            (let [initial-db @conn
+                  _ (subtree/assert-before! initial-db expected-subtree)
+                  initial (repo/prepare-commit (atom initial-db) {:message message})
+                  index-prefix (subtree/prefix-tree! initial-db (:prefix expected-subtree) true)]
+              (when-not (:noop? initial)
+                (throw (ex-info "Conditional subtree requires a clean initial index" {:type ::staged-changes})))
+              (vreset! subtree-basis {:before expected-subtree :plan initial
+                                      :index-prefix index-prefix :stage-rows (subtree/stage-rows initial-db paths)})))
           (check-shape! fs entries)
       ;; the undo restores the index to HEAD: so it must be at HEAD
-          (let [staged (:staged (repo/status conn))]
+          (let [staged (when-not expected-subtree (:staged (repo/status conn)))]
             (when (seq staged)
               (throw (ex-info (str "The workspace has staged changes (" (str/join ", " (take 5 staged))
                                    "); commit them before a room_write")
                               {:type ::staged-changes :staged (vec staged)}))))
-          (let [worktree (repo/worktree conn)
+          (let [worktree (if expected-subtree (:worktree (:plan @subtree-basis)) (repo/worktree conn))
                 before (into {} (keep (fn [p] (when-let [e (get worktree (rel p))] [p e]))) paths)
                 _ (when (and opened
                              (not= opened (into {} (map (fn [p] [p (get before p)])) paths)))
@@ -610,13 +664,14 @@
                           ;; before forwarding. Refuse before the first write,
                           ;; without even issuing a compensating index mutation.
                           (try (gs/assert-workspace-current! ws)
+                               (when expected-subtree (subtree/assert-before! @conn expected-subtree))
                                (catch Throwable error
                                  (vreset! execution-error error)
                                  (throw error)))
                           ;; The new completion API keeps schema installation
                           ;; after pure preflight and actual outer forwarding.
                           ;; Legacy callers retain their original ordering.
-                          (when (and completion publication)
+                          (when (and (or completion expected-subtree) publication)
                             (try (guarded-native! completion true #(publication/install! conn))
                                  (catch Throwable error
                                    (vreset! execution-error error)
@@ -636,17 +691,21 @@
                                   (guarded-native! completion true
                                                    #(forks/commit-paths-in-workspace!
                                                      room ws expected message
-                                                     {:receipt? true :expected-modes file-modes
-                                                      :publication commit-publication}))
+                                                     (cond-> {:receipt? true :expected-modes file-modes
+                                                              :publication commit-publication}
+                                                       required-subtree
+                                                       (assoc :required-subtree required-subtree :removed-paths @removed
+                                                              :subtree-basis @subtree-basis :stage-witness stage-witness))))
                                   entries (into {} (map (fn [p] [p (get tree (rel p))])) paths)]
                           ;; Only the forwarded physical write path can produce
                           ;; this receipt. A handler may answer without forwarding.
-                              (vreset! applied {:commit commit :entries entries :publication publication})
+                              (vreset! applied (cond-> {:commit commit :entries entries :publication publication}
+                                                 required-subtree (assoc :subtree required-subtree)))
                                ;; Durable publication already includes directory
                                ;; cleanup in its one joined transaction. Never
                                ;; enqueue another mutation after restoring an
                                ;; interrupted publication caller's interrupt flag.
-                              (when (and (nil? publication) (seq @removed))
+                              (when (and (nil? publication) (nil? required-subtree) (seq @removed))
                                 (guarded-native! completion true
                                                  #(d/transact conn [[:db.fn/call file-tx/remove-empty-dirs-tx
                                                                      (vec (distinct (mapcat file-tx/ancestors-of @removed)))]])))
@@ -662,13 +721,32 @@
                            ;; from an absent receipt; retain the host journal.
                               (if (or @applied (publication/uncertain? e))
                                 (throw e)
-                                (let [conflicted (guarded-native! completion true
-                                                                  #(restore! conn before expected @touched created))]
-                                  (throw (if (seq conflicted)
-                                           (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
-                                                         (str/join ", " conflicted))
-                                                    (assoc (ex-data e) :conflicted conflicted) e)
-                                           e)))))))
+                                (try
+                                  (let [_ (when (and expected-subtree
+                                                     (or (.isInterrupted (Thread/currentThread)) (interrupted-failure? e)))
+                                            (.interrupt (Thread/currentThread))
+                                            (throw (ex-info "Conditional write interrupted; no cleanup was submitted"
+                                                            {::publication/uncertain? true} e)))
+                                        conflicted (guarded-native! completion true
+                                                                    #(if expected-subtree
+                                                                       (do (try (gs/assert-workspace-current! ws)
+                                                                                (catch Throwable changed
+                                                                                  (throw (ex-info "Conditional cleanup target changed; no cleanup submitted"
+                                                                                                  {::publication/uncertain? true} changed))))
+                                                                           (publication/undo-subtree! conn @subtree-basis required-subtree
+                                                                                                      (vec @touched) @stage-witness paths (vec created)))
+                                                                       (restore! conn before expected @touched created)))]
+                                    (throw (if (seq conflicted)
+                                             (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
+                                                           (str/join ", " conflicted))
+                                                      (assoc (ex-data e) :conflicted conflicted) e)
+                                             e)))
+                                  (catch Throwable final-error
+                                   ;; Cleanup itself can have dispatched before
+                                   ;; losing its ACK. An outer handler must not
+                                   ;; hide that uncertainty by swallowing it.
+                                    (when expected-subtree (vreset! execution-error final-error))
+                                    (throw final-error)))))))
                 _answer (try
                           (effects/perform!
                            outer-boundary {:effect :git/commit :resource {:message message :system-id system-id}}
@@ -712,7 +790,13 @@
    opened `{:content uuid :size n :mode n}` entry, or nil if absent. The SAME
    snapshot used by compare-and-write checks it before any effect/write. A
    stale opened version refuses the batch; omission retains unconditional
-   client-write behavior."
+   client-write behavior.
+
+   Host-only `:expected-subtree` supplies a bounded full BEFORE prefix manifest;
+   publication checks BOTH worktree and index against its derived AFTER tree.
+   See `doc/subtree-cas.md` for bounds and cleanup/uncertainty semantics. Hosts
+   requiring sealed completion evidence must use `write-to-completion!`;
+   this option does not make intermediate writes invisible."
   [room files opts]
   (binding [ec/*execution-context* (:ctx room)]
     (write-workspace! room (workspace! room) files opts nil)))

@@ -6,6 +6,7 @@
             [clojure.string :as str]
             [datahike.api :as d]
             [dvergr.rooms.file-tx :as file-tx]
+            [dvergr.rooms.subtree :as subtree]
             [geschichte.repo :as repo]
             [geschichte.query :as query])
   (:import [java.util.concurrent CompletableFuture]))
@@ -173,7 +174,8 @@
   [db plan candidate]
   (if (checked-existing db candidate)
     []
-    (let [expected (receipt plan (select-keys candidate (take 6 identity-keys))
+    (let [_ (when-let [condition (:required-subtree plan)] (subtree/assert-after! db condition))
+          expected (receipt plan (select-keys candidate (take 6 identity-keys))
                             (into {} (map (fn [path] [path (get (:index plan) (subs path 1))]))
                                   (:publication/paths plan)))]
       (when-not (and (instance? java.util.Date (:publication/created-at candidate))
@@ -192,6 +194,125 @@
   [error]
   (true? (::uncertain? (ex-data error))))
 
+(defn- transact-joined!
+  "ONE owned native submission. Internal consume runs before interrupt restore;
+   no caller-supplied hook, extra executor or timeout-as-physical-completion."
+  [conn tx-data consume]
+  (let [completion (CompletableFuture.) interrupted? (volatile! false)]
+    (try
+      (async/take! (d/transact! conn tx-data) #(.complete completion %))
+      (let [report (loop []
+                     (let [result (try [:done (.get completion)]
+                                       (catch InterruptedException _
+                                         (vreset! interrupted? true) [:interrupted]))]
+                       (if (= :interrupted (first result)) (recur) (second result))))]
+        (when (instance? Throwable report) (throw report))
+        (consume report))
+      (finally (when @interrupted? (.interrupt (Thread/currentThread)))))))
+
+(defn prepared-write-tx
+  "Fixed HOST condition-enabled ordinary publication. BOTH exact prefixes and
+   the complete prepared basis are checked in the SAME writer, also for noop."
+  [db plan]
+  (subtree/assert-after! db (:required-subtree plan))
+  (when-not (and (vector? (:subtree/removed plan)) (<= (count (:subtree/removed plan)) subtree/max-entries)
+                 (every? #(and (canonical-path? %)
+                               (str/starts-with? % (:prefix (:required-subtree plan)))
+                               (nil? (get (:index plan) (subs % 1)))) (:subtree/removed plan)))
+    (throw (ex-info "Invalid conditional cleanup paths" {:type ::invalid})))
+  (into (repo/prepared-commit-tx db plan)
+        (file-tx/remove-empty-dirs-tx
+         db (distinct (mapcat file-tx/ancestors-of
+                              (:subtree/removed plan))))))
+
+(defn commit-prepared!
+  "HOST fixed conditional commit/noop; no fake receipt journal. Only the
+   ORIGINAL joined report acknowledges success. Dispatched uncertainty NEVER
+   permits restore/replan/retry. Returned tree is the validated published index."
+  [conn plan]
+  (prepared-write-tx @conn plan)
+  (try
+    (transact-joined!
+     conn [[:db.fn/call prepared-write-tx plan]]
+     (fn [{:keys [db-before db-after]}]
+       ;; Datahike .1910 transaction completion increments max-tx exactly once,
+       ;; even when the fixed function returns no commit/ref datoms. This fences
+       ;; a stale before snapshot substituted for a noop's original after ACK.
+       (when-not (and db-before db-after (integer? (:max-tx db-before))
+                      (= (inc (:max-tx db-before)) (:max-tx db-after)))
+         (throw (ex-info "Prepared write acknowledgement unavailable" {:type ::recovery-required})))
+       (prepared-write-tx db-before plan)
+       (subtree/assert-after! db-after (:required-subtree plan))
+       (let [commit (get-in plan [:commit :geschichte.commit/id])
+             expected-head (or commit (:head plan))]
+         (when-not (and (= (:repository plan) (:geschichte.repo/id (query/repository db-after)))
+                        (= (:ref plan) (query/current-ref db-after))
+                        (= expected-head (get (query/refs db-after) (:ref plan)))
+                        (= (:worktree plan) (query/worktree db-after))
+                        (= (:index plan) (repo/index-tree (atom db-after)))
+                        (or (nil? commit)
+                            (= (:checkpoint plan) (:geschichte.commit/snapshot (query/commit db-after commit)))))
+           (throw (ex-info "Prepared write acknowledgement does not match its commit"
+                           {:type ::recovery-required})))
+         {:commit (some-> commit str) :tree (:index plan)})))
+    (catch Throwable cause
+      (throw (ex-info "Prepared write outcome is uncertain; do not replay"
+                      {:type ::recovery-required ::uncertain? true} cause)))))
+
+(defn stage-subtree!
+  "Fixed condition-only stage CAS. A lexical native witness is set ONLY from
+   this submission's validated original before/after report, never readback."
+  [conn basis after paths witness]
+  (subtree/stage-tx @conn basis after paths)
+  (try
+    (transact-joined!
+     conn [[:db.fn/call subtree/stage-tx basis after paths]]
+     (fn [{:keys [db-before db-after]}]
+       (when-not (and db-before db-after (integer? (:max-tx db-before))
+                      (= (inc (:max-tx db-before)) (:max-tx db-after)))
+         (throw (ex-info "Conditional stage acknowledgement unavailable" {:type ::recovery-required})))
+       (subtree/stage-tx db-before basis after paths)
+       (subtree/assert-after! db-after after)
+       (vreset! witness true)
+       true))
+    (when (.isInterrupted (Thread/currentThread))
+      (throw (InterruptedException. "Interrupted after conditional stage acknowledgement")))
+    true
+    (catch Throwable cause
+      (throw (ex-info "Conditional staging is uncertain; do not undo or replay"
+                      {:type ::recovery-required ::uncertain? true} cause)))))
+
+(defn undo-subtree-tx [db basis after touched stage-owned? paths created]
+  (let [{:keys [tx]} (subtree/undo-data db basis after touched stage-owned? paths)]
+    ;; Transaction functions receive the writer's transient DB. Return the
+    ;; fixed cleanup AFTER undo datoms, so it observes their actual applied
+    ;; state in this same transaction; never nest d/with on a transient DB.
+    (cond-> tx (seq created) (conj [:db.fn/call file-tx/remove-empty-dirs-tx created]))))
+
+(defn undo-subtree!
+  "Fixed value-CAS cleanup, joined before return/interrupt restoration. Foreign
+   FULL worktree/index values are preserved. No stage ACK means no index undo."
+  [conn basis after touched stage-owned? paths created]
+  (try
+    (transact-joined!
+     conn [[:db.fn/call undo-subtree-tx basis after touched stage-owned? paths created]]
+     (fn [{:keys [db-before db-after]}]
+       (when-not (and db-before db-after (integer? (:max-tx db-before))
+                      (= (inc (:max-tx db-before)) (:max-tx db-after)))
+         (throw (ex-info "Conditional cleanup acknowledgement unavailable" {:type ::recovery-required})))
+       (let [original (subtree/undo-data db-before basis after touched stage-owned? paths)
+             tx (undo-subtree-tx db-before basis after touched stage-owned? paths created)
+             projected (if (seq tx) (:db-after (d/with db-before tx)) db-before)
+             dirs #(mapv (fn [path] (boolean (:db/id (d/entity % [:geschichte.work-dir/path (subs path 1)])))) created)]
+         (when-not (and (= (subtree/work-rows projected touched) (subtree/work-rows db-after touched))
+                        (= (subtree/stage-rows projected paths) (subtree/stage-rows db-after paths))
+                        (= (dirs projected) (dirs db-after)))
+           (throw (ex-info "Conditional cleanup acknowledgement does not match" {:type ::recovery-required})))
+         (:conflicts original))))
+    (catch Throwable cause
+      (throw (ex-info "Conditional cleanup is uncertain; do not replay"
+                      {:type ::recovery-required ::uncertain? true} cause)))))
+
 (defn publish!
   "Publish under the host's canonical repository lease. Return the WINNING
    receipt from db-after, not the caller's possibly losing candidate commit.
@@ -205,30 +326,14 @@
         ;; Deterministic rejection here is pre-dispatch and safe for the host to
         ;; roll back. This is not a substitute for writer-side validation.
         (publish-tx @conn plan receipt)
-        (let [completion (CompletableFuture.)
-              interrupted? (volatile! false)]
-          (try
-            (try
-              ;; Datahike owns the native operation. Its throwable-promise is a
-              ;; ReadPort; a callback lets us join without wrapped interrupts or
-              ;; another worker, and without ever submitting the operation twice.
-              (async/take! (d/transact! conn [[:db.fn/call publish-tx plan receipt]])
-                           #(.complete completion %))
-              (let [report (loop []
-                             (let [result (try [:done (.get completion)]
-                                               (catch InterruptedException _
-                                                 (vreset! interrupted? true)
-                                                 [:interrupted]))]
-                               (if (= :interrupted (first result))
-                                 (recur)
-                                 (second result))))]
-                (when (instance? Throwable report) (throw report))
-                (or (when-let [db (:db-after report)] (recover db receipt))
-                    (throw (ex-info "Committed publication receipt is unavailable"
-                                    {:type ::recovery-required}))))
-              (catch Throwable cause
-                (throw (ex-info "Publication outcome requires scoped recovery"
-                                {:type ::recovery-required ::uncertain? true
-                                 :operation (:publication/id receipt)} cause))))
-            (finally
-              (when @interrupted? (.interrupt (Thread/currentThread)))))))))
+        (try
+          (transact-joined!
+           conn [[:db.fn/call publish-tx plan receipt]]
+           (fn [report]
+             (or (when-let [db (:db-after report)] (recover db receipt))
+                 (throw (ex-info "Committed publication receipt is unavailable"
+                                 {:type ::recovery-required})))))
+          (catch Throwable cause
+            (throw (ex-info "Publication outcome requires scoped recovery"
+                            {:type ::recovery-required ::uncertain? true
+                             :operation (:publication/id receipt)} cause)))))))
