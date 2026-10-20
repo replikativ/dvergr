@@ -38,6 +38,7 @@
             [dvergr.agent.workflow :as workflow]
             [dvergr.agent.grounds :as grounds]
             [dvergr.catalog :as catalog]
+            [dvergr.catalog.immutable :as immutable-catalog]
             [dvergr.catalog.casepack :as casepack]
             [dvergr.catalog.report :as report]
             [dvergr.catalog.room :as room-wf]
@@ -252,27 +253,14 @@
              (and (integer? (:length args)) (<= 1 (:length args) room-files/max-read-bytes)))
          (or (not (contains? args :expected-target-stamp)) (target-stamp? (:expected-target-stamp args))))))
 
-(defn room-file-read
-  "INTERNAL, already-authorized adapter gateway, NOT an authorization endpoint.
-   invoke authorizes tools before calling this; MCP resources retain their own
-   room/read gate. Pass the EXPLICIT authenticated principal, never derive one.
-
-   Optional trusted host config [:room-files :resolve-read] receives principal
-   and a CLOSED request with :operation (:list/:read/:resource), original :room,
-   path/bounds and expected-target-stamp. It must authorize and resolve current
-   canonical ownership before hydration, returning ONLY {:db immutable-db
-   :target-stamp bounded-string}. The gateway never hydrates, exports handles,
-   caches authority, accepts callbacks from RPC, or falls back on hook failure.
-   Directory resource fallback projects the SAME returned DB exactly once.
-
-   Without a configured hook, existing selected MountFS behavior is unchanged.
-   An unsupported stamp is refused, not silently ignored. New flat helpers are
-   not generic replacements for nested MountFS/selected sandbox access."
+(defn- configured-room-file-binding
+  "Already-authorized HOST binding acquisition. nil means ONLY absent hook.
+   No RPC/SCI export or reusable authority; all configured errors fail closed."
   [daemon authenticated-principal operation args]
   (let [config (:config daemon)
-        files-config (:room-files config)
-        configured? (contains? config :room-files)]
-    (if (and configured? (or (not (map? files-config)) (contains? files-config :resolve-read)))
+        files-config (:room-files config)]
+    (when (and (contains? config :room-files)
+               (or (not (map? files-config)) (contains? files-config :resolve-read)))
       (let [resolver (:resolve-read files-config)]
         (when (or (simple/on-drain-thread?) (not (fn? resolver)))
           (file-read-error! :unavailable nil))
@@ -292,42 +280,63 @@
                   (when (and (contains? args :expected-target-stamp)
                              (not= (:expected-target-stamp args) (:target-stamp binding)))
                     (file-read-error! :target-changed nil))
-                  (let [db (:db binding) stamp (:target-stamp binding)
-                        result (try
-                                 (case operation
-                                   :list (room-files/list-dir-in db (:path args) (select-keys args [:offset]))
-                                   :read (room-files/read-file-in db (:path args) (select-keys args [:offset :length]))
-                                   :resource
-                                   (try {:kind :file :data (room-files/read-file-in db (:path args)
-                                                                                    {:max room-files/max-resource-bytes :whole? true})}
-                                        (catch clojure.lang.ExceptionInfo error
-                                          (if (= ::room-files/directory (:type (ex-data error)))
-                                            {:kind :directory :data (room-files/list-dir-in db (:path args))}
-                                            (throw error)))))
-                                 (catch InterruptedException error
-                                   (.interrupt (Thread/currentThread))
-                                   (file-read-error! :unavailable error))
+                  binding))))))
+
+(defn room-file-read
+  "INTERNAL, already-authorized adapter gateway, NOT an authorization endpoint.
+   invoke authorizes tools before calling this; MCP resources retain their own
+   room/read gate. Pass the EXPLICIT authenticated principal, never derive one.
+
+   Optional trusted host config [:room-files :resolve-read] receives principal
+   and a CLOSED request with :operation (:list/:read/:resource), original :room,
+   path/bounds and expected-target-stamp. It must authorize and resolve current
+   canonical ownership before hydration, returning ONLY {:db immutable-db
+   :target-stamp bounded-string}. The gateway never hydrates, exports handles,
+   caches authority, accepts callbacks from RPC, or falls back on hook failure.
+   Directory resource fallback projects the SAME returned DB exactly once.
+
+   Without a configured hook, existing selected MountFS behavior is unchanged.
+   An unsupported stamp is refused, not silently ignored. New flat helpers are
+   not generic replacements for nested MountFS/selected sandbox access."
+  [daemon authenticated-principal operation args]
+  (if-let [binding (configured-room-file-binding daemon authenticated-principal operation args)]
+    (in-ctx daemon
+            (let [db (:db binding) stamp (:target-stamp binding)
+                  result (try
+                           (case operation
+                             :list (room-files/list-dir-in db (:path args) (select-keys args [:offset]))
+                             :read (room-files/read-file-in db (:path args) (select-keys args [:offset :length]))
+                             :resource
+                             (try {:kind :file :data (room-files/read-file-in db (:path args)
+                                                                              {:max room-files/max-resource-bytes :whole? true})}
+                                  (catch clojure.lang.ExceptionInfo error
+                                    (if (= ::room-files/directory (:type (ex-data error)))
+                                      {:kind :directory :data (room-files/list-dir-in db (:path args))}
+                                      (throw error)))))
+                           (catch InterruptedException error
+                             (.interrupt (Thread/currentThread))
+                             (file-read-error! :unavailable error))
+                           (catch clojure.lang.ExceptionInfo error
+                             (file-read-error! (case (:type (ex-data error))
+                                                 ::room-files/not-found :not-found
+                                                 (::room-files/invalid ::room-files/not-a-directory ::room-files/directory) :refused
+                                                 :unavailable) error))
+                           (catch Throwable error (file-read-error! :unavailable error)))]
+              (assoc result :target-stamp stamp)))
+    (do
+      (when (contains? args :expected-target-stamp) (file-read-error! :refused nil))
+      (files-op daemon (:room args)
+                (fn [room]
+                  (in-ctx daemon
+                          (case operation
+                            :list (room-files/list-dir room (:path args) (select-keys args [:offset]))
+                            :read (room-files/read-file room (:path args) (select-keys args [:offset :length]))
+                            :resource
+                            (try {:kind :file :data (room-files/read-file room (:path args) {:max room-files/max-resource-bytes})}
                                  (catch clojure.lang.ExceptionInfo error
-                                   (file-read-error! (case (:type (ex-data error))
-                                                       ::room-files/not-found :not-found
-                                                       (::room-files/invalid ::room-files/not-a-directory ::room-files/directory) :refused
-                                                       :unavailable) error))
-                                 (catch Throwable error (file-read-error! :unavailable error)))]
-                    (assoc result :target-stamp stamp)))))
-      (do
-        (when (contains? args :expected-target-stamp) (file-read-error! :refused nil))
-        (files-op daemon (:room args)
-                  (fn [room]
-                    (in-ctx daemon
-                            (case operation
-                              :list (room-files/list-dir room (:path args) (select-keys args [:offset]))
-                              :read (room-files/read-file room (:path args) (select-keys args [:offset :length]))
-                              :resource
-                              (try {:kind :file :data (room-files/read-file room (:path args) {:max room-files/max-resource-bytes})}
-                                   (catch clojure.lang.ExceptionInfo error
-                                     (if (= ::room-files/directory (:type (ex-data error)))
-                                       {:kind :directory :data (room-files/list-dir room (:path args))}
-                                       (throw error))))))))))))
+                                   (if (= ::room-files/directory (:type (ex-data error)))
+                                     {:kind :directory :data (room-files/list-dir room (:path args))}
+                                     (throw error)))))))))))
 
 ;; ---- plain-data projections (serializable for any binding) ----
 
@@ -946,13 +955,22 @@
     :schema [:map [:room {:optional true} Room]]
     :impl (fn [daemon {:keys [room]}]
             (into (mapv catalog/describe (vals catalog/workflows))
-                  (when-let [r (some->> room (resolve-room daemon))]
-                    (for [n (in-ctx daemon (room-wf/list-bundles r))
-                          :let [b (try (in-ctx daemon (room-wf/read-bundle r n)) (catch Exception _ nil))]]
-                      (cond-> {:id (str (:slug r) "/" n) :room (:slug r)}
-                        b (merge (select-keys (:definition b) [:title :doc :params :profile])
-                                 {:bundle (str (:id b)) :verifier (name (room-wf/tier b))})
-                        (nil? b) (assoc :problems ["not well formed; see catalog_check"]))))))}
+                  (when room
+                    (if-let [{:keys [db target-stamp]}
+                             (configured-room-file-binding daemon *principal* :list
+                                                           {:room room :path "/workflows"})]
+                      (try (in-ctx daemon (immutable-catalog/list-in db room target-stamp))
+                           (catch InterruptedException error
+                             (.interrupt (Thread/currentThread))
+                             (file-read-error! :unavailable error))
+                           (catch Throwable error (file-read-error! :unavailable error)))
+                      (when-let [r (resolve-room daemon room)]
+                        (for [n (in-ctx daemon (room-wf/list-bundles r))
+                              :let [b (try (in-ctx daemon (room-wf/read-bundle r n)) (catch Exception _ nil))]]
+                          (cond-> {:id (str (:slug r) "/" n) :room (:slug r)}
+                            b (merge (select-keys (:definition b) [:title :doc :params :profile])
+                                     {:bundle (str (:id b)) :verifier (name (room-wf/tier b))})
+                            (nil? b) (assoc :problems ["not well formed; see catalog_check"]))))))))}
 
    :catalog/calibrate
    {:doc (str "Calibrate a workflow bundle's checker (calibration.edn: a reference answer and "
