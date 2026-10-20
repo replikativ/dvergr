@@ -15,6 +15,7 @@
             [geschichte.git.http :as git-http]
             [geschichte.git.local :as git-local]
             [geschichte.repo :as repo]
+            [geschichte.query :as query]
             [muschel.fs.geschichte :as mgeschichte]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]
@@ -214,17 +215,89 @@
 (def gy-connection gy/connection)
 (def gy-workspace-id gy/workspace-id)
 
+(defn- workspace-descriptor
+  ([system] (workspace-descriptor system (gy/connection system)))
+  ([system conn]
+   (when-not (instance? clojure.lang.IDeref conn)
+     (throw (ex-info "Geschichte workspace has no active connection"
+                     {:type ::workspace-unavailable})))
+   (let [db @conn
+         config (:config db)
+         branch (get config :branch :db)
+         physical {:repository (:geschichte.repo/id (query/repository db))
+                   :store (get-in config [:store :id])
+                   :backend (get-in config [:store :backend])
+                   :branch branch :ref (query/current-ref db)}]
+     (when-not (every? some? (vals physical))
+       (throw (ex-info "Geschichte workspace is not initialized"
+                       {:type ::workspace-unavailable})))
+     {:system system
+      :conn conn
+      :id [(:store physical) branch]
+      ::physical-target physical
+      :repository {:conn conn :config config :workspace-branch branch}})))
+
+(defn workspace-for-system!
+  "HOST API: resolve this exact registered Geschichte SystemIdentity object in
+   the bound context, independently of ambient selection. Its logical id and
+   connection must be unique; aliases cannot select another system's policy.
+   A parent/facade/replacement object is not the registered capability.
+   The descriptor freezes repository/store/branch/ref identity, not HEAD.
+   Resolution is a snapshot, NOT authorization or a registration lifetime lease."
+  [system]
+  (when-not (and (satisfies? p/SystemIdentity system)
+                 (string? (p/system-id system))
+                 (not (str/blank? (p/system-id system)))
+                 (= :geschichte (p/system-type system)))
+    (throw (ex-info "Expected a registered Geschichte SystemIdentity object"
+                    {:type ::invalid-workspace-system})))
+  (let [id (p/system-id system)
+        registered (vec (vals (ygg/registered-systems)))
+        matches (filterv #(and (satisfies? p/SystemIdentity %)
+                               (= id (p/system-id %)))
+                         registered)]
+    (when-not (and (= 1 (count matches)) (identical? system (first matches)))
+      (throw (ex-info "Geschichte workspace is missing, replaced or ambiguous"
+                      {:type ::workspace-unavailable :system/id id})))
+    (let [conn (gy/connection system)]
+      (when-not (identical? conn (gy/connection (first matches)))
+        (throw (ex-info "Geschichte workspace connection changed"
+                        {:type ::workspace-changed :system/id id})))
+      (when-not (= 1 (count (filter #(and (satisfies? p/SystemIdentity %)
+                                          (identical? conn
+                                                      (if (= :geschichte (p/system-type %))
+                                                        (gy/connection %)
+                                                        (:conn %))))
+                                    registered)))
+        (throw (ex-info "Geschichte connection has ambiguous registered system ownership"
+                        {:type ::workspace-unavailable :system/id id})))
+      (workspace-descriptor system conn))))
+
+(defn assert-workspace-current!
+  "HOST API: revalidate a retained descriptor's exact registered system,
+   connection, canonical filesystem configuration and frozen physical target.
+   Returns the ORIGINAL descriptor. Does not change selection or admit writes;
+   callers retain their existing effect/permission gates and physical lock."
+  [workspace]
+  (when-not (and (map? workspace) (map? (:repository workspace)))
+    (throw (ex-info "Expected a host workspace descriptor"
+                    {:type ::invalid-workspace-descriptor})))
+  (let [current (workspace-for-system! (:system workspace))
+        conn (:conn current)]
+    (when-not (and (identical? conn (:conn workspace))
+                   (identical? conn (get-in workspace [:repository :conn]))
+                   (= (:id current) (:id workspace))
+                   (= (::physical-target current) (::physical-target workspace))
+                   (= (dissoc (:repository current) :conn)
+                      (dissoc (:repository workspace) :conn)))
+      (throw (ex-info "Retained Geschichte workspace target changed"
+                      {:type ::workspace-changed})))
+    workspace))
+
 (defn current-workspace
   "Virtual workspace descriptor for the bound context, or nil."
   []
-  (when-let [system (current-system)]
-    (let [conn (gy/connection system)]
-      {:system system
-       :conn conn
-       :id (gy/workspace-id system)
-       :repository {:conn conn
-                    :config (:config @conn)
-                    :workspace-branch (get-in @conn [:config :branch])}})))
+  (some-> (current-system) workspace-descriptor))
 
 (defn optional-workspace
   "Compatibility boundary for legacy callers that have no workspace. Resolve
