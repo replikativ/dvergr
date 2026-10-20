@@ -62,6 +62,7 @@
             [dvergr.model.registry :as reg]
             [dvergr.principal :as principal]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [taoensso.telemere :as tel]))
 
@@ -218,6 +219,115 @@
            (if-let [status (file-error-status (:type (ex-data e)))]
              (throw (ex-info (ex-message e) (assoc (ex-data e) ::status status) e))
              (throw e))))))
+
+(defn- file-read-error! [reason cause]
+  (throw (ex-info (case reason
+                    :target-changed "Workspace changed; discover the current target before continuing"
+                    :not-found "Workspace file or directory not found"
+                    :refused "Workspace read refused"
+                    "Workspace read unavailable")
+                  {:type ::file-read-refused :reason reason
+                   ::status (case reason :target-changed 409 :not-found 404 :refused 400 503)
+                   :json-rpc/code (if (= :not-found reason) -32002 -32602)}
+                  cause)))
+
+(defn- target-stamp? [stamp]
+  (and (string? stamp) (<= 1 (count stamp) 256) (not (str/blank? stamp))
+       (not (re-find #"[\p{Cntrl}]" stamp))))
+
+(defn- host-read-request? [operation args]
+  (let [allowed (case operation
+                  :list #{:room :path :offset :expected-target-stamp}
+                  :read #{:room :path :offset :length :expected-target-stamp}
+                  :resource #{:room :path :expected-target-stamp}
+                  nil)]
+    (and allowed (map? args) (every? allowed (keys args))
+         (string? (:room args)) (<= 1 (count (:room args)) 1024)
+         (if (= :list operation)
+           (or (not (contains? args :path)) (and (string? (:path args)) (<= (count (:path args)) 4096)))
+           (and (string? (:path args)) (<= 1 (count (:path args)) 4096)))
+         (or (not (contains? args :offset))
+             (and (integer? (:offset args)) (<= 0 (:offset args) room-files/max-file-bytes)))
+         (or (not (contains? args :length))
+             (and (integer? (:length args)) (<= 1 (:length args) room-files/max-read-bytes)))
+         (or (not (contains? args :expected-target-stamp)) (target-stamp? (:expected-target-stamp args))))))
+
+(defn room-file-read
+  "INTERNAL, already-authorized adapter gateway, NOT an authorization endpoint.
+   invoke authorizes tools before calling this; MCP resources retain their own
+   room/read gate. Pass the EXPLICIT authenticated principal, never derive one.
+
+   Optional trusted host config [:room-files :resolve-read] receives principal
+   and a CLOSED request with :operation (:list/:read/:resource), original :room,
+   path/bounds and expected-target-stamp. It must authorize and resolve current
+   canonical ownership before hydration, returning ONLY {:db immutable-db
+   :target-stamp bounded-string}. The gateway never hydrates, exports handles,
+   caches authority, accepts callbacks from RPC, or falls back on hook failure.
+   Directory resource fallback projects the SAME returned DB exactly once.
+
+   Without a configured hook, existing selected MountFS behavior is unchanged.
+   An unsupported stamp is refused, not silently ignored. New flat helpers are
+   not generic replacements for nested MountFS/selected sandbox access."
+  [daemon authenticated-principal operation args]
+  (let [config (:config daemon)
+        files-config (:room-files config)
+        configured? (contains? config :room-files)]
+    (if (and configured? (or (not (map? files-config)) (contains? files-config :resolve-read)))
+      (let [resolver (:resolve-read files-config)]
+        (when (or (simple/on-drain-thread?) (not (fn? resolver)))
+          (file-read-error! :unavailable nil))
+        (when-not (and (map? authenticated-principal) (:principal/id authenticated-principal)
+                       (host-read-request? operation args))
+          (file-read-error! :refused nil))
+        (in-ctx daemon
+                (let [binding (try (resolver authenticated-principal (assoc args :operation operation))
+                                   (catch InterruptedException error
+                                     (.interrupt (Thread/currentThread))
+                                     (file-read-error! :unavailable error))
+                                   (catch Throwable error (file-read-error! :unavailable error)))]
+                  (when-not (and (map? binding) (= #{:db :target-stamp} (set (keys binding)))
+                                 (room-files/immutable-workspace-db? (:db binding))
+                                 (target-stamp? (:target-stamp binding)))
+                    (file-read-error! :unavailable nil))
+                  (when (and (contains? args :expected-target-stamp)
+                             (not= (:expected-target-stamp args) (:target-stamp binding)))
+                    (file-read-error! :target-changed nil))
+                  (let [db (:db binding) stamp (:target-stamp binding)
+                        result (try
+                                 (case operation
+                                   :list (room-files/list-dir-in db (:path args) (select-keys args [:offset]))
+                                   :read (room-files/read-file-in db (:path args) (select-keys args [:offset :length]))
+                                   :resource
+                                   (try {:kind :file :data (room-files/read-file-in db (:path args)
+                                                                                    {:max room-files/max-resource-bytes :whole? true})}
+                                        (catch clojure.lang.ExceptionInfo error
+                                          (if (= ::room-files/directory (:type (ex-data error)))
+                                            {:kind :directory :data (room-files/list-dir-in db (:path args))}
+                                            (throw error)))))
+                                 (catch InterruptedException error
+                                   (.interrupt (Thread/currentThread))
+                                   (file-read-error! :unavailable error))
+                                 (catch clojure.lang.ExceptionInfo error
+                                   (file-read-error! (case (:type (ex-data error))
+                                                       ::room-files/not-found :not-found
+                                                       (::room-files/invalid ::room-files/not-a-directory ::room-files/directory) :refused
+                                                       :unavailable) error))
+                                 (catch Throwable error (file-read-error! :unavailable error)))]
+                    (assoc result :target-stamp stamp)))))
+      (do
+        (when (contains? args :expected-target-stamp) (file-read-error! :refused nil))
+        (files-op daemon (:room args)
+                  (fn [room]
+                    (in-ctx daemon
+                            (case operation
+                              :list (room-files/list-dir room (:path args) (select-keys args [:offset]))
+                              :read (room-files/read-file room (:path args) (select-keys args [:offset :length]))
+                              :resource
+                              (try {:kind :file :data (room-files/read-file room (:path args) {:max room-files/max-resource-bytes})}
+                                   (catch clojure.lang.ExceptionInfo error
+                                     (if (= ::room-files/directory (:type (ex-data error)))
+                                       {:kind :directory :data (room-files/list-dir room (:path args))}
+                                       (throw error))))))))))))
 
 ;; ---- plain-data projections (serializable for any binding) ----
 
@@ -1224,9 +1334,10 @@
     :kind :read
     :schema [:map [:room Room]
              [:path {:optional true} [:string {:description "directory, e.g. /data (default /)"}]]
-             [:offset {:optional true} [:int {:min 0 :description "entry to start at (default 0)"}]]]
-    :impl (fn [daemon {:keys [room path offset]}]
-            (files-op daemon room #(in-ctx daemon (room-files/list-dir % path {:offset offset}))))}
+             [:offset {:optional true} [:int {:min 0 :description "entry to start at (default 0)"}]]
+             [:expected-target-stamp {:optional true} [:string {:min 1 :max 256
+                                                                :description "Opaque target precondition from a configured host read; unsupported hosts refuse it"}]]]
+    :impl (fn [daemon args] (room-file-read daemon *principal* :list args))}
 
    :room/read
    {:doc (str "Read a file of a room's workspace: {text} for UTF-8 text, {base64, media-type} for "
@@ -1240,9 +1351,10 @@
              [:offset {:optional true} [:int {:min 0 :description "byte to start at (default 0)"}]]
              [:length {:optional true} [:int {:min 1 :max room-files/max-read-bytes
                                               :description (str "bytes to read (default and at most "
-                                                                room-files/max-read-bytes ")")}]]]
-    :impl (fn [daemon {:keys [room path offset length]}]
-            (files-op daemon room #(in-ctx daemon (room-files/read-file % path {:offset offset :length length}))))}
+                                                                room-files/max-read-bytes ")")}]]
+             [:expected-target-stamp {:optional true} [:string {:min 1 :max 256
+                                                                :description "Opaque target precondition, not file-content or chunk identity; unsupported hosts refuse it"}]]]
+    :impl (fn [daemon args] (room-file-read daemon *principal* :read args))}
 
    :room/diff
    {:doc "The diff of a fork against its parent (what reconcile-merge would apply)."
