@@ -412,26 +412,23 @@
   (ops/authorize! dmn principal :room/read args)
   ;; uncut: a resource is a document, and a listing is a bounded page
   (let [json-text #(json/write-value-as-string % json-write-mapper)]
-    (if-let [r (ops/resolve-room dmn room)]
-      (binding [ec/*execution-context* (:execution-ctx dmn)]
-        (try
-          (let [{:keys [text base64 media-type size length]}
-                (room-files/read-file r path {:max room-files/max-resource-bytes})]
-            (when (< length size)
-              (throw (ex-info (str path " has " size " bytes, more than a resource returns ("
-                                   room-files/max-resource-bytes "); read it with room_read and offset")
-                              {:json-rpc/code -32602 :json-rpc/data {:uri uri}})))
-            [(cond-> {:uri uri :mimeType media-type}
-               text (assoc :text text)
-               base64 (assoc :blob base64))])
-          (catch clojure.lang.ExceptionInfo e
-            (case (:type (ex-data e))
-              ::room-files/directory
-              [{:uri uri :mimeType "application/json" :text (json-text (room-files/list-dir r path))}]
-              ::room-files/not-found
-              (throw (ex-info (str "Resource not found: " uri) {:json-rpc/code -32002 :json-rpc/data {:uri uri}}))
-              (throw e)))))
-      (throw (ex-info (str "Resource not found: " uri) {:json-rpc/code -32002 :json-rpc/data {:uri uri}})))))
+    (try
+      (let [{:keys [kind data target-stamp]} (ops/room-file-read dmn principal :resource args)
+            {:keys [text base64 media-type size length]} data]
+        (when (and (= :file kind) (< length size))
+          (throw (ex-info (str path " has " size " bytes, more than a resource returns ("
+                               room-files/max-resource-bytes "); read it with room_read and offset")
+                          {:json-rpc/code -32602 :json-rpc/data {:uri uri}})))
+        [(cond-> (if (= :directory kind)
+                   {:uri uri :mimeType "application/json"
+                    :text (json-text (cond-> data target-stamp (assoc :target-stamp target-stamp)))}
+                   (cond-> {:uri uri :mimeType media-type}
+                     text (assoc :text text) base64 (assoc :blob base64)))
+           target-stamp (assoc :_meta {:dvergr/target-stamp target-stamp}))])
+      (catch clojure.lang.ExceptionInfo e
+        (if (#{::room-files/not-found ::ops/no-room} (:type (ex-data e)))
+          (throw (ex-info (str "Resource not found: " uri) {:json-rpc/code -32002 :json-rpc/data {:uri uri}}))
+          (throw e))))))
 
 (defn- read-resource [principal uri]
   (if-let [{:keys [op args file?]} (when-let [m (uri->op+args uri)]

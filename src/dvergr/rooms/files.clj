@@ -15,6 +15,7 @@
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.blob :as blob]
+            [datahike.db.interface :as dbi]
             [dvergr.effects :as effects]
             [dvergr.system.rooms :as srooms]
             [dvergr.rooms.forks :as forks]
@@ -24,6 +25,9 @@
             [dvergr.substrate.geschichte :as gs]
             [dvergr.tools :as tools]
             [geschichte.repo :as repo]
+            [geschichte.content :as content]
+            [geschichte.fs :as gfs]
+            [geschichte.query :as query]
             [jsonista.core :as json]
             [muschel.fs :as mfs]
             [org.replikativ.spindel.engine.core :as ec]
@@ -215,6 +219,109 @@
           _ (when (and (= end offset) (< offset size))
               (refuse (str "length " length " is shorter than the character at offset " offset)
                       {:path p :offset offset :length length}))
+          n (- end offset)]
+      (cond-> {:path p :size size :content-id (str content)
+               :media-type (media-type p text?) :offset offset :length n}
+        text? (assoc :text (String. bytes (int offset) (int n) StandardCharsets/UTF_8))
+        (not text?) (assoc :base64 (.encodeToString (Base64/getEncoder)
+                                                    (java.util.Arrays/copyOfRange bytes (int offset) (int end))))
+        (< end size) (assoc :next-offset end)))))
+
+;; ---------------------------------------------------------------------------
+(def max-read-index-entries
+  "Metadata bound of explicit flat-repository read projections. Legacy selected
+   MountFS reads retain their existing behavior, including nested mounts."
+  20000)
+
+(defn immutable-workspace-db?
+  "Whether a value supports immutable Datahike projections. This is a storage
+   shape check, NOT authorization or a proof of repository ownership."
+  [db]
+  (and (satisfies? dbi/IDB db) (satisfies? dbi/ISearch db)))
+
+(defn- frozen-workspace! [db]
+  (when-not (immutable-workspace-db? db)
+    (refuse "An immutable workspace database is required" {}))
+  (doseq [attribute [:geschichte.work/path :geschichte.work-dir/path]]
+    (when (> (count (take (inc max-read-index-entries) (d/datoms db :avet attribute)))
+             max-read-index-entries)
+      (refuse "Workspace metadata exceeds the explicit read limit" {})))
+  ;; Geschichte's read APIs take an IDeref. This local frozen value is never
+  ;; exposed, mutated, registered as a system, or used as a Room facade.
+  (atom db))
+
+(defn list-dir-in
+  "HOST STORAGE primitive: bounded listing of ONE immutable native repository,
+   including its explicit directories. No selected workspace or nested MountFS
+   lookup. Caller must establish current authority and canonical ownership.
+   The snapshot is not a GC pin; it is never a retained authorization lease."
+  ([db path] (list-dir-in db path {}))
+  ([db path {:keys [offset]}]
+   (let [frozen (frozen-workspace! db)
+         dir (workspace-path (or path "/") true)
+         st (gfs/stat frozen dir)
+         offset (or offset 0)]
+     (when-not (and (integer? offset) (<= 0 offset max-read-index-entries))
+       (refuse "Invalid directory offset" {}))
+     (when-not (= :dir (:type st))
+       (throw (ex-info "Workspace directory not found"
+                       {:type (if st ::not-a-directory ::not-found)})))
+     (let [tree (query/worktree db)
+           all (vec (remove #(= ".git" (:name %)) (gfs/list-dir frozen dir)))
+           entry (fn [{entry-name :name entry-type :type size :size}]
+                   (let [p (str (when-not (= "/" dir) dir) "/" entry-name)]
+                     (cond-> {:name entry-name :path p :kind (name (or entry-type :file))}
+                       (= :file entry-type)
+                       (assoc :size size :content-id (some-> (get tree (rel p)) :content str)))))
+           page (loop [es (drop offset all) acc [] chars 0]
+                  (if-let [e (some-> (first es) entry)]
+                    (let [entry-chars (inc (count (json/write-value-as-string e)))
+                          _ (when (> entry-chars max-list-chars)
+                              (refuse "Workspace listing entry exceeds the explicit read limit" {}))
+                          n (+ chars entry-chars)]
+                      (if (and (seq acc) (or (<= max-list-entries (count acc)) (< max-list-chars n)))
+                        acc (recur (rest es) (conj acc e) n))) acc))
+           end (+ offset (count page))]
+       (cond-> {:path dir :total (count all) :entries page}
+         (< end (count all)) (assoc :next-offset end))))))
+
+(defn read-file-in
+  "HOST STORAGE primitive: raw bytes of one file in a frozen native repository.
+   Same bounded text/binary chunk format as read-file; never consults selection,
+   live filesystem mounts or a newer content entity. Validate metadata BEFORE
+   decoding a body. :whole? is trusted resource policy, not a client option.
+   Caller supplies current authorization/ownership; no interpreter or write."
+  [db path {:keys [offset length max whole?] :or {max max-read-bytes}}]
+  (let [frozen (frozen-workspace! db)
+        p (workspace-path path)
+        {:keys [content mode size] :as entry} (get (query/worktree db) (rel p))
+        offset (or offset 0)
+        length (or length max)]
+    (when-not (and (integer? max) (<= 1 max max-resource-bytes)
+                   (integer? offset) (<= 0 offset max-file-bytes)
+                   (integer? length) (pos? length))
+      (refuse "Invalid file read bounds" {}))
+    (when-not entry
+      (throw (ex-info "Workspace file not found"
+                      {:type (if (= :dir (:type (gfs/stat frozen p))) ::directory ::not-found)})))
+    (when-not (and (uuid? content) (integer? size) (<= 0 size max-file-bytes)
+                   (integer? mode) (= 0100000 (bit-and mode 0170000)))
+      (refuse "Only bounded regular workspace files can be read" {}))
+    (when (and whole? (> size max))
+      (refuse "File exceeds the whole-resource limit; use room_read chunks" {}))
+    (when-not (= size (:geschichte.content/size (d/entity db [:geschichte.content/id content])))
+      (refuse "Workspace content metadata is inconsistent" {}))
+    (let [^bytes bytes (content/read-by-id frozen content)
+          _ (when-not (and bytes (= size (alength bytes)))
+              (refuse "Workspace content is unavailable or inconsistent" {}))
+          length (long (min max length))
+          _ (when (and (pos? offset) (>= offset size)) (refuse "File offset is outside the file" {}))
+          text? (text-bytes? bytes)
+          _ (when (and text? (continuation? bytes offset))
+              (refuse "File offset is inside a character" {}))
+          end (min size (+ offset length))
+          end (if text? (loop [e end] (if (continuation? bytes e) (recur (dec e)) e)) end)
+          _ (when (and (= end offset) (< offset size)) (refuse "Read length splits a character" {}))
           n (- end offset)]
       (cond-> {:path p :size size :content-id (str content)
                :media-type (media-type p text?) :offset offset :length n}
