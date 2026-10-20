@@ -107,6 +107,26 @@ promise zero temporary writes or zero rollback transactions. Arbitrary repositor
 checks, not by the process-local monitor. Legacy `dvergr.rooms.files/write!`
 still resolves ambient selection once and uses this same pinned implementation.
 
+For a host that must distinguish a refused original claim from an unresolved
+publication, `dvergr.rooms.files/write-to-completion!` is a separate API. Its
+normal envelope has `:completion :not-started`, `:returned`, or `:pending`, a
+native `:result`, and an optional diagnostic `:error`. Only not-started proves
+this invocation entered no canonical file/index/schema/publication mutation.
+Consume that evidence only for the exact separately authorized original claim;
+it never authorizes aborting an applying operation. A winning native
+applied/recovered result is returned even when a surrounding handler throws.
+Handler response maps and exception metadata are not completion authority.
+
+The new API permits only synchronous forwarding on its calling native worker
+thread. One private bottom gate covers outer and inner executors and seals
+permanently before the envelope is constructed: saved `next` callbacks cannot
+write later or from another thread. Pure preflight precedes receipt-schema
+installation; recovery still precedes opened-version refusal. Entered failures
+remain pending, even if existing best-effort compensation reports no conflicts.
+This does not certify rollback or arbitrary trusted-host handler I/O. Legacy
+`write!` and `write-to!` retain their prior contracts; no new executor or grant
+is introduced.
+
 Execution selection is separate from that registry resolver. A trusted host
 can call `dvergr.substrate.geschichte/select-workspace!` with the exact runtime
 system name in the **Run world's** context before constructing its tools.
