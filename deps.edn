@@ -102,8 +102,10 @@
         ;; plain Room contexts, source-preserving failed-copy recovery, and
         ;; independent Sessions at fork creation (spindel#145/#146).
         ;; Reviewed staged-interpreter publication API (Spindel PR #147).
+        ;; Historical savepoint forks own isolated workspaces; settlement joins
+        ;; native overlay disposal (Spindel #148). Public commit pending release.
         org.replikativ/spindel     {:git/url "https://github.com/replikativ/spindel.git"
-                                  :git/sha "0cda03449d853f32c13d4087b1f9abbc19400db5"}
+                                    :git/sha "2e394753b9871b0c705d21e6aef1784b2b74d6b0"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,
@@ -152,7 +154,10 @@
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.3.46 merges a diverged Geschichte overlay three-way (#24): a fork
         ;; whose parent gained a commit meanwhile merges instead of fencing.
-        org.replikativ/yggdrasil   {:mvn/version "0.3.49"
+        ;; Explicit owned historical overlays (#29), matching Spindel's contract.
+        ;; Keep this direct pin aligned; an old Maven pin would override it.
+        org.replikativ/yggdrasil   {:git/url "https://github.com/replikativ/yggdrasil"
+                                    :git/sha "dee7438acbf428323779e6d59fc18db4aa9d7556"
                                     :exclusions  [org.babashka/sci]}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
