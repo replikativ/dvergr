@@ -47,17 +47,56 @@
             (is (not (contains? row :bundle)))
             (is (not (contains? row :verifier)))))))))
 
+(deftest incomplete-source-rows-refuse-rather-than-disappear-from-a-bundle
+  (fixture/with-repositories
+    (fn [_ conn _]
+      (seed! conn "insight" valid-source)
+      (let [db @conn
+            path "workflows/insight/fixtures/input.md"
+            eid (d/q '[:find ?e . :in $ ?path :where [?e :geschichte.work/path ?path]] db path)
+            content-eid (:db/id (:geschichte.work/content (d/entity db eid)))]
+        (is (some? eid))
+        (doseq [tx [[[:db/retract eid :geschichte.work/content]]
+                    [[:db/retract eid :geschichte.work/size]]
+                    [[:db/retract eid :geschichte.work/mode]]
+                    [[:db/retract content-eid :geschichte.content/id]]]]
+          (let [corrupt (:db-after (d/with db tx))]
+            (with-redefs [query/worktree (fn [& _] (throw (AssertionError. "No inner-join manifest")))
+                          content/read-by-id (fn [& _] (throw (AssertionError. "Reject all metadata before bodies")))]
+              (is (thrown? clojure.lang.ExceptionInfo (projection/list-in corrupt "room" "stamp"))))))))))
+
+(deftest subtree-acquisition-refuses-overflow-before-entity-or-body-reads
+  (fixture/with-repositories
+    (fn [_ conn _]
+      (let [seen (atom 0)
+            rows (fn rows [i]
+                   (lazy-seq
+                    (swap! seen inc)
+                    (cons {:e i :v (str "workflows/cap/" i)} (rows (inc i)))))]
+        (with-redefs [d/index-range (fn [& _] (rows 0))
+                      d/entity (fn [& _] (throw (AssertionError. "Reject overflow before entities")))
+                      query/worktree (fn [& _] (throw (AssertionError. "No full manifest")))
+                      content/read-by-id (fn [& _] (throw (AssertionError. "No overflow bodies")))]
+          (is (thrown? clojure.lang.ExceptionInfo (projection/snapshot-in @conn)))
+          (is (= 501 @seen)))))))
+
 (deftest whole-subtree-file-count-cap-is-exact-and-metadata-first
   (fixture/with-repositories
     (fn [_ conn _]
       (let [db @conn {:keys [content size mode]} (get (query/worktree db) "identity.txt")
             make-db (fn [n]
                       (:db-after (d/with db
-                                         (mapv (fn [i] {:geschichte.work/path (str "workflows/cap/" i ".txt")
-                                                        :geschichte.work/content [:geschichte.content/id content]
-                                                        :geschichte.work/size size :geschichte.work/mode mode})
-                                               (range n)))))]
-        (is (= 500 (count (projection/snapshot-in (make-db 500)))))
+                                         (conj (mapv (fn [i] {:geschichte.work/path (str "workflows/cap/" i ".txt")
+                                                              :geschichte.work/content [:geschichte.content/id content]
+                                                              :geschichte.work/size size :geschichte.work/mode mode})
+                                                     (range n))
+                                               {:geschichte.work/path "workflows0"}))))]
+        (let [full (make-db 500)]
+          ;; An unrelated incomplete row at the inclusive endpoint must not
+          ;; consume the workflow limit or become an invalid source entry.
+          (is (= "workflows0" (:v (last (d/index-range full {:attrid :geschichte.work/path
+                                                             :start "workflows/" :end "workflows0"})))))
+          (is (= 500 (count (projection/snapshot-in full)))))
         (with-redefs [content/read-by-id (fn [& _] (throw (AssertionError. "Overflow reached body")))]
           (is (thrown? clojure.lang.ExceptionInfo (projection/snapshot-in (make-db 501)))))
         (let [valid (make-db 2)

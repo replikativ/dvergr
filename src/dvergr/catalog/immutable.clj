@@ -6,7 +6,6 @@
             [dvergr.catalog.room :as room]
             [dvergr.rooms.files :as files]
             [geschichte.content :as content]
-            [geschichte.query :as query]
             [jsonista.core :as json]
             [malli.core :as m])
   (:import [java.nio ByteBuffer]
@@ -30,10 +29,29 @@
                         (d/datoms db :avet :geschichte.work/path)))
            files/max-read-index-entries)
     (refuse!))
-  (let [entries (into (sorted-map)
-                      (filter (fn [[path _]] (str/starts-with? path "workflows/")))
-                      (query/worktree db))]
-    (when (> (count entries) max-files) (refuse!))
+  ;; Worktree's convenience query inner-joins metadata: incomplete path rows
+  ;; disappear from it. Inspect EVERY indexed path in this bounded subtree so
+  ;; corrupt source cannot silently become a smaller, apparently valid bundle.
+  (let [rows (into [] (remove #(= "workflows0" (:v %)))
+                   ;; Datahike's end value is inclusive. Exclude ONLY that
+                   ;; known outside-prefix endpoint AFTER bounded acquisition.
+                   (take (inc max-files)
+                         (d/index-range db {:attrid :geschichte.work/path
+                                            :start "workflows/" :end "workflows0"})))
+        _ (when (> (count rows) max-files) (refuse!))
+        entries (reduce (fn [entries row]
+                          (let [path (:v row)
+                                entity (d/entity db (:e row))]
+                            (when-not (and (string? path) (<= (count path) 4096)
+                                           (str/starts-with? path "workflows/")
+                                           (= path (:geschichte.work/path entity))
+                                           (not (contains? entries path)))
+                              (refuse!))
+                            (assoc entries path
+                                   {:content (:geschichte.content/id (:geschichte.work/content entity))
+                                    :size (:geschichte.work/size entity)
+                                    :mode (:geschichte.work/mode entity)})))
+                        (sorted-map) rows)]
     (doseq [[path {:keys [content size mode]}] entries]
       (when-let [[_ name] (and (string? path)
                                (re-matches #"workflows/([^/]+)/workflow\.edn" path))]
