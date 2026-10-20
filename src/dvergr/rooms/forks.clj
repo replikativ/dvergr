@@ -302,7 +302,7 @@
    Optional :expected-modes is checked against that same staged index. The
    exact descriptor is revalidated; ambient selection is never consulted."
   ([room workspace expected message] (commit-paths-in-workspace! room workspace expected message {}))
-  ([room workspace expected message {:keys [receipt? expected-modes publication]}]
+  ([room workspace expected message {:keys [receipt? expected-modes publication required-subtree removed-paths subtree-basis stage-witness]}]
    (binding [ec/*execution-context* (:ctx room)]
      (let [{:keys [conn]} (git/assert-workspace-current! workspace)
            rel #(str/replace (str %) #"^/+" "")
@@ -316,7 +316,12 @@
                                   (str/join ", " (take 5 staged)) "); commit them first")
                              {:type ::staged-changes :room (:id room) :staged staged}))))
          (when (seq paths)
-           (repo/stage! conn paths)
+           (if required-subtree
+             (do (when-not (and (:noop? (:plan subtree-basis)) stage-witness)
+                   (throw (ex-info "Missing original clean subtree stage basis" {:type ::concurrent-change})))
+                 (publication/stage-subtree! conn subtree-basis required-subtree
+                                             (mapv #(str "/" %) paths) stage-witness))
+             (repo/stage! conn paths))
            (let [index (repo/index-tree conn)
                  staged (:staged (repo/status conn))
                 ;; the content, and a regular file: a link to the same text has the same id
@@ -335,7 +340,8 @@
                    published
                    (when publication
                      (let [{:keys [identity authorize! before-dispatch!]} publication
-                           plan (publication/prepare conn options (mapv #(str "/" %) paths))
+                           plan (cond-> (publication/prepare conn options (mapv #(str "/" %) paths))
+                                  required-subtree (assoc :required-subtree required-subtree))
                            _ (when-not (= index (:index plan))
                                (throw (ex-info "Staged files changed during publication preparation"
                                                {:type ::concurrent-change :room (:id room)})))
@@ -359,11 +365,28 @@
                        (git/assert-workspace-current! workspace)
                        (before-dispatch! candidate)
                        (publication/publish! conn plan candidate)))
-                   commit (if publication
-                            (some-> (:publication/commit published) str)
-                            (when (seq staged)
-                              (git/assert-workspace-current! workspace)
-                              (some-> (repo/commit! conn options) :geschichte.commit/id str)))]
+                   conditional
+                   (when (and required-subtree (nil? publication))
+                     (let [plan (assoc (repo/prepare-commit conn options)
+                                       :required-subtree required-subtree
+                                       :subtree/removed (vec removed-paths))]
+                       (when-not (every? #(and (contains? expected (rel %))
+                                               (nil? (get expected (rel %)))) removed-paths)
+                         (throw (ex-info "Invalid conditional cleanup paths" {:type ::concurrent-change})))
+                       (when-not (= index (:index plan))
+                         (throw (ex-info "Index changed before conditional publication" {:type ::concurrent-change})))
+                       (when-let [reason (srooms/room-effect-write-refusal
+                                          room {:effect :room/write
+                                                :resource {:system-id (srooms/connection-system-id conn)}})]
+                         (throw (ex-info "Room policy changed before conditional publication"
+                                         {:type ::publication-policy-changed :reason reason})))
+                       (git/assert-workspace-current! workspace)
+                       (publication/commit-prepared! conn plan)))
+                   commit (cond publication (some-> (:publication/commit published) str)
+                                required-subtree (:commit conditional)
+                                (seq staged)
+                                (do (git/assert-workspace-current! workspace)
+                                    (some-> (repo/commit! conn options) :geschichte.commit/id str)))]
                (if receipt?
                  (cond-> {:commit commit :tree index} published (assoc :publication published))
                  commit)))))))))
