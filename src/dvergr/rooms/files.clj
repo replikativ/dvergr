@@ -26,7 +26,8 @@
             [geschichte.repo :as repo]
             [jsonista.core :as json]
             [muschel.fs :as mfs]
-            [org.replikativ.spindel.engine.core :as ec])
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple])
   (:import [java.nio ByteBuffer]
            [java.nio.charset CharacterCodingException CodingErrorAction StandardCharsets]
            [java.util Base64]))
@@ -367,11 +368,64 @@
    :removed (mapv :publication.entry/path
                   (filter #(= :deleted (:publication.entry/state %)) (:publication/entries receipt)))})
 
+(defn- applied-result [entries receipt message removed]
+  (cond-> {:commit (when receipt (:commit receipt))
+           :applied? (boolean receipt)
+           :message message
+           :written (vec (for [[p c] entries :when (and receipt (not= ::remove c))
+                               :let [entry (get-in receipt [:entries p])]]
+                           {:path p :size (:size entry) :content-id (some-> (:content entry) str)
+                            :entry entry}))
+           :removed removed}
+    (:publication receipt) (assoc :publication (:publication receipt))))
+
+(defn- completion-gate []
+  {:owner (Thread/currentThread)
+   :state (atom {:sealed? false :active 0 :entered? false :positive nil})})
+
+(defn- guarded-native! [gate mutation? f]
+  (if-not gate
+    (f)
+    (let [state (:state gate)]
+      (locking state
+        (when-not (and (identical? (:owner gate) (Thread/currentThread))
+                       (not (:sealed? @state)))
+          (throw (ex-info "Native file forwarding is closed or on another thread"
+                          {:type ::closed-forwarding})))
+        (swap! state #(cond-> (update % :active inc) mutation? (assoc :entered? true))))
+      ;; Never retain the monitor across a handler/native call: a handler can
+      ;; wait for a foreign callback, which must be able to refuse immediately.
+      (try (f)
+           (finally (locking state (swap! state update :active dec)))))))
+
+(defn- guarded-boundary [boundary gate mutation?]
+  (if-not gate
+    boundary
+    (fn []
+      (update (or (when boundary (boundary)) {}) :handlers
+              #(conj (vec %) (fn [effect next]
+                               (guarded-native! gate mutation? (fn [] (next effect)))))))))
+
+(defn- observe-positive! [gate result]
+  ;; Called only by the native receipt path, BEFORE returning through handlers.
+  (when gate
+    (locking (:state gate)
+      (swap! (:state gate) assoc :positive result)))
+  result)
+
+(defn- seal-completion! [gate]
+  (locking (:state gate)
+    (swap! (:state gate) assoc :sealed? true)))
+
+(defn- receipt-schema-present? [db]
+  (some? (d/q '[:find ?e . :where [?e :db/ident :publication/id]] db)))
+
 (defn- write-workspace!
   "Shared native batch writer. Every physical operation retains this exact
    descriptor; neither file effects nor commit re-resolve ambient selection."
-  [room workspace files {:keys [message boundary file-modes publication] :as opts}]
+  [room workspace files {:keys [message boundary file-modes publication] :as opts} completion]
   (let [entries (plan files)
+        planned entries
         {:keys [conn] :as ws} (gs/assert-workspace-current! workspace)
         system-id (binding [ec/*execution-context* (:ctx room)]
                     (srooms/connection-system-id conn))
@@ -382,8 +436,18 @@
                              :trunk-write-policy reason)))
         fs (gs/filesystem ws)
         boundary (or boundary (host-boundary room (effects/make-sink)))
+        outer-boundary (guarded-boundary boundary completion false)
+        inner-boundary (guarded-boundary boundary completion true)
         ;; `:workspace`: the gate's compare-and-write needs the repository
-        ctx {:filesystem fs :workspace ws :system-id system-id :cwd "/" :effect-boundary boundary}
+        ctx {:filesystem fs :workspace ws :system-id system-id :cwd "/" :effect-boundary inner-boundary}
+        commit-publication (if (and completion (fn? (:before-dispatch! publication)))
+                             (update publication :before-dispatch!
+                                     (fn [hook]
+                                       (fn [candidate]
+                                         ;; The journal may commit applying and
+                                         ;; then throw before publication starts.
+                                         (guarded-native! completion true #(hook candidate)))))
+                             publication)
         paths (mapv first entries)
         opened (opened-worktree! paths opts)
         _ (when (and (contains? opts :file-modes)
@@ -404,9 +468,13 @@
       (gs/assert-workspace-current! ws)
       (when publication
         (publication/authorize! publication)
-        (publication/install! conn))
-      (if-let [recovered (when publication (publication/recover @conn (:identity publication)))]
-        (publication-result recovered message)
+        (if completion
+          (publication/validate-identity! (:identity publication))
+          (publication/install! conn)))
+      (if-let [recovered (when (and publication
+                                    (or (nil? completion) (receipt-schema-present? @conn)))
+                           (publication/recover @conn (:identity publication)))]
+        (observe-positive! completion (publication-result recovered message))
         (do
           (check-shape! fs entries)
       ;; the undo restores the index to HEAD: so it must be at HEAD
@@ -438,6 +506,14 @@
                                (catch Throwable error
                                  (vreset! execution-error error)
                                  (throw error)))
+                          ;; The new completion API keeps schema installation
+                          ;; after pure preflight and actual outer forwarding.
+                          ;; Legacy callers retain their original ordering.
+                          (when (and completion publication)
+                            (try (guarded-native! completion true #(publication/install! conn))
+                                 (catch Throwable error
+                                   (vreset! execution-error error)
+                                   (throw error))))
                           (try
                             (doseq [[p c] entries
                                 ;; compare-and-write: what the snapshot saw, or fail
@@ -449,10 +525,12 @@
                                   (swap! removed conj p))
                                 (do (tools/workspace-write! ctx p c opts)
                                     (swap! touched conj p))))
-                            (let [{:keys [commit tree publication]} (forks/commit-paths-in-workspace!
-                                                                     room ws expected message
-                                                                     {:receipt? true :expected-modes file-modes
-                                                                      :publication publication})
+                            (let [{:keys [commit tree publication]}
+                                  (guarded-native! completion true
+                                                   #(forks/commit-paths-in-workspace!
+                                                     room ws expected message
+                                                     {:receipt? true :expected-modes file-modes
+                                                      :publication commit-publication}))
                                   entries (into {} (map (fn [p] [p (get tree (rel p))])) paths)]
                           ;; Only the forwarded physical write path can produce
                           ;; this receipt. A handler may answer without forwarding.
@@ -462,8 +540,13 @@
                                ;; enqueue another mutation after restoring an
                                ;; interrupted publication caller's interrupt flag.
                               (when (and (nil? publication) (seq @removed))
-                                (d/transact conn [[:db.fn/call file-tx/remove-empty-dirs-tx
-                                                   (vec (distinct (mapcat file-tx/ancestors-of @removed)))]]))
+                                (guarded-native! completion true
+                                                 #(d/transact conn [[:db.fn/call file-tx/remove-empty-dirs-tx
+                                                                     (vec (distinct (mapcat file-tx/ancestors-of @removed)))]])))
+                              ;; Ordinary cleanup must finish before a positive
+                              ;; completion can escape. Durable publication has
+                              ;; its directory cleanup in the joined transaction.
+                              (observe-positive! completion (applied-result planned @applied message @removed))
                               commit)
                             (catch Throwable e
                               (vreset! execution-error e)
@@ -472,7 +555,8 @@
                            ;; from an absent receipt; retain the host journal.
                               (if (or @applied (publication/uncertain? e))
                                 (throw e)
-                                (let [conflicted (restore! conn before expected @touched created)]
+                                (let [conflicted (guarded-native! completion true
+                                                                  #(restore! conn before expected @touched created))]
                                   (throw (if (seq conflicted)
                                            (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
                                                          (str/join ", " conflicted))
@@ -480,7 +564,7 @@
                                            e)))))))
                 _answer (try
                           (effects/perform!
-                           boundary {:effect :git/commit :resource {:message message :system-id system-id}}
+                           outer-boundary {:effect :git/commit :resource {:message message :system-id system-id}}
                            #(force execute))
                           (catch Throwable error
                             (cond
@@ -494,15 +578,7 @@
                 ;; write into an ordinary skipped operation by swallowing it.
                 _ (when (publication/uncertain? @execution-error) (throw @execution-error))
                 receipt @applied]
-            (cond-> {:commit (when receipt (:commit receipt))
-                     :applied? (boolean receipt)
-                     :message message
-                     :written (vec (for [[p c] entries :when (and receipt (not= ::remove c))
-                                         :let [entry (get-in receipt [:entries p])]]
-                                     {:path p :size (:size entry) :content-id (some-> (:content entry) str)
-                                      :entry entry}))
-                     :removed @removed}
-              (:publication receipt) (assoc :publication (:publication receipt)))))))))
+            (applied-result entries receipt message @removed)))))))
 
 (defn write!
   "Write `files` (`{path content}`; content `{:text …}`, `{:base64 …}`, or nil
@@ -532,7 +608,7 @@
    client-write behavior."
   [room files opts]
   (binding [ec/*execution-context* (:ctx room)]
-    (write-workspace! room (workspace! room) files opts)))
+    (write-workspace! room (workspace! room) files opts nil)))
 
 (defn write-to!
   "HOST API: write/commit a batch to this exact registered Geschichte system
@@ -541,4 +617,55 @@
    No selection mutation, Room facade or serializable descriptor capability."
   [room system files opts]
   (binding [ec/*execution-context* (:ctx room)]
-    (write-workspace! room (gs/workspace-for-system! system) files opts)))
+    (write-workspace! room (gs/workspace-for-system! system) files opts nil)))
+
+(defn- interrupted-failure? [failure]
+  ;; Native failure wrappers retain their causes. Do not infer cancellation
+  ;; from interceptor-controlled ex-data, and tolerate a cyclic cause chain.
+  (loop [cause failure seen #{}]
+    (cond
+      (nil? cause) false
+      (instance? InterruptedException cause) true
+      (contains? seen cause) false
+      :else (recur (.getCause ^Throwable cause) (conj seen cause)))))
+
+(defn write-to-completion!
+  "HOST API: a closed native completion for this exact registered target.
+   Returns {:completion :not-started|:returned|:pending :result … :error …}.
+   Only :not-started proves this invocation entered no canonical native
+   file/index/schema/publication mutation; use it only with the caller's
+   separately authorized exact original claim, never an
+   applying publication. :returned carries a native applied/recovered result,
+   not an interceptor's answer. :pending does NOT certify compensation.
+
+   Forwarding is synchronous on this calling worker thread only. A private
+   bottom gate permanently closes before return; saved outer/inner next
+   callbacks cannot start later writes. This is not a portable bearer token or
+   a sandbox for arbitrary trusted-host handler I/O. Legacy write!/write-to!
+   retain their original contracts. Interruption remains set on this worker
+   after closure. No new permission or executor is supplied."
+  [room system files opts]
+  (let [gate (completion-gate)
+        result (volatile! nil)
+        error (volatile! nil)
+        closed (volatile! nil)]
+    (try
+      (when (simple/on-drain-thread?)
+        (throw (ex-info "Native file completion requires a host worker"
+                        {:type ::blocking-completion})))
+      (binding [ec/*execution-context* (:ctx room)]
+        (vreset! result (write-workspace! room (gs/workspace-for-system! system) files opts gate)))
+      (catch Throwable failure (vreset! error failure))
+      (finally (vreset! closed (seal-completion! gate))))
+    ;; Normalize only AFTER permanent closure. Neither a forged response nor
+    ;; Throwable metadata can supply the private positive/native-entry evidence.
+    (when (interrupted-failure? @error)
+      (.interrupt (Thread/currentThread)))
+    (let [{:keys [active entered? positive]} @closed]
+      {:completion (cond
+                     (pos? active) :pending
+                     positive :returned
+                     (not entered?) :not-started
+                     :else :pending)
+       :result (or positive @result)
+       :error @error})))

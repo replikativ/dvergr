@@ -75,11 +75,10 @@
                       {:type ::intent-conflict :operation (:publication/id receipt)})))
     existing))
 
-(defn recover
-  "Look up a receipt only after checking its complete host identity and current
-   physical target. Callers must authorize this read first. Absence is not proof
-   that an outstanding publication failed and never authorizes a replay."
-  [db identity]
+(defn validate-identity!
+  "Pure host validation of a complete recovery identity; returns it unchanged.
+   This neither authorizes a read/write nor installs receipt schema."
+  [identity]
   (when-not (and (map? identity)
                  (every? #(uuid? (get identity %))
                          [:publication/id :publication/intent :publication/actor
@@ -90,6 +89,14 @@
                  (keyword? (:publication/branch identity))
                  (string? (:publication/ref identity)))
     (throw (ex-info "Invalid publication recovery identity" {:type ::invalid})))
+  identity)
+
+(defn recover
+  "Look up a receipt only after checking its complete host identity and current
+   physical target. Callers must authorize this read first. Absence is not proof
+   that an outstanding publication failed and never authorizes a replay."
+  [db identity]
+  (validate-identity! identity)
   (checked-existing db identity))
 
 (defn authorize!
