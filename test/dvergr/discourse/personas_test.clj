@@ -50,13 +50,24 @@
                         :content (str reply-text "\n--SYSTEM--\n" system-content)})
       :complete)))
 
+(defmacro ^:private with-owned-rooms
+  "Fresh incarnations, closed in reverse order even when a turn/assertion fails.
+   Keep injected participant handlers installed through their physical drain."
+  [bindings & body]
+  (if-let [room (first bindings)]
+    `(let [~room (d/room (keyword (str "persona-test-" (random-uuid))))]
+       (try
+         (with-owned-rooms ~(vec (rest bindings)) ~@body)
+         (finally (d/close-room! ~room))))
+    `(do ~@body)))
+
 ;; ============================================================================
 ;; researcher / coder / reviewer
 ;; ============================================================================
 
 (deftest researcher-loads-prompt-and-replies
   (testing "researcher persona injects researcher.md as system prompt"
-    (let [r (d/room :t)]
+    (with-owned-rooms [r]
       (binding [ec/*execution-context* (:ctx r)]
         (d/join r (personas/researcher
                    {:run-turn-fn (mock-turn-fn "researched")})))
@@ -71,8 +82,7 @@
 
 (deftest coder-and-reviewer-have-distinct-ids
   (testing "personas get sensible default ids when not overridden"
-    (let [r1 (d/room :t1)
-          r2 (d/room :t2)]
+    (with-owned-rooms [r1 r2]
       (binding [ec/*execution-context* (:ctx r1)]
         (d/join r1 (personas/coder    {:run-turn-fn (mock-turn-fn "code")})))
       (binding [ec/*execution-context* (:ctx r2)]
@@ -86,7 +96,7 @@
 
 (deftest id-and-spec-overrides-honoured
   (testing "Caller can rename, swap model/provider, and pin tools"
-    (let [r (d/room :t)]
+    (with-owned-rooms [r]
       (binding [ec/*execution-context* (:ctx r)]
         (d/join r (personas/coder
                    {:id :impl
@@ -103,7 +113,7 @@
 
 (deftest from-prompt-loads-arbitrary-file
   (testing "from-prompt loads any agents/*.md and builds an llm-agent"
-    (let [r (d/room :t)]
+    (with-owned-rooms [r]
       (binding [ec/*execution-context* (:ctx r)]
         (d/join r (personas/from-prompt
                    "researcher.md"  ; reusing an existing file
