@@ -12,6 +12,7 @@
             [dvergr.agent.attempt :as attempt]
             [dvergr.agent.attempt.governance :as attempt-governance]
             [dvergr.agent.spend :as spend]
+            [dvergr.agent.conversation-capture :as conversation]
             [dvergr.artifact :as artifact]
             [dvergr.chat.schema :as schema]
             [dvergr.chat.persist :as persist]
@@ -20,6 +21,7 @@
             [kontor.gate :as kontor-gate]
             [kontor.resource :as resource]
             [hasch.core :as hasch]
+            [org.replikativ.spindel.engine.hash :as content-hash]
             [taoensso.telemere :as tel]))
 
 (defn- validate-scorecard [value]
@@ -416,7 +418,7 @@
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
-    :run/reason :run/error :run/savepoint :run/resumed-by :run/search :run/role])
+    :run/reason :run/error :run/savepoint :run/conversation-ref :run/resumed-by :run/search :run/role])
 
 (def ^:private attempt-pull-pattern
   '[:attempt/id :attempt/content-id :attempt/payload-ref :attempt/payload-blob
@@ -493,6 +495,7 @@
     (assoc :run/settlement-reason (:run/settlement-reason run))
     (:run/ended-at run) (assoc :run/ended-at (:run/ended-at run))
     (:run/savepoint run) (assoc :run/savepoint (:run/savepoint run))
+    (:run/conversation-ref run) (assoc :run/conversation-ref (:run/conversation-ref run))
     (:run/resumed-by run) (assoc :run/resumed-by (:run/resumed-by run))
     (:run/search run) (assoc :run/search (:run/search run))
     (:run/role run) (assoc :run/role (:run/role run))
@@ -762,6 +765,35 @@
 ;; =============================================================================
 ;; Store impl
 ;; =============================================================================
+
+(defn- checkpoint-entity [db chat-id run-id]
+  (when-let [entity (dh/pull db (into [:db/id] run-pull-pattern) [:run/id run-id])]
+    (when (= (:db/id (dh/entity db [:chat/id chat-id]))
+             (:db/id (:run/chat (dh/entity db [:run/id run-id]))))
+      entity)))
+
+(defn- record-run-savepoint-tx [db chat-id store-room-id run-id origin expected data ref]
+  (let [current (checkpoint-entity db chat-id run-id)
+        old-data (some-> (:run/savepoint current) edn/read-string)
+        step (get-in data [:savepoint/payload :step])
+        old-step (get-in old-data [:savepoint/payload :step])]
+    (when-not (and current (= :running (:run/status current))
+                   (= (:run/world current) (:world origin))
+                   (= (:run/chat-id current) (:chat origin))
+                   (= (store/room-id->slug store-room-id)
+                      (:room/slug (dh/entity db [:chat/id chat-id])))
+                   (= expected (:run/savepoint current))
+                   (= run-id (get-in data [:savepoint/payload :run]))
+                   (= (:run/room current) (get-in data [:savepoint/payload :control-room]))
+                   (integer? step) (not (neg? step))
+                   (or (nil? old-step) (> step old-step))
+                   (= (:savepoint/id data)
+                      (content-hash/content-hash (dissoc data :savepoint/id :savepoint/address)))
+                   (= ref (get-in data [:savepoint/payload :conversation :ref])))
+      (throw (ex-info "Run checkpoint ownership or latest revision changed"
+                      {:type ::stale-savepoint :run/id run-id})))
+    [{:db/id (:db/id current) :run/savepoint (pr-str data)
+      :run/conversation-ref ref :run/updated-at (java.util.Date.)}]))
 
 (defrecord DatahikeStore [conn artifacts]
   store/PRoomStore
@@ -1116,6 +1148,11 @@
         (locking (run-write-lock (:run/id (store/validate-run! run)))
           (let [run (store/validate-run! run)
                 existing (store/-load-run this room-id (:run/id run))
+                ;; Lifecycle writes never own checkpoint publication. Preserve
+                ;; the observed projection and OMIT these attrs from its TX so
+                ;; a newer checkpoint cannot be overwritten by a stale caller.
+                run (merge (dissoc run :run/savepoint :run/conversation-ref)
+                           (select-keys existing [:run/savepoint :run/conversation-ref]))
                 run (->> run
                          (store/validate-run-update! existing)
                          (store/validate-run-causes!
@@ -1123,7 +1160,8 @@
                           #(store/-load-run this room-id %)))]
             (when (persist/persist-tx!
                    conn
-                   (cond-> [(run->entity (:chat/id ent) run)
+                   (cond-> [(dissoc (run->entity (:chat/id ent) run)
+                                    :run/savepoint :run/conversation-ref)
                             {:db/id [:chat/id (:chat/id ent)]
                              :chat/updated-at (java.util.Date.)}]
                      ;; a stored Run is the map stored: a withdrawn resume
@@ -1203,6 +1241,68 @@
              (take (or limit 100))
              vec)
         [])))
+
+  store/PRunSavepointStore
+  (-record-run-savepoint! [_ room-id run-id origin expected data prepared]
+    (let [validated (conversation/prepare (get-in prepared [:value :messages])
+                                          (get-in prepared [:value :tool-schemas]))
+          manifest (conversation/manifest validated)
+          slug (store/room-id->slug room-id)
+          ent (room-by-slug conn slug)]
+      (when-not (and ent (= manifest (get-in data [:savepoint/payload :conversation])))
+        (throw (ex-info "Conversation and savepoint binding disagree" {:type ::invalid-savepoint})))
+      (locking (run-write-lock run-id)
+        (artifact/publish-value!
+         artifacts (:value validated)
+         (fn [ref]
+           (when-not (= (:ref manifest) ref)
+             (throw (ex-info "Published conversation identity disagrees" {:type ::invalid-savepoint})))
+           (let [report (try
+                          (dh/transact conn [[:db.fn/call record-run-savepoint-tx
+                                              (:chat/id ent) room-id run-id origin expected data ref]])
+                          (catch Throwable error
+                            (loop [cause error seen #{}]
+                              (when (and cause (not (contains? seen cause)))
+                                (when (instance? InterruptedException cause)
+                                  (.interrupt (Thread/currentThread)))
+                                (recur (ex-cause cause) (conj seen cause))))
+                            (throw (ex-info "Run checkpoint submission was not acknowledged"
+                                            {:type ::savepoint-unacknowledged :run/id run-id}
+                                            error))))
+                 before (:db-before report)
+                 after (:db-after report)
+                 prior (when before (checkpoint-entity before (:chat/id ent) run-id))
+                 stored (when after (checkpoint-entity after (:chat/id ent) run-id))]
+             ;; Only ORIGINAL immutable report facts acknowledge publication.
+             ;; Missing/lost reports never use @conn to fabricate this ACK.
+             (when-not (and before after prior stored
+                            (= expected (:run/savepoint prior))
+                            (= :running (:run/status prior))
+                            (= (:world origin) (:run/world prior))
+                            (= (:chat origin) (:run/chat-id prior))
+                            (= (pr-str data) (:run/savepoint stored))
+                            (= ref (:run/conversation-ref stored)))
+               (throw (ex-info "Run checkpoint publication was not acknowledged"
+                               {:type ::savepoint-unacknowledged :run/id run-id})))
+             (select-keys stored [:run/savepoint :run/conversation-ref])))))))
+
+  (-load-run-conversation [_ room-id run-id expected]
+    (let [db @conn
+          chat-id (dh/q '[:find ?id . :in $ ?slug
+                          :where [?c :room/slug ?slug] [?c :chat/id ?id]]
+                        db (store/room-id->slug room-id))
+          stored (when chat-id (checkpoint-entity db chat-id run-id))
+          data (some-> (:run/savepoint stored) edn/read-string)
+          manifest (get-in data [:savepoint/payload :conversation])]
+      (when-not (and stored (= expected (:run/savepoint stored))
+                     (= (:savepoint/id data)
+                        (content-hash/content-hash (dissoc data :savepoint/id :savepoint/address)))
+                     (= run-id (get-in data [:savepoint/payload :run]))
+                     (= (:run/room stored) (get-in data [:savepoint/payload :control-room]))
+                     (= (:run/conversation-ref stored) (:ref manifest)))
+        (throw (ex-info "No matching retained conversation checkpoint"
+                        {:type ::invalid-savepoint :run/id run-id})))
+      {:data data :messages (conversation/restore artifacts manifest)}))
 
   store/PMessageBatchStore
   (-store-messages! [_ room-id msgs]

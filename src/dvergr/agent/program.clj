@@ -18,6 +18,7 @@
             [dvergr.agent.prompt :as prompt]
             [dvergr.agent.room-context :as room-context]
             [dvergr.agent.run :as run]
+            [dvergr.agent.conversation-capture :as conversation-capture]
             [dvergr.agent.turn :as turn]
             [dvergr.agent.world :as world]
             [dvergr.chat.agent :as chat-agent]
@@ -1070,25 +1071,42 @@
       (deferred result))))
 
 (defn- turn-savepoint-handler
-  "Persist every turn savepoint on the Run its payload names, then continue at
-   once. A savepoint that cannot be persisted costs the Run its resumability,
-   never its progress."
-  [sp]
-  (let [payload (:savepoint/payload sp)
-        continue! #(savepoint/resume sp payload)]
-    ((portable/persist sp)
-     (fn [data]
-       (try (run/record-savepoint! (:run payload) data)
-            (catch Throwable t
-              (tel/log! {:level :warn :id ::savepoint-not-recorded
-                         :data {:run/id (:run payload) :error (ex-message t)}}
-                        "A turn savepoint could not be recorded")))
-       (continue!))
-     (fn [error]
-       (tel/log! {:level :warn :id ::savepoint-not-persisted
-                  :data {:run/id (:run payload) :error (ex-message error)}}
-                 "A turn savepoint could not be persisted")
-       (continue!)))))
+  "Pure metadata handshake; native publication never runs on the world's drain."
+  [origin caller published point]
+  (if-not (= (:fork-id (:ctx origin)) (:fork-id (:savepoint/world point)))
+    (savepoint/resume point (:savepoint/payload point))
+    (binding [ec/*execution-context* caller]
+      (published {:point point}))))
+
+(defn- persist-turn-on-worker! [point]
+  ;; snapshot-id may perform native IO (for example Git rev-parse). Both the
+  ;; call and its original callback belong to this already-supervised worker.
+  ;; A late callback only settles local data; it can never publish a checkpoint.
+  (let [done (CountDownLatch. 1)
+        outcome (volatile! nil)
+        interrupted? (volatile! false)
+        finish! (fn [result] (vreset! outcome result) (.countDown done))]
+    (when (.isInterrupted (Thread/currentThread))
+      (throw (InterruptedException. "Turn capture was interrupted before persistence")))
+    ((portable/persist point)
+     #(finish! {:data %}) #(finish! {:error %}))
+    (loop []
+      (when-not (try (.await done) true
+                     (catch InterruptedException _ (vreset! interrupted? true) false))
+        (recur)))
+    (when (or @interrupted? (.isInterrupted (Thread/currentThread)))
+      (.interrupt (Thread/currentThread))
+      (throw (InterruptedException. "Turn capture was interrupted during persistence")))
+    (if-let [error (:error @outcome)]
+      (do
+        (when (loop [cause error seen #{}]
+                (cond (nil? cause) false
+                      (contains? seen cause) false
+                      (instance? InterruptedException cause) true
+                      :else (recur (.getCause ^Throwable cause) (conj seen cause))))
+          (.interrupt (Thread/currentThread)))
+        (throw error))
+      (:data @outcome))))
 
 (defn- install-turn-savepoints!
   "Own an independent session for this Run. Its ordinary savepoint forks share
@@ -1097,7 +1115,7 @@
    the installed handler."
   [control-room work-room]
   (let [world (:ctx work-room)
-        table {:conversation/turn turn-savepoint-handler}]
+        table {:conversation/turn #(savepoint/resume % (:savepoint/payload %))}]
     ;; world/open! masks inherited session state at fork creation. Opening must
     ;; fail rather than silently reuse another computation's cleanup owner.
     (savepoint/open! world (cond-> {:handlers table :purpose :run
@@ -1138,15 +1156,40 @@
    the work world (where its systems are, so the portable form records their
    snapshots). A Spin in the calling (control) context that completes once
    the handler continued it; with no handler it completes at once."
-  [work-room run-id step payload]
+  [work-room run-id step payload supervisor prepared]
   (let [done (sync/deferred)
-        caller ec/*execution-context*]
-    (binding [ec/*execution-context* (:ctx work-room)]
-      (sync/spawn! (sp/spin (savepoint :conversation/turn payload
-                                       {:resume `continue-llm-run :args [run-id step]}))
-                   {:on-success (fn [_] (binding [ec/*execution-context* caller] (done :ok)))
-                    :on-error (fn [e] (binding [ec/*execution-context* caller] (done {::savepoint-error e})))}))
-    (sp/spin (sp/await done))))
+        published (sync/deferred)
+        caller ec/*execution-context*
+        world (:ctx work-room)
+        previous (get (savepoint/handlers world) :conversation/turn)]
+    (sp/spin
+     (try
+       (savepoint/install-handlers!
+        world {:conversation/turn #(turn-savepoint-handler work-room caller published %)})
+       (binding [ec/*execution-context* world]
+         (sync/spawn! (sp/spin (savepoint :conversation/turn payload
+                                          {:resume `continue-llm-run :args [run-id step]}))
+                      {:on-success (fn [_] (binding [ec/*execution-context* caller] (done :ok)))
+                       :on-error (fn [e] (binding [ec/*execution-context* caller]
+                                           (published {:error e})
+                                           (done {::savepoint-error e})))}))
+       (let [{:keys [point error]} (sp/await published)
+             result (when point
+                      (sp/await
+                       (worker-result-spin
+                        (start-worker! supervisor
+                                       #(binding [ec/*execution-context* world]
+                                          (let [data (persist-turn-on-worker! point)]
+                                            (run/record-savepoint! run-id work-room data prepared)))))))
+             failure (or error (when (worker-error? result) (::worker-error result)))]
+         (when failure
+           (tel/log! {:level :warn :id ::savepoint-not-recorded
+                      :data {:run/id run-id :error (ex-message failure)}}
+                     "Turn capture failed; preserving the prior durable checkpoint"))
+         (when point (savepoint/resume point (:savepoint/payload point)))
+         (sp/await done))
+       (finally
+         (savepoint/install-handlers! world {:conversation/turn previous}))))))
 
 (defn- model-step-usage [budget uncertain?]
   (cond-> (select-keys budget [:used :by-type :unreported-types])
@@ -1227,8 +1270,7 @@
                     instructions (llm-instructions agent tool-map)
                     ;; resuming: the conversation so far is the stopped Run's,
                     ;; system prompt included
-                    resumed (when-let [{from-chat :chat} (::resume agent)]
-                              (chat-context/load-messages (some-> control-room :store :conn) from-chat))
+                    resumed (when (::resume agent) (get-in agent [::resume :messages]))
                     sent (if (::resume agent)
                            (some (fn [m] (when (= :system (or (:message/role m) (:role m)))
                                            (or (:message/content m) (:content m))))
@@ -1421,11 +1463,27 @@
                :else
                (do
                  ;; the gap after this step: a point to resume the Run from
-                 (sp/await (turn-savepoint!
-                            work-room run-id model-step
-                            {:run run-id :step model-step :task task
-                             :agent (dissoc agent ::protocol ::resume)
-                             :control-room (:id control-room)}))
+                 (let [prepared
+                       (sp/await
+                        (worker-result-spin
+                         (start-worker! supervisor
+                                        #(binding [ec/*execution-context* (:ctx work-room)]
+                                           (conversation-capture/prepare
+                                            (chat-context/get-messages chat-ctx) tool-map)))))]
+                   (cond
+                     (= ::worker-cancelled prepared) (cancelled! run-id)
+                     (worker-error? prepared)
+                     (tel/log! {:level :warn :id ::conversation-not-captured
+                                :data {:run/id run-id :error (ex-message (::worker-error prepared))}}
+                               "Conversation capture failed; preserving the prior checkpoint")
+                     :else
+                     (sp/await (turn-savepoint!
+                                work-room run-id model-step
+                                {:run run-id :step model-step :task task
+                                 :agent (dissoc agent ::protocol ::resume)
+                                 :conversation (conversation-capture/manifest prepared)
+                                 :control-room (:id control-room)}
+                                supervisor prepared))))
                  (recur (inc model-step)))))))))))
 
 (declare execute-agent-program)
@@ -2392,6 +2450,9 @@
           _ (when (get-in agent [:agent/program :single-use?])
               (throw (ex-info "Single-use CLI Runs require a new explicitly admitted task"
                               {:type ::resume-denied :run/id run-id})))
+          ;; All bytes/codec/identity/semantic checks precede successor claims,
+          ;; world creation and conserved resource transfer. Never load live tail.
+          messages (run/load-conversation! control-room old)
           new-id (random-uuid)
           ;; excludes a concurrent resume; nothing durable changes until the
           ;; new Run is admitted and holds the old Run's wallet
@@ -2428,7 +2489,7 @@
                                  (fn [_] (deliver done :ok)) (fn [e] (deliver done e)))
                                 (let [r (deref done 10000 (ex-info "hydrate-into! timed out" {}))]
                                   (when (instance? Throwable r) (throw r)))))
-                  :resume {:from run-id :chat (:run/chat-id old) :step step
+                  :resume {:from run-id :chat (:run/chat-id old) :step step :messages messages
                            ;; what the stopped Run's chat spent (microdollars):
                            ;; its budget is not spent again
                            :spent (chat-spent control-room (:run/chat-id old))}})

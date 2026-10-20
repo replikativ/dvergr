@@ -514,18 +514,29 @@
    Run's latest point to resume from (doc/runs.md, Resuming a Run). Durable and in the
    live entry, so the Run's later updates carry it. nil when the Run is not
    live in this process."
-  [run-id data]
+  [run-id origin data prepared]
   (with-run-lock run-id
     (when-let [entry (get @active run-id)]
-      (let [run (assoc (:run entry)
-                       :run/savepoint (pr-str data)
-                       :run/updated-at (java.util.Date.))]
-        (when-let [room-store (:store entry)]
-          (when-not (store/-store-run! room-store (:store-room-id entry) run)
-            (throw (ex-info "Run savepoint was not durable"
-                            {:type ::savepoint-not-durable :run/id run-id}))))
-        (locking lifecycle-lock (swap! active assoc-in [run-id :run] run))
-        run))))
+      (let [room-store (:store entry)
+            current (:run entry)]
+        (when-not (and (= (:run/world current) (:id origin))
+                       (= (:fork-id (:ctx origin)) (:fork-id ec/*execution-context*))
+                       (satisfies? store/PRunSavepointStore room-store))
+          (throw (ex-info "Run has no owned conversation checkpoint publisher"
+                          {:type ::savepoint-not-durable :run/id run-id})))
+        (let [durable (store/-load-run room-store (:store-room-id entry) run-id)
+              facts (store/-record-run-savepoint!
+                     room-store (:store-room-id entry) run-id
+                     {:world (:id origin) :chat (:run/chat-id current)}
+                     (:run/savepoint durable) data prepared)]
+          (when-not (and (= (pr-str data) (:run/savepoint facts))
+                         (= (get-in data [:savepoint/payload :conversation :ref])
+                            (:run/conversation-ref facts)))
+            (throw (ex-info "Run checkpoint did not acknowledge exact publication"
+                            {:type ::savepoint-not-durable :run/id run-id})))
+          (locking lifecycle-lock
+            (swap! active update-in [run-id :run] merge facts))
+          (get-in @active [run-id :run]))))))
 
 (def ^:private search-intent
   "What a search decided for a member, written once and never changed by a
@@ -619,6 +630,16 @@
   "The latest portable savepoint of durable `run`, as data, or nil."
   [run]
   (some-> (:run/savepoint run) clojure.edn/read-string))
+
+(defn load-conversation!
+  "Load one validated frozen checkpoint before successor admission. No live fallback."
+  [room run]
+  (let [room-store (:store room)]
+    (when-not (satisfies? store/PRunSavepointStore room-store)
+      (throw (ex-info "Room cannot restore frozen Run conversations"
+                      {:type ::unsupported-savepoint-store})))
+    (:messages (store/-load-run-conversation room-store (store/conversation-id room) (:run/id run)
+                                             (:run/savepoint run)))))
 
 (defonce ^:private resume-reservations
   ;; Run ids a `resume!` in this process is resuming right now: excludes a
