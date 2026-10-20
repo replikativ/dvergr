@@ -32,9 +32,12 @@
   ;; Worktree's convenience query inner-joins metadata: incomplete path rows
   ;; disappear from it. Inspect EVERY indexed path in this bounded subtree so
   ;; corrupt source cannot silently become a smaller, apparently valid bundle.
-  (let [rows (vec (take (inc max-files)
-                        (d/index-range db {:attrid :geschichte.work/path
-                                           :start "workflows/" :end "workflows0"})))
+  (let [rows (into [] (remove #(= "workflows0" (:v %)))
+                   ;; Datahike's end value is inclusive. Exclude ONLY that
+                   ;; known outside-prefix endpoint AFTER bounded acquisition.
+                   (take (inc max-files)
+                         (d/index-range db {:attrid :geschichte.work/path
+                                            :start "workflows/" :end "workflows0"})))
         _ (when (> (count rows) max-files) (refuse!))
         entries (reduce (fn [entries row]
                           (let [path (:v row)

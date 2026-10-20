@@ -86,11 +86,17 @@
       (let [db @conn {:keys [content size mode]} (get (query/worktree db) "identity.txt")
             make-db (fn [n]
                       (:db-after (d/with db
-                                         (mapv (fn [i] {:geschichte.work/path (str "workflows/cap/" i ".txt")
-                                                        :geschichte.work/content [:geschichte.content/id content]
-                                                        :geschichte.work/size size :geschichte.work/mode mode})
-                                               (range n)))))]
-        (is (= 500 (count (projection/snapshot-in (make-db 500)))))
+                                         (conj (mapv (fn [i] {:geschichte.work/path (str "workflows/cap/" i ".txt")
+                                                              :geschichte.work/content [:geschichte.content/id content]
+                                                              :geschichte.work/size size :geschichte.work/mode mode})
+                                                     (range n))
+                                               {:geschichte.work/path "workflows0"}))))]
+        (let [full (make-db 500)]
+          ;; An unrelated incomplete row at the inclusive endpoint must not
+          ;; consume the workflow limit or become an invalid source entry.
+          (is (= "workflows0" (:v (last (d/index-range full {:attrid :geschichte.work/path
+                                                             :start "workflows/" :end "workflows0"})))))
+          (is (= 500 (count (projection/snapshot-in full)))))
         (with-redefs [content/read-by-id (fn [& _] (throw (AssertionError. "Overflow reached body")))]
           (is (thrown? clojure.lang.ExceptionInfo (projection/snapshot-in (make-db 501)))))
         (let [valid (make-db 2)
