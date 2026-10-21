@@ -1089,6 +1089,101 @@
   [room-id db-name]
   (:conn (room-database-by-name room-id db-name)))
 
+(declare registry-system-for)
+
+(defn- granted-kb-basis! [snapshot room-id system-id]
+  (let [room (d/pull snapshot [:room/id :room/archived-at :room/provisioning-state :room/provisioning-version]
+                     [:room/id room-id])
+        system (d/pull snapshot [:system/id :system/type :system/name :system/scope]
+                       [:system/id system-id])
+        permissions (d/q '[:find [?permission ...] :in $ ?room ?system
+                           :where [?r :room/id ?room] [?s :system/id ?system]
+                           [?g :grant/room ?r] [?g :grant/system ?s]
+                           [?g :grant/permission ?permission]] snapshot room-id system-id)]
+    (when-not (and (= room-id (:room/id room)) (nil? (:room/archived-at room))
+                   (or (and (nil? (:room/provisioning-state room)) (nil? (:room/provisioning-version room)))
+                       (and (= :ready (:room/provisioning-state room)) (= 1 (:room/provisioning-version room))))
+                   (= system-id (:system/id system)) (= :kb (:system/type system))
+                   (string? (:system/name system)) (string? (:system/scope system))
+                   (.isAbsolute (io/file (:system/scope system)))
+                   (some #(or (= :read %) (grant-permits? % :write) (grant-permits? % :read)) permissions))
+      (throw (ex-info "A current readable grant to an existing KB is required"
+                      {:type ::invalid-kb-attachment :room/id room-id :system/id system-id})))
+    (dissoc system :db/id)))
+
+(defn ensure-granted-kb!
+  "HOST ONLY: activate ONE existing granted KB in its canonical Room context.
+   No supplied path/connection/permission, store creation, schema installation
+   or fulltext worker. Preserves all existing adapters and Room/context identity.
+   Serialize caller lifecycle: must not overlap root teardown/hydration, like
+   prepared Room registration. Never call from an engine or speculative world.
+
+   Metadata grant is not enough to attach a live native adapter. Conversely,
+   adapter presence does not grant permission: sandbox use still checks current
+   grants. An uncertain native acquisition/registration retains its exact owner
+   in the existing preparation gate; no automatic compensation or retry."
+  [room-id system-id]
+  (when (or (simple/on-drain-thread?) (not (ec/execution-context-bound?))
+            (not (identical? (ec/current-execution-context) (rctx/current-root))))
+    (throw (ex-info "Live KB attachment requires a bound host root"
+                    {:type ::requires-host-root})))
+  (when-not (and (uuid? room-id) (uuid? system-id))
+    (throw (ex-info "Room and KB registry UUIDs required" {:type ::invalid-kb-attachment})))
+  (locking profiled-creation-lock
+    (let [ctx (room-ctx-for room-id)
+          _ (when-not (and ctx (not (identical? ctx (rctx/current-root)))
+                           (identical? (rctx/current-root) (rctx/root-ctx ctx)))
+              (throw (ex-info "Canonical live Room context required" {:type ::not-prepared :room/id room-id})))
+          control (sdb/get-conn)
+          initial @control
+          expected (granted-kb-basis! initial room-id system-id)
+          cfg (assoc (kb-cfg (:system/scope expected)) :branch :db)
+          id (kb-system-name (:system/scope expected))
+          _ (when-not (= system-id (:system/id (registry-system-for initial id)))
+              (throw (ex-info "KB runtime identity has no unique registry owner" {:type ::conflicting-kb-adapter})))
+          current! (fn []
+                     (let [snapshot @control]
+                       (when-not (and (identical? control (sdb/get-conn))
+                                      (identical? ctx (room-ctx-for room-id))
+                                      (= expected (granted-kb-basis! snapshot room-id system-id))
+                                      (= system-id (:system/id (registry-system-for snapshot id))))
+                         (throw (ex-info "KB attachment basis changed" {:type ::attachment-changed})))))
+          verify! (fn [system]
+                    (when-not (and (= id (ygg-protocols/system-id system))
+                                   (= :datahike (ygg-protocols/system-type system))
+                                   (:conn system)
+                                   (= (:store cfg) (get-in @(:conn system) [:config :store]))
+                                   (= (:branch cfg) (get-in @(:conn system) [:config :branch])))
+                      (throw (ex-info "KB runtime adapter has a conflicting physical identity"
+                                      {:type ::conflicting-kb-adapter :system/id system-id})))
+                    system)]
+      (binding [ec/*execution-context* ctx]
+        (when (some (fn [[key adapter]]
+                      (and (not= key id) (:conn adapter)
+                           (= (get-in cfg [:store :id]) (get-in @(:conn adapter) [:config :store :id]))))
+                    (ygg/registered-systems))
+          (throw (ex-info "KB physical store is already registered under another runtime key"
+                          {:type ::conflicting-kb-adapter :system/id system-id})))
+        (if-let [existing (ygg/system id)]
+          (do (verify! existing) (current!)
+              {:room/id room-id :system/id system-id :status :already-attached})
+          (do
+            (when-not (d/database-exists? cfg)
+              (throw (ex-info "Granted KB store is missing; live attachment cannot initialize it"
+                              {:type ::missing-kb :system/id system-id})))
+            (try
+              (preparation/with-addition!
+                ctx {:id id :acquire! #(sdh/connect cfg)
+                     :prepare! #(verify! (dh-adapter/create % {:system-name id}))}
+                current!)
+              {:room/id room-id :system/id system-id :status :attached}
+              (catch Throwable error
+                (when (preparation/recovery-required? error)
+                  (let [[before _] (swap-vals! room-hydration-errors assoc room-id error)
+                        previous (get before room-id)]
+                    (when (and previous (not (identical? previous error))) (.addSuppressed error previous))))
+                (throw error)))))))))
+
 (defn- system-name
   "The Yggdrasil system id a registry system of `type` at `scope` registers
    under in a room's composite, or nil for a type that registers none."

@@ -359,3 +359,38 @@ ordinary retries, release and reset cannot discard it. New Run admission closure
 is attempted. If that fence itself fails, its error is retained as suppressed
 evidence and admission remains explicitly uncertain. This is not a drain or an
 automatic constructor retry: explicit host reconciliation is required.
+
+### Adding a granted KB to an existing Room
+
+Hydration is a boot operation, not a live attachment refresh: repeating it
+preserves the canonical context and its native adapters. A new metadata grant
+alone therefore does not activate a native KB adapter in an already-running
+Room. The HOST calls `dvergr.system.rooms/ensure-granted-kb!` with the Room and
+registry-system UUIDs after authorizing and recording that grant.
+
+The operation accepts only an existing KB on its canonical `:db` branch, with
+current readable permission, unambiguous registry/runtime identity and the
+original root-owned Room context. Marked pending, archived, foreign-root and
+engine callers refuse. Exact existing adapters are reused without another
+connection lease. Adapter type, store identity and branch must match; another
+runtime key already holding the physical store refuses. No store creation,
+schema installation, fulltext job or replacement of existing adapters occurs.
+
+`dvergr.system.room-preparation/with-addition!` is the internal native ownership
+seam. It records acquisition and registration phases, preserves all preexisting
+adapters, and releases only its new lease on positively safe failure before
+registration. An uncertain acquire, release or started registration retains an
+opaque owner behind the existing preparation gate; it is not automatically
+retried, unregistered or force-released. Reconciliation of an unknown native
+outcome remains an explicit HOST responsibility.
+
+The caller must serialize this HOST operation with hydration and root teardown,
+as with prepared Room registration. The creation/attachment monitor alone does
+**not** enforce that lifecycle contract. Before exposing this through a live
+UI/MCP handler, an embedder must prove that its dispatcher stops admission and
+physically joins these calls before native teardown, or provide a shared native
+lifecycle coordinator. This foundation does not add a transport endpoint.
+
+Adapter presence is not permission. SCI database handles continue resolving
+current grants at use time, including downgrade and revocation. Existing
+speculative worlds are not retroactively mounted or replaced by attachment.
