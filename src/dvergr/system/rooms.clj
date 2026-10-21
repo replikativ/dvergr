@@ -288,15 +288,33 @@
   (binding [ec/*execution-context* (rctx/current-root)]
     (:child-ctx (ygg/fork! {:systems :none :purpose :room}))))
 
+(defn- needs-hydration? [room-id]
+  (if-let [existing (get @room-ctxs room-id)]
+    (do
+      ;; A transport-only restart keeps the room runtime alive. Replacing its
+      ;; context would strand the existing registry Room/bus on the old fork.
+      ;; A different daemon root, however, must explicitly stop/release its
+      ;; predecessor; silently reusing or replacing those handles is unsafe.
+      (when-not (identical? (rctx/current-root) (rctx/root-ctx existing))
+        (throw (ex-info "Release the previous daemon's room stores before hydration"
+                        {:type ::stale-room-context :room/id room-id})))
+      (boolean (get @room-hydration-errors room-id)))
+    true))
+
 (defn hydrate-rooms!
   "Recreate each room's OWN execution context (RF5 S2) on daemon boot and
    register that room's systems INTO it — so per-room msgs/KB/repo survive a
    restart with the same per-room-composite isolation `provision-room!` set up.
    The `room-ctxs` map + composites are in-memory, so this runs at boot after the
    system DB is up. Requires a bound ctx (its `current-root` is the fork parent).
-   Best-effort per room."
+   Repeating hydration on the SAME daemon root preserves existing room
+   contexts/handles (e.g. an embedder's web-only restart). Failed/missing rooms
+   may retry. A new daemon root requires release-room-stores! first; hydration
+   refuses to silently replace its predecessor's live contexts. Best-effort
+   per newly hydrated room."
   []
-  (doseq [{:room/keys [id]} (sdb/all-rooms)]
+  (doseq [{:room/keys [id]} (sdb/all-rooms)
+          :when (needs-hydration? id)]
     (let [room-ctx (fork-room-ctx)]
       (try
         (binding [ec/*execution-context* room-ctx]

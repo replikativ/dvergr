@@ -1,11 +1,11 @@
 (ns dvergr.orchestration.daemon-test
   "Integration tests for the daemon with mock agents.
 
-   Most tests share one daemon (`*shared-daemon*`) — each `daemon/start!`
+   These tests share one daemon (`*shared-daemon*`) — each `daemon/start!`
    does heavy I/O (system-db and room stores, Geschichte workspaces, room
    subsystems) that takes ~3-5s and dominates the suite.
-   Tests that specifically exercise start/stop lifecycle keep their own
-   per-test daemon."
+   Standalone start/stop tests live in daemon-lifecycle-test so they never
+   open a second daemon over this fixture's live room stores."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.actors :as actors]
@@ -18,7 +18,6 @@
             [dvergr.substrate.paths :as paths]
             [dvergr.channels.telegram :as tg]
             [dvergr.security.allowlist :as allowlist]
-            [dvergr.substrate.config :as config]
             [dvergr.test-registries :as test-registries]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.yggdrasil :as ygg]))
@@ -50,9 +49,8 @@
       (doseq [r (rreg/list-rooms)]
         (reset! (:participants r) (get (:rooms snap) (:id r) {}))))))
 
-;; :once — start ONE daemon for the whole ns. Tests that need a fresh
-;; lifecycle (start-stop-no-telegram, no-agents-config) opt out by
-;; starting their own daemon and ignoring *shared-daemon*.
+;; :once — start ONE daemon for the whole ns. Standalone lifecycle tests
+;; have a separate namespace/fixture, never a second concurrent daemon.
 ;;
 ;; Re-root ALL dvergr state (system-db, workspace, …) to an isolated temp dir for
 ;; the whole ns: the system-DB conn is a JVM-global singleton at
@@ -103,82 +101,6 @@
 ;; ============================================================================
 ;; Tests
 ;; ============================================================================
-
-(deftest test-daemon-start-stop-no-telegram
-  (testing "Daemon starts and stops without Telegram"
-    ;; This test specifically exercises the full lifecycle, so it keeps
-    ;; its own daemon — don't reuse *shared-daemon* here.
-    (let [d (daemon/start! {:db-path (tmp-db-path)
-                            :agents {:echo {:provider :fireworks
-                                            :model "test-model"
-                                            :system-prompt "Echo agent"
-                                            :tags #{:echo}
-                                            :description "Test echo agent"}}})]
-      (is (= :running @(:status d)))
-      (is (nil? (:telegram-ch d)))
-
-      ;; Check the config agent is registered. Presence (online-actors) is a
-      ;; JVM-global view across all daemons in the test JVM (single-daemon-per-JVM
-      ;; design), so assert membership of THIS daemon's :echo, not an exact count.
-      (let [by-id (into {} (map (juxt :id identity)) (daemon/list-agents d))]
-        (is (contains? by-id :echo) ":echo agent is hosted")
-        (is (= #{:echo} (:tags (by-id :echo)))))
-
-      ;; Check daemon status
-      (let [status (daemon/daemon-status d)]
-        (is (= :running (:status status)))
-        (is (pos? (:agents status)))
-        (is (false? (:telegram-connected? status))))
-
-      ;; Stop
-      (is (= :stopped (daemon/stop! d)))
-      (is (= :stopped @(:status d))))))
-
-(deftest test-daemon-start-initialises-allowlist
-  (testing "every start installs the configured allowlist policy, empty lists included,
-            so a restart never keeps the previous process's state"
-    (let [outsider {:id 999 :username "outsider"}]
-      (try
-        (let [d (daemon/start! {:db-path (tmp-db-path) :allowed-users [{:id 123}]})]
-          (try
-            (is (true? (allowlist/allowed? {:id 123})))
-            (is (false? (allowlist/allowed? outsider)))
-            (finally (daemon/stop! d))))
-        (let [d (daemon/start! {:db-path (tmp-db-path)
-                                :allowed-users [] :strict-allowlist? true})]
-          (try
-            (is (false? (allowlist/allowed? {:id 123})) "previous users are cleared")
-            (is (false? (allowlist/allowed? outsider)) "strict + empty denies")
-            (finally (daemon/stop! d))))
-        (let [d (daemon/start! {:db-path (tmp-db-path)})]
-          (try
-            (is (true? (allowlist/allowed? outsider))
-                "no allowlist and no strict flag: open, as documented")
-            (finally (daemon/stop! d))))
-        (finally
-          (allowlist/configure! {:users []}))))))
-
-(deftest test-start-from-config-rereads-the-file
-  (testing "a restart through start-from-config! applies an edited config file"
-    (let [file   (java.io.File/createTempFile "dvergr-daemon-config" ".edn")
-          cfg    @#'config/config-atom
-          saved  @cfg
-          start! (fn [m]
-                   (spit file (pr-str m))
-                   (with-redefs-fn {#'config/getenv (fn [k] (when (= k "DVERGR_CONFIG")
-                                                              (str file)))}
-                     #(daemon/start-from-config! {:db-path (tmp-db-path)})))]
-      (try
-        (let [d (start! {:allowed-users [{:id 123}]})]
-          (try (is (true? (allowlist/allowed? {:id 123})))
-               (finally (daemon/stop! d))))
-        (let [d (start! {:allowed-users [] :strict-allowlist? true})]
-          (try (is (false? (allowlist/allowed? {:id 123})) "the revoked user is out")
-               (finally (daemon/stop! d))))
-        (finally
-          (reset! cfg saved)
-          (.delete file)
-          (allowlist/configure! {:users []}))))))
 
 (deftest test-daemon-multiple-agents
   (testing "Daemon hosts multiple agents simultaneously"
@@ -309,12 +231,3 @@
               (is (= :telegram-4242 (:from m)) "authored by the user-actor")
               (is (= :user (:role m))
                   "human inbound stored as :user, not :assistant"))))))))
-
-(deftest test-daemon-no-agents-config
-  (testing "Daemon starts cleanly with no :agents in config — the file-driven
-            var secretary (resources/agents/var.md, autostart: true) still boots"
-    (let [d (daemon/start! {:db-path (tmp-db-path)})]
-      (is (= :running @(:status d)))
-      (is (contains? (into #{} (map :id) (daemon/list-agents d)) :var)
-          "var autostarts from its definition file even with no :agents config")
-      (daemon/stop! d))))

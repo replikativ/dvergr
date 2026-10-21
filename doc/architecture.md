@@ -16,6 +16,13 @@ workspace, a git repository kept as a Datahike branch with a muschel virtual
 filesystem, + Datahike message/knowledge stores); a thin global **system-db**
 (`dvergr.system.db`) is only the registry that keeps the set of rooms/agents together.
 
+Repeated `system.rooms/hydrate-rooms!` on the same daemon root preserves healthy
+room contexts and store handles. This keeps registered Room objects and their
+message buses aligned during an embedder's sequential transport-only restart;
+missing or failed rooms may retry. Switching daemon roots requires explicitly
+releasing the predecessor's room stores first. Hydration does not make
+concurrent bootstrap calls atomic or replace the daemon shutdown lifecycle.
+
 **Layer summary:**
 - **L0 — CoW substrate / persistence**: config loading (`substrate/config`), the
   Geschichte room workspaces (`substrate/geschichte`; forking a room branches
