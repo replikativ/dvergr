@@ -7,6 +7,7 @@
             [dvergr.room.registry :as rreg]
             [dvergr.room.store :as rstore]
             [dvergr.rooms :as droom]
+            [dvergr.discourse :as discourse]
             [dvergr.room.store.datahike :as datahike-store]
             [dvergr.substrate.datahike :as substrate-datahike]
             [dvergr.system.db :as system-db]
@@ -14,6 +15,76 @@
             [kontor.governance :as governance]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]))
+
+(deftest repeated-hydration-preserves-the-live-room-context
+  (let [root (context/create-execution-context)
+        another-root (context/create-execution-context)
+        room-id (random-uuid) lookups (atom 0)]
+    (rooms/clear-room-ctxs!)
+    (try
+      (with-redefs [system-db/all-rooms (fn [] [{:room/id room-id}])
+                    system-db/systems-for-room (fn [_] (swap! lookups inc) [])]
+        (let [first-context (binding [ec/*execution-context* root]
+                              (rooms/hydrate-rooms!) (rooms/room-ctx-for room-id))]
+          (is (some? first-context))
+          (binding [ec/*execution-context* root] (rooms/hydrate-rooms!))
+          (is (identical? first-context (rooms/room-ctx-for room-id)))
+          (is (= 1 @lookups) "No store reconnect or replacement fork on web-only restart")
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (binding [ec/*execution-context* another-root] (rooms/hydrate-rooms!))))
+          (is (identical? first-context (rooms/room-ctx-for room-id)))
+          (is (= 1 @lookups))))
+      (finally
+        (rooms/clear-room-ctxs!)
+        (context/close-context! root)
+        (context/close-context! another-root)))))
+
+(deftest previously-failed-room-hydration-can-retry
+  (let [root (context/create-execution-context) room-id (random-uuid)
+        fail? (atom true) attempts (atom 0)]
+    (rooms/clear-room-ctxs!)
+    (try
+      (with-redefs-fn
+        {#'system-db/all-rooms (fn [] [{:room/id room-id}])
+         #'system-db/systems-for-room (fn [_] [{:system {:system/type :msgs :system/scope "fixture"}}])
+         #'rooms/register-system-into-current! (fn [_]
+                                                 (swap! attempts inc)
+                                                 (when @fail? (throw (ex-info "Temporary failure" {}))))}
+        #(binding [ec/*execution-context* root]
+           (rooms/hydrate-rooms!)
+           (is (thrown? clojure.lang.ExceptionInfo (rooms/room-ctx-for room-id)))
+           (reset! fail? false)
+           (rooms/hydrate-rooms!)
+           (is (some? (rooms/room-ctx-for room-id)))
+           (rooms/hydrate-rooms!)
+           (is (= 2 @attempts))))
+      (finally (rooms/clear-room-ctxs!) (context/close-context! root)))))
+
+(deftest both-hydration-stages-preserve-a-registered-room-and-its-context
+  (let [root (context/create-execution-context) room-id (random-uuid)
+        slug (str "hydration-identity-" (random-uuid))
+        keyword-id (rstore/slug->room-id slug) created (atom nil)]
+    (rooms/clear-room-ctxs!)
+    (try
+      (binding [ec/*execution-context* root]
+        (with-redefs [system-db/all-rooms (fn [] [{:room/id room-id :room/slug slug :room/name "Identity"}])
+                      system-db/systems-for-room (constantly [])]
+          (rooms/hydrate-rooms!)
+          (let [first-context (rooms/room-ctx-for room-id)
+                live (discourse/make-room {:id keyword-id :ctx first-context :title "Identity"})]
+            (reset! created live)
+            (is (identical? live (rreg/lookup keyword-id)))
+            (dotimes [_ 2]
+              (rooms/hydrate-rooms!)
+              (droom/hydrate-registry! root)
+              (is (identical? live (rreg/lookup keyword-id)))
+              (is (identical? (:ctx live) (rooms/room-ctx-for room-id)))))))
+      (finally
+        (when-let [live @created]
+          (binding [ec/*execution-context* root]
+            (discourse/close-room! live {:close-context? false})))
+        (rooms/clear-room-ctxs!)
+        (context/close-context! root)))))
 
 (deftest resource-kernel-installs-on-provision-and-reconnect
   (let [cfg {:store {:backend :memory :id (random-uuid)}
