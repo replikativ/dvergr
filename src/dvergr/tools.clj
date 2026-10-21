@@ -7,6 +7,7 @@
             [datahike.api :as d]
             [dvergr.sandbox :as sandbox]
             [dvergr.effects :as effects]
+            [dvergr.rooms.file-tx :as file-tx]
             [dvergr.system.rooms :as srooms]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.io.acquisition :as acquisition]
@@ -360,14 +361,26 @@
         rel (subs resolved 1)
         bytes (if (bytes? content) content (.getBytes (str content) "UTF-8"))
         old (get (geschichte.repo/worktree conn) rel)]
-    (geschichte.content/transact-content!
-     conn bytes (:content old)
-     (fn [id]
-       [[:db.fn/call expect-guard rel expected true]
-        {:geschichte.work/path rel
-         :geschichte.work/content [:geschichte.content/id id]
-         :geschichte.work/size (long (alength ^bytes bytes))
-         :geschichte.work/mode (long (or mode (:mode old) 33188))}]))
+    (when-let [state (:basis-write-state ctx)] (vreset! state :dispatched))
+    (try
+      (geschichte.content/transact-content!
+       conn bytes (:content old)
+       (fn [id]
+         (cond-> []
+           (:validated-basis ctx) (conj [:db.fn/call file-tx/assert-basis! (:validated-basis ctx)])
+           true (conj [:db.fn/call expect-guard rel expected true]
+                      {:geschichte.work/path rel
+                       :geschichte.work/content [:geschichte.content/id id]
+                       :geschichte.work/size (long (alength ^bytes bytes))
+                       :geschichte.work/mode (long (or mode (:mode old) 33188))}))))
+      (when-let [state (:basis-write-state ctx)] (vreset! state :written))
+      (catch Throwable failure
+        ;; This witness cannot be set by a handler's fabricated error. A fixed
+        ;; guard rejected INSIDE the native transaction; nothing was committed.
+        (when (and (:validated-basis ctx) (:basis-write-state ctx)
+                   (file-tx/native-basis-refusal? failure))
+          (vreset! (:basis-write-state ctx) :refused))
+        (throw failure)))
     resolved))
 
 (defn- changed-underneath
@@ -408,24 +421,39 @@
      (throw (ex-info "A file mode requires a guarded write and a regular-file mode"
                      {:type ::invalid-mode})))
    (let [content (if (bytes? content) content (str content))
-         n (if (bytes? content) (alength ^bytes content) (alength (.getBytes ^String content "UTF-8")))]
-     (effects/perform! (effect-boundary ctx)
-                       {:effect :fs/write :resource {:path (str path)
-                                                     :system-id (or (:system-id ctx)
-                                                                    (srooms/connection-system-id (get-in ctx [:workspace :conn])))}
+         n (if (bytes? content) (alength ^bytes content) (alength (.getBytes ^String content "UTF-8")))
+         write (if (contains? opts :expect)
+                 #(rethrow-changed
+                   (fn []
+                     (let [resolved (tool-path ctx path)]
+                       ;; Validated-basis writes replace an existing regular
+                       ;; file, with no preparatory mutations.
+                       (when-not (:validated-basis ctx)
+                         (make-parents! (:filesystem ctx) resolved))
+                       (guarded-write! ctx resolved content (:expect opts) (:mode opts)))))
+                 #(write-file! ctx path content))
+         ;; Repeated INNER forwarding must not execute a second transaction or
+         ;; overwrite successful native evidence with a later basis refusal.
+         once (when (:validated-basis ctx) (delay (write)))
+         owner (when once (Thread/currentThread))
+         open? (when once (volatile! true))]
+     (try
+       (effects/perform! (effect-boundary ctx)
+                         {:effect :fs/write :resource {:path (str path)
+                                                       :system-id (or (:system-id ctx)
+                                                                      (srooms/connection-system-id (get-in ctx [:workspace :conn])))}
                         ;; bytes are digested as they are (a byte array prints by identity)
-                        :result-of (constantly (if (bytes? content)
-                                                 (String. ^bytes content "ISO-8859-1")
-                                                 content))
-                        :bytes n}
-                       (if (contains? opts :expect)
-                         #(rethrow-changed
-                           (fn []
-                             (let [resolved (tool-path ctx path)]
-                               ;; the directories first, as a plain write makes them
-                               (make-parents! (:filesystem ctx) resolved)
-                               (guarded-write! ctx resolved content (:expect opts) (:mode opts)))))
-                         #(write-file! ctx path content))))))
+                          :result-of (constantly (if (bytes? content)
+                                                   (String. ^bytes content "ISO-8859-1")
+                                                   content))
+                          :bytes n}
+                         (if once
+                           #(do (when-not (and (identical? owner (Thread/currentThread)) @open?)
+                                  (throw (ex-info "Validated file forwarding is closed or on another thread"
+                                                  {:type ::closed-validated-forwarding})))
+                                (force once))
+                           write))
+       (finally (when open? (vreset! open? false)))))))
 
 (defn workspace-delete!
   "Delete the file at `path` in the workspace of the tool context `ctx`,

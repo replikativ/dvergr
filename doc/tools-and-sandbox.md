@@ -219,6 +219,34 @@ later worktree read. A handler answering without forwarding does not certify a
 save. Existing executable modes survive edits; `:file-modes` permits explicit
 regular-file mode preservation when moving a file.
 
+For schema-sensitive edits, the host can additionally pass `:validated-basis`
+from `dvergr.rooms.file-tx/capture-basis` on the **fresh Save-time** immutable DB
+used for validation. This is a closed backend/store/physical-branch/repository/
+Git-ref/commit-id/max-tx DTO, not a predicate or permission. Only one existing
+regular-file replacement with `:expected-worktree` is supported; creation,
+deletion, multiple files and combination with publication/subtree options refuse
+before effects. No parent directories are created. A fixed transaction guard
+checks that basis in the same transaction that publishes content/worktree rows,
+including identical-content replacements. It does not itself validate a schema
+or guarantee that schemas remain unchanged after publication.
+Inner forwarding is synchronous, on the calling thread, and closed when the
+file effect returns. Repeated forwarding memoizes one native result/error;
+skipping that native write cannot certify even an identical-content save.
+For this option, `write!`/`write-to!` also reuse the native completion gate to
+close outer forwarding before returning. Saved callbacks cannot start a later
+batch. Existing writes without this option retain their prior contracts.
+
+The guard compares commit-id and pre-transaction max-tx, not hash/eid/op-count:
+transaction clocks and content rows may precede its execution. A private native
+refusal witness prevents an unnecessary index reset from undoing another writer's
+intervening staging. Handler-thrown lookalikes cannot supply that witness. No
+compensation runs for this restricted contract: before native dispatch there
+are no owned mutations; after dispatch an exception is conservatively uncertain,
+even if the native write returned before a handler failed. Another writer may
+have staged changes, or an acknowledgement may have been lost after committing.
+Inspect the actual worktree/index before retrying; do not automatically retry.
+Failed guards may leave unreferenced content-addressed payloads for normal GC.
+
 Host proposal adopters may also supply `:publication`: a scoped `:identity`,
 a synchronous `:authorize!` callback returning literal `true`, and a synchronous
 `:before-dispatch!` callback that durably journals the candidate before dispatch.

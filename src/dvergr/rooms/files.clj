@@ -59,7 +59,7 @@
 (def max-batch-files "How many paths one `room_write` names." 200)
 (def write-capabilities
   "Host embedding contracts supported by the canonical batch writer."
-  #{:expected-worktree :applied-receipt :file-modes :durable-publication :explicit-workspace :expected-subtree})
+  #{:expected-worktree :applied-receipt :file-modes :durable-publication :explicit-workspace :expected-subtree :validated-basis})
 
 ;; ---------------------------------------------------------------------------
 ;; Paths and the workspace
@@ -534,9 +534,20 @@
 (defn- write-workspace!
   "Shared native batch writer. Every physical operation retains this exact
    descriptor; neither file effects nor commit re-resolve ambient selection."
-  [room workspace files {:keys [message boundary file-modes publication expected-subtree] :as opts} completion]
+  [room workspace files {:keys [message boundary file-modes publication expected-subtree validated-basis] :as opts} completion]
   (let [entries (plan files)
         planned entries
+        _ (when (contains? opts :validated-basis)
+            (file-tx/validate-basis! validated-basis)
+            (when-not (and (= 1 (count entries))
+                           (bytes? (second (first entries)))
+                           (not (contains? opts :publication))
+                           (not (contains? opts :expected-subtree))
+                           (let [opened (opened-worktree! [(ffirst entries)] opts)
+                                 entry (get opened (ffirst entries))]
+                             (and entry (#{33188 33261} (:mode entry)))))
+              (refuse "validated-basis requires one existing regular-file replacement with expected-worktree, without publication/subtree" {})))
+        basis-write-state (when validated-basis (volatile! :not-dispatched))
         _ (when (contains? opts :expected-subtree) (subtree/validate! expected-subtree))
         ;; This option is fixed data, never a caller predicate. Validate native
         ;; accessible paths and derive AFTER without a raced repository reread.
@@ -586,7 +597,8 @@
         outer-boundary (guarded-boundary boundary completion false)
         inner-boundary (guarded-boundary boundary completion true)
         ;; `:workspace`: the gate's compare-and-write needs the repository
-        ctx {:filesystem fs :workspace ws :system-id system-id :cwd "/" :effect-boundary inner-boundary}
+        ctx (cond-> {:filesystem fs :workspace ws :system-id system-id :cwd "/" :effect-boundary inner-boundary}
+              validated-basis (assoc :validated-basis validated-basis :basis-write-state basis-write-state))
         commit-publication (if (and completion (fn? (:before-dispatch! publication)))
                              (update publication :before-dispatch!
                                      (fn [hook]
@@ -686,6 +698,9 @@
                                   (swap! touched conj p)
                                   (swap! removed conj p))
                                 (do (tools/workspace-write! ctx p c opts)
+                                    (when (and basis-write-state (not= :written @basis-write-state))
+                                      (throw (ex-info "Validated file write was not forwarded"
+                                                      {:type ::not-applied})))
                                     (swap! touched conj p))))
                             (let [{:keys [commit tree publication]}
                                   (guarded-native! completion true
@@ -714,39 +729,49 @@
                               ;; its directory cleanup in the joined transaction.
                               (observe-positive! completion (applied-result planned @applied message @removed))
                               commit)
-                            (catch Throwable e
-                              (vreset! execution-error e)
+                            (catch Throwable failure
+                              ;; This contract never compensates: before native
+                              ;; dispatch there is no owned mutation; afterward
+                              ;; neither another writer's index nor a lost ACK
+                              ;; can be safely undone by the legacy restore.
+                              (let [e (if (and basis-write-state
+                                               (#{:dispatched :written} @basis-write-state))
+                                        (ex-info "Validated file transaction dispatched; inspect before retry"
+                                                 {::publication/uncertain? true} failure)
+                                        failure)]
+                                (vreset! execution-error e)
                            ;; Native publication may have committed despite a lost
                            ;; acknowledgement. Never undo it or infer failure
                            ;; from an absent receipt; retain the host journal.
-                              (if (or @applied (publication/uncertain? e))
-                                (throw e)
-                                (try
-                                  (let [_ (when (and expected-subtree
-                                                     (or (.isInterrupted (Thread/currentThread)) (interrupted-failure? e)))
-                                            (.interrupt (Thread/currentThread))
-                                            (throw (ex-info "Conditional write interrupted; no cleanup was submitted"
-                                                            {::publication/uncertain? true} e)))
-                                        conflicted (guarded-native! completion true
-                                                                    #(if expected-subtree
-                                                                       (do (try (gs/assert-workspace-current! ws)
-                                                                                (catch Throwable changed
-                                                                                  (throw (ex-info "Conditional cleanup target changed; no cleanup submitted"
-                                                                                                  {::publication/uncertain? true} changed))))
-                                                                           (publication/undo-subtree! conn @subtree-basis required-subtree
-                                                                                                      (vec @touched) @stage-witness paths (vec created)))
-                                                                       (restore! conn before expected @touched created)))]
-                                    (throw (if (seq conflicted)
-                                             (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
-                                                           (str/join ", " conflicted))
-                                                      (assoc (ex-data e) :conflicted conflicted) e)
-                                             e)))
-                                  (catch Throwable final-error
+                                (if (or @applied (publication/uncertain? e)
+                                        basis-write-state)
+                                  (throw e)
+                                  (try
+                                    (let [_ (when (and expected-subtree
+                                                       (or (.isInterrupted (Thread/currentThread)) (interrupted-failure? e)))
+                                              (.interrupt (Thread/currentThread))
+                                              (throw (ex-info "Conditional write interrupted; no cleanup was submitted"
+                                                              {::publication/uncertain? true} e)))
+                                          conflicted (guarded-native! completion true
+                                                                      #(if expected-subtree
+                                                                         (do (try (gs/assert-workspace-current! ws)
+                                                                                  (catch Throwable changed
+                                                                                    (throw (ex-info "Conditional cleanup target changed; no cleanup submitted"
+                                                                                                    {::publication/uncertain? true} changed))))
+                                                                             (publication/undo-subtree! conn @subtree-basis required-subtree
+                                                                                                        (vec @touched) @stage-witness paths (vec created)))
+                                                                         (restore! conn before expected @touched created)))]
+                                      (throw (if (seq conflicted)
+                                               (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
+                                                             (str/join ", " conflicted))
+                                                        (assoc (ex-data e) :conflicted conflicted) e)
+                                               e)))
+                                    (catch Throwable final-error
                                    ;; Cleanup itself can have dispatched before
                                    ;; losing its ACK. An outer handler must not
                                    ;; hide that uncertainty by swallowing it.
-                                    (when expected-subtree (vreset! execution-error final-error))
-                                    (throw final-error)))))))
+                                      (when expected-subtree (vreset! execution-error final-error))
+                                      (throw final-error))))))))
                 _answer (try
                           (effects/perform!
                            outer-boundary {:effect :git/commit :resource {:message message :system-id system-id}}
@@ -754,6 +779,10 @@
                           (catch Throwable error
                             (cond
                               (publication/uncertain? @execution-error) (throw @execution-error)
+                              (and basis-write-state (#{:dispatched :written} @basis-write-state))
+                              (throw (ex-info "Validated file dispatch completed before handler failure; inspect before retry"
+                                              (cond-> {::publication/uncertain? true}
+                                                @applied (assoc :applied @applied)) error))
                               (and publication @applied)
                               (throw (ex-info "Publication committed before completion failed"
                                               {::publication/uncertain? true
@@ -792,14 +821,27 @@
    stale opened version refuses the batch; omission retains unconditional
    client-write behavior.
 
+   Host-only `:validated-basis` is file-tx/capture-basis from a fresh Save-time
+   immutable DB used by the host for schema/constraint validation. Restricted
+   to ONE existing regular-file replacement with expected-worktree, without
+   subtree/publication. A fixed guard compares repository identity and the
+   commit-id/max-tx pair atomically with content/worktree publication. It is
+   not authority, schema validation, or a guarantee schemas stay unchanged
+   afterward. Forwarding is synchronous and sealed on return. No compensation
+   is attempted: native dispatch followed by failure is uncertain, while a
+   proven native pre-write refusal leaves other writers' state untouched.
+
    Host-only `:expected-subtree` supplies a bounded full BEFORE prefix manifest;
    publication checks BOTH worktree and index against its derived AFTER tree.
    See `doc/subtree-cas.md` for bounds and cleanup/uncertainty semantics. Hosts
    requiring sealed completion evidence must use `write-to-completion!`;
    this option does not make intermediate writes invisible."
   [room files opts]
-  (binding [ec/*execution-context* (:ctx room)]
-    (write-workspace! room (workspace! room) files opts nil)))
+  (let [gate (when (contains? opts :validated-basis) (completion-gate))]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (write-workspace! room (workspace! room) files opts gate))
+      (finally (when gate (seal-completion! gate))))))
 
 (defn write-to!
   "HOST API: write/commit a batch to this exact registered Geschichte system
@@ -807,8 +849,11 @@
    options, effects, permissions, receipts and recovery contract as write!.
    No selection mutation, Room facade or serializable descriptor capability."
   [room system files opts]
-  (binding [ec/*execution-context* (:ctx room)]
-    (write-workspace! room (gs/workspace-for-system! system) files opts nil)))
+  (let [gate (when (contains? opts :validated-basis) (completion-gate))]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (write-workspace! room (gs/workspace-for-system! system) files opts gate))
+      (finally (when gate (seal-completion! gate))))))
 
 (defn- interrupted-failure? [failure]
   ;; Native failure wrappers retain their causes. Do not infer cancellation
@@ -832,8 +877,9 @@
    Forwarding is synchronous on this calling worker thread only. A private
    bottom gate permanently closes before return; saved outer/inner next
    callbacks cannot start later writes. This is not a portable bearer token or
-   a sandbox for arbitrary trusted-host handler I/O. Legacy write!/write-to!
-   retain their original contracts. Interruption remains set on this worker
+   a sandbox for arbitrary trusted-host handler I/O. Ordinary write!/write-to!
+   retain their original contracts; :validated-basis opts into a sealed gate.
+   Interruption remains set on this worker
    after closure. No new permission or executor is supplied."
   [room system files opts]
   (let [gate (completion-gate)
