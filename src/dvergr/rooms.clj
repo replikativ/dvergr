@@ -13,6 +13,7 @@
      (create-room! {:title \"General\" :slug \"general\" :type :internal})
      ;; then post through the Room: (dvergr.discourse/post! room msg)"
   (:require [datahike.api :as dh]
+            [clojure.string :as str]
             [dvergr.chat.schema :as schema]
             [dvergr.substrate.config :as config]
             [dvergr.discourse :as d]
@@ -21,7 +22,9 @@
             [dvergr.system.db :as sdb]
             [dvergr.room.store.datahike :as datahike-store]
             [dvergr.room.registry :as rreg]
+            [dvergr.runtime.ctx :as rctx]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [dvergr.agent.run :as agent-run]
             [dvergr.chat.schema :as chat-schema]
             [taoensso.telemere :as tel]))
@@ -52,6 +55,95 @@
 ;; ============================================================================
 ;; Room CRUD
 ;; ============================================================================
+
+(defn- register-live-room!
+  [{:keys [title slug type telegram-chat-id agent-ids parent-id]} room-ctx]
+  (let [store (when room-ctx (binding [ec/*execution-context* room-ctx] (room-store slug)))]
+    (when-not store
+      (throw (ex-info (str "Room " slug " has no "
+                           (if room-ctx "messages store" "execution context") " after provisioning")
+                      {:slug slug :room-ctx? (some? room-ctx)})))
+    (tel/log! {:id :rooms/created :data {:slug slug}} "Room created")
+    (let [room (binding [ec/*execution-context* room-ctx]
+                 (d/make-room {:id (rstore/slug->room-id slug) :slug slug :title (or title slug)
+                               :parent-id parent-id :ctx room-ctx :store store
+                               :meta (cond-> {:type (or type :internal) :chat-id (srooms/msgs-chat-id slug)
+                                              :agent-ids (set agent-ids)}
+                                       telegram-chat-id (assoc :telegram-chat-id telegram-chat-id))}))]
+      (doseq [aid (seq agent-ids)]
+        (binding [ec/*execution-context* room-ctx] (discourse-join! room aid)))
+      room)))
+
+;; Process-native constructor coordination, never forkable application state.
+(defonce ^:private prepared-registration-lock (Object.))
+
+(defn register-prepared-room!
+  "HOST ONLY: register ONE already-prepared persistent Room, without provisioning
+   or rewriting control metadata. Returns its live Room. Reuses only an exact
+   canonical incarnation. Must not overlap root teardown/hydration.
+
+   A started constructor can already own bus pumps even if it throws. Preserve
+   that failure in the existing preparation-owner gate and attempt to close new
+   Run admission. A failed fence remains explicitly uncertain; no automatic
+   retry, drain or compensating teardown. Not a
+   transport/authorization or migration API."
+  [room-id]
+  (when (or (simple/on-drain-thread?) (not (ec/execution-context-bound?))
+            (not (identical? (ec/current-execution-context) (rctx/current-root))))
+    (throw (ex-info "Prepared Room registration requires a bound host root" {:type ::requires-host-root})))
+  (when-not (uuid? room-id) (throw (ex-info "Persistent Room UUID required" {:type ::invalid-room-id})))
+  (locking prepared-registration-lock
+    (let [control @(sdb/get-conn)
+          eid (dh/q '[:find ?room . :in $ ?id :where [?room :room/id ?id]] control room-id)
+          agents (when eid (vec (take 257 (dh/datoms control :eavt eid :room/agent-ids))))
+          _ (when (> (count agents) 256)
+              (throw (ex-info "Prepared Room has too many configured agents" {:type ::too-many-agents :room/id room-id})))
+          row (when eid (assoc (dh/pull control
+                                        '[:room/id :room/slug :room/name :room/type :room/archived-at
+                                          :room/provisioning-state :room/provisioning-version
+                                          :room/parent-slug :room/telegram-chat-id
+                                          {:room/default-repository [:system/repository-profile]}] eid)
+                               :room/agent-ids (mapv :v agents)))
+          slug (:room/slug row)
+          profiled? (some? (get-in row [:room/default-repository :system/repository-profile]))
+          _ (when-not (and row (string? slug) (not (str/blank? slug)) (nil? (:room/archived-at row))
+                           (or (and (not profiled?) (nil? (:room/provisioning-state row))
+                                    (nil? (:room/provisioning-version row)))
+                               (and (= 1 (:room/provisioning-version row)) (= :ready (:room/provisioning-state row)))))
+              (throw (ex-info "Persistent Room is not ready for registration" {:type ::not-ready :room/id room-id})))
+          ctx (srooms/room-ctx-for room-id)
+          _ (when-not (and ctx (not (identical? ctx (rctx/current-root)))
+                           (identical? (rctx/current-root) (rctx/root-ctx ctx)))
+              (throw (ex-info "Canonical prepared Room context required" {:type ::not-prepared :room/id room-id})))
+          conn (binding [ec/*execution-context* ctx] (srooms/room-msgs-conn room-id))
+          ;; Independently verify seeded durable identity: make-room's store
+          ;; metadata writer currently logs/swallow failures, not an ACK proof.
+          snapshot (when conn @conn)
+          _ (when-not (and snapshot (srooms/canonical-messages-identity? snapshot slug))
+              (throw (ex-info "Prepared messages identity is unavailable" {:type ::invalid-messages :room/id room-id})))
+          id (rstore/slug->room-id slug)
+          same? (fn [room]
+                  (and (= id (:id room)) (= slug (:slug room)) (identical? ctx (:ctx room))
+                       (identical? conn (get-in room [:store :conn]))
+                       (instance? clojure.lang.IDeref (:meta room))
+                       (= (srooms/msgs-chat-id slug) (:chat-id @(:meta room)))))]
+      (if-let [existing (rreg/lookup id)]
+        (if (same? existing) existing
+            (throw (ex-info "Another Room incarnation is already registered" {:type ::foreign-registration :room/id room-id})))
+        (try
+          (let [room (register-live-room!
+                      {:slug slug :title (:room/name row) :type (:room/type row)
+                       :parent-id (some-> (:room/parent-slug row) rstore/slug->room-id)
+                       :telegram-chat-id (:room/telegram-chat-id row) :agent-ids (:room/agent-ids row)} ctx)]
+            (when-not (and (same? room) (identical? room (rreg/lookup id))
+                           (identical? ctx (srooms/room-ctx-for room-id)))
+              (throw (ex-info "Room registration did not preserve its canonical owner" {:type ::registration-mismatch})))
+            room)
+          (catch Throwable error
+            (let [held (srooms/retain-room-registration-failure! room-id ctx error)]
+              (try (agent-run/close-room-admission! {:id id :ctx ctx})
+                   (catch Throwable fence-error (.addSuppressed held fence-error)))
+              (throw held))))))))
 
 (defn create-room!
   "Create a new room: Datahike entity AND discourse.Room registration.
@@ -129,37 +221,9 @@
                                     "Room provisioning failed")
                           (throw (ex-info (str "Room " slug " could not be provisioned: " (ex-message t))
                                           {:slug slug :repo-source repo-source} t))))
-          ;; never the daemon ctx: a room runs on its own (see hydrate-registry!)
-          room-ctx (:room-ctx prov)
-          store    (when room-ctx
-                     (binding [ec/*execution-context* room-ctx] (room-store slug)))]
-      (when-not store
-        (throw (ex-info (str "Room " slug " has no "
-                             (if room-ctx "messages store" "execution context")
-                             " after provisioning")
-                        {:slug slug :room-ctx? (some? room-ctx)})))
-      (tel/log! {:id :rooms/created :data {:slug slug}} "Room created")
-      ;; Build the discourse Room ON its own ctx, with its per-room store.
-      ;; rreg/register! roots the registry write (Tier-1), so the room is visible
-      ;; to the UI even though it runs on its own ctx.
-      (let [new-room (binding [ec/*execution-context* room-ctx]
-                       (d/make-room {:id        (rstore/slug->room-id slug)
-                                     :slug      slug
-                                     :title     (or title slug)
-                                     :parent-id parent-kw
-                                     :ctx       room-ctx
-                                     :store     store
-                                     :meta      (cond-> {:type (or type :internal)
-                                                         :chat-id (srooms/msgs-chat-id slug)
-                                                         :agent-ids (set agent-ids)}
-                                                  telegram-chat-id
-                                                  (assoc :telegram-chat-id telegram-chat-id))}))]
-              ;; Discourse-level join for every agent in :agent-ids. Only
-              ;; effective for agents currently in the runtime registry —
-              ;; missing ones get a warning but don't fail the create.
-        (doseq [aid (seq agent-ids)]
-          (binding [ec/*execution-context* room-ctx]
-            (discourse-join! new-room aid)))))
+          room-ctx (:room-ctx prov)]
+      (register-live-room! {:slug slug :title title :type type :parent-id parent-kw
+                            :telegram-chat-id telegram-chat-id :agent-ids agent-ids} room-ctx))
     (rstore/slug->room-id slug)))
 
 (defn archive-room!

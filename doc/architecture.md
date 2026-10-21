@@ -296,7 +296,9 @@ reopening never deletes a pre-existing repository or removes shared governance.
 The registry persists only a repository's keyword `:system/repository-profile`,
 never its executable hooks. `dvergr.system.rooms/hydrate-rooms!` accepts the
 trusted host's `:repository-profiles` map. A profiled Room needs exactly one
-messages system with exactly its expected room/chat identity. The bootstrap
+messages system with exactly its expected room/chat identity. Unrelated agent
+ChatContext identities may coexist in that store, but every additional room
+marker or an expected chat ID on a different entity is refused. The bootstrap
 prepares that system's resource governance first and all profiled repository
 adapters next, before registering any mandatory adapter. Missing policy or a
 failed preparation withholds the Room; reopening never initializes a missing
@@ -342,3 +344,18 @@ resources. Fulltext declarations are deliberately omitted here: asynchronous
 index builds require their own explicitly owned lifecycle. This API is not an
 authorization endpoint and is not enabled by generic room creation or transport
 handlers; an embedder must select the host policy and authorize activation.
+
+`dvergr.rooms/register-prepared-room!` is the separate HOST-only live Room
+registration step. It consumes one already-prepared canonical Room context,
+checks persisted readiness and messages identity, and never reprovisions or
+rewrites control metadata. Exact live incarnations are reused; foreign
+incarnations and contexts are refused before construction. Hosts must serialize
+this step with root hydration and teardown. Unprofiled marker-free legacy Rooms
+may use it only after their ordinary native preparation has completed.
+
+A failed constructor may already have started bus pumps or published its Room.
+Its exact context is retained behind the existing preparation recovery gate;
+ordinary retries, release and reset cannot discard it. New Run admission closure
+is attempted. If that fence itself fails, its error is retained as suppressed
+evidence and admission remains explicitly uncertain. This is not a drain or an
+automatic constructor retry: explicit host reconciliation is required.
