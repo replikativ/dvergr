@@ -32,6 +32,7 @@
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.sandbox :as sandbox]
             [dvergr.substrate.paths :as paths]
+            [dvergr.substrate.datahike :as substrate-datahike]
             [dvergr.system.db :as sdb]
             [dvergr.system.rooms :as srooms]
             [kontor.governance :as governance]
@@ -62,23 +63,30 @@
             ledger (binding [rtc/*execution-context* (:room-ctx c)]
                      (srooms/create-room-db! (:room-id c) "c-ledger")
                      (some #(when (= "c-ledger" (get-in % [:system :system/name])) (:system %))
-                           (sdb/systems-for-room (:room-id c))))]
-        ;; attach as a host does: a grant in the system DB, and the system
-        ;; registered into the room's composite (`hydrate-rooms!` at boot)
+                           (sdb/systems-for-room (:room-id c))))
+            ;; Start the actual Room and interpreter BEFORE adding grants or
+            ;; adapters: attachment must work through this SAME live session.
+            live-room (binding [rtc/*execution-context* root]
+                        (droom/register-prepared-room! (:room-id a)))
+            _ (reset! world {:a a :b b :c c :ec (:room-ctx a) :root root :live-room live-room})
+            ec (:room-ctx a)
+            sci-ctx (sandbox/fork-for-session ec)
+            _ (swap! world assoc :sci-ctx sci-ctx)
+            _ (sandbox/setup-agent-namespaces! sci-ctx ec :room-id (:room-id a))]
+        ;; LIVE attachment is a metadata grant plus explicit additive native
+        ;; activation. Hydration preserves already-provisioned contexts.
         (sdb/attach! (:room-id a) (:kb-id b) :read)
         (sdb/attach! (:room-id a) (:kb-id c) :read-write)
         (sdb/attach! (:room-id a) (:system/id ledger) :read)
+        (binding [rtc/*execution-context* root]
+          (srooms/ensure-granted-kb! (:room-id a) (:kb-id b))
+          (srooms/ensure-granted-kb! (:room-id a) (:kb-id c)))
         (binding [rtc/*execution-context* (:room-ctx a)]
-          (doseq [system [{:system/type :kb :system/scope (:kb-path b)}
-                          {:system/type :kb :system/scope (:kb-path c)}
-                          ledger]]
-            (#'srooms/register-system-into-current! system)))
-        (let [ec (:room-ctx a)
-              sci-ctx (sandbox/fork-for-session ec)]
-          (sandbox/setup-agent-namespaces! sci-ctx ec :room-id (:room-id a))
-          (reset! world {:a a :b b :c c :ec ec :sci-ctx sci-ctx :root root})
-          (f)))
+          ;; The new API deliberately supports only KBs, not general mounts.
+          (#'srooms/register-system-into-current! ledger))
+        (f))
       (finally
+        (when-let [room (:live-room @world)] (discourse/close-room! room))
         (srooms/set-grant-permits! nil)
         (srooms/set-trunk-write-policy! nil)
         (when-let [{:keys [a b c]} @world]
@@ -119,6 +127,31 @@
                           @(srooms/room-msgs-conn (get-in @world [:a :room-id]))))))
 
 (defn- read-only? [r] (boolean (re-find #"read-only" (str (:err r)))))
+
+(deftest live-kb-activation-is-idempotent-and-never-replaces-context-or-adapters
+  (let [{:keys [a b ec root live-room]} @world
+        before (binding [rtc/*execution-context* ec] (ygg/registered-systems))]
+    (in-room :b #(dh/transact (srooms/room-kb-conn (:room-id b)) [{:entity/title "live-grant-note"}]))
+    (is (= {:ok true}
+           (ev "(contains? (set (d/q '[:find [?t ...] :where [_ :entity/title ?t]] @(room/db \"room-b-kb\"))) \"live-grant-note\")")))
+    (with-redefs [substrate-datahike/connect (fn [& _] (throw (AssertionError. "Repeated attach acquired another lease")))]
+      (is (= :already-attached
+             (:status (binding [rtc/*execution-context* root]
+                        (srooms/ensure-granted-kb! (:room-id a) (:kb-id b)))))))
+    (is (identical? ec (srooms/room-ctx-for (:room-id a))))
+    (is (identical? ec (:ctx live-room)))
+    (is (identical? live-room (binding [rtc/*execution-context* root] (registry/lookup (:id live-room)))))
+    (is (every? (fn [[id adapter]]
+                  (identical? adapter (binding [rtc/*execution-context* ec] (ygg/system id)))) before))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (binding [rtc/*execution-context* ec]
+                   (srooms/ensure-granted-kb! (:room-id a) (:kb-id b)))))
+    (try
+      (sdb/detach! (:room-id a) (:kb-id b))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (binding [rtc/*execution-context* root]
+                     (srooms/ensure-granted-kb! (:room-id a) (:kb-id b)))))
+      (finally (sdb/attach! (:room-id a) (:kb-id b) :read)))))
 
 (deftest a-kb-attached-read-refuses-every-write
   (let [before (titles :b)

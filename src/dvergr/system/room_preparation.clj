@@ -1,6 +1,7 @@
 (ns dvergr.system.room-preparation
-  "Private synchronous bootstrap ownership, before a Room is published.
-   Not participant preparation, semantic world state or a permission system."
+  "Synchronous HOST ownership for private Room bootstrap and additive native
+   adapters in existing Rooms. Not participant preparation, semantic world
+   state or a permission system."
   (:require [clojure.string :as str]
             [datahike.api :as d]
             [datahike.connector :as connector]
@@ -51,6 +52,76 @@
   (if-let [retained (owner error)]
     ((:recover! retained))
     (refuse! :no-retained-owner)))
+
+(defn with-addition!
+  "INTERNAL HOST: prepare one additive adapter in an existing canonical Room.
+   Caller serializes attachment with lifecycle changes. current! rechecks the
+   canonical context and current registry grant without acquiring native state.
+   Existing adapters are never replaced or torn down. A started registration
+   may already be observable, so uncertainty retains ownership, not rollback."
+  [ctx {:keys [id acquire! prepare!] :as spec} current!]
+  (when (simple/on-drain-thread?) (refuse! :requires-host-thread))
+  (when-not (and ctx (:parent-ctx ctx) (map? spec)
+                 (= #{:id :acquire! :prepare!} (set (keys spec)))
+                 (string? id) (not (str/blank? id)) (<= (count id) 256)
+                 (every? fn? [acquire! prepare! current!]))
+    (refuse! :invalid-host-specs))
+  (binding [ec/*execution-context* ctx]
+    (current!)
+    (let [baseline (ygg/registered-systems)
+          _ (when (contains? baseline id) (refuse! :registration-id-occupied))
+          state (atom {:ctx ctx :phase :acquiring :conn nil :system nil})]
+      (letfn [(baseline-intact? []
+                (let [actual (ygg/registered-systems)]
+                  (and (= (set (keys baseline)) (set (keys actual)))
+                       (every? (fn [[key system]] (identical? system (get actual key))) baseline))))
+              (audit! []
+                (when-not (baseline-intact?)
+                  (swap! state assoc :phase :foreign-registration)
+                  (refuse! :registration-owner-changed)))
+              (cleanup! []
+                (when-not (#{:owned :prepared} (:phase @state))
+                  (refuse! :native-addition-needs-reconciliation))
+                (audit!)
+                (swap! state assoc :phase :releasing)
+                (d/release (:conn @state))
+                (swap! state assoc :phase :released)
+                true)
+              (recover-owner! []
+                (binding [ec/*execution-context* ctx]
+                  (try (cleanup!)
+                       (catch Throwable error
+                         (throw (retained-error state recover-owner! error nil))))))]
+        (try
+          (let [conn (acquire!)]
+            ;; Retain the result before validation/preparation. Even an invalid
+            ;; result cannot justify retrying an acquisition with unknown cost.
+            (swap! state assoc :conn conn)
+            (when-not (connector/connection? conn) (refuse! :acquire-did-not-return-connection))
+            (swap! state assoc :phase :owned)
+            (audit!)
+            (let [system (prepare! conn)]
+              (when-not (and (= id (p/system-id system)) (identical? conn (:conn system)))
+                (refuse! :prepared-system-mismatch))
+              (swap! state assoc :phase :prepared :system system)
+              (current!)
+              (audit!)
+              (swap! state assoc :phase :registering)
+              (ygg/register! system)
+              (let [actual (ygg/registered-systems)]
+                (when-not (and (identical? system (get actual id))
+                               (= (conj (set (keys baseline)) id) (set (keys actual)))
+                               (every? (fn [[key previous]] (identical? previous (get actual key))) baseline))
+                  (refuse! :registration-mismatch)))
+              (swap! state assoc :phase :published)
+              system))
+          (catch Throwable error
+            (if (#{:owned :prepared} (:phase @state))
+              (do (try (cleanup!)
+                       (catch Throwable cleanup-error
+                         (throw (retained-error state recover-owner! error cleanup-error))))
+                  (throw error))
+              (throw (retained-error state recover-owner! error nil)))))))))
 
 (defn with-prepared!
   "INTERNAL bootstrap only. ctx must be a fresh unpublished non-root context.
