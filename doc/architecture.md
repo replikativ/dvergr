@@ -264,3 +264,29 @@ graph TD
 | `clients/client` | L7 | nREPL client — inspect/interact + fork-task workflow over a daemon |
 | `cli/main` + `tui/app` (src-clients) | L7 | CLI entry point; the TUI app (a rich medium adapter onto rooms) |
 | `web/{server,guard,dashboard,api,ops,agents,apps}` | L7 | http-kit server and its browser boundary (Host/Origin checks); dashboard (hiccup+HTMX); spec-derived JSON API; web `ops` binding; agent config UI; a room's `app/` served as a static app (doc/web.md) |
+
+### Host repository initialization profiles
+
+`substrate.geschichte/ensure-repository!` and `substrate.geschichte/create-system`
+accept an explicit `:repository-profile` keyword plus a trusted host
+`:repository-profiles` policy map. `substrate.repository-profile/resolve!`
+requires the selected policy's three hooks: `:initialize!`, `:prepare-open!`
+and `:abort-create!`. No hooks are read from repository files, serialized into
+schema or exposed as agent/RPC options. Nil preserves ordinary initialization;
+an unknown explicit profile refuses instead of falling back.
+
+Initialization owns an exclusively fresh scope and receives its pristine
+connection instead of ordinary initialization/sandbox import. The host must
+join its initialization work. Reopening runs synchronous validation/governance
+registration before adapter publication; it must not start asynchronous work.
+These substrate APIs do not yet persist profiles in the room registry or
+change ordinary room creation/hydration.
+
+Abort must be idempotent and positively join work before connection release
+or deletion. Failed abort retains the exact native resources in an opaque JVM
+exception field, not executable ex-data. The host can call
+`substrate.geschichte/recover-initialization!` to retry abort/cleanup. Recovery
+does not rerun initialization and is idempotent after successful cleanup.
+Release/deletion uncertainty refuses blind retries; it requires explicit host
+reconciliation. Lifecycle hooks must not call recovery reentrantly. Failed
+reopening never deletes a pre-existing repository or removes shared governance.
