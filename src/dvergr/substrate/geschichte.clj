@@ -10,6 +10,7 @@
             [clojure.string :as str]
             [datahike.api :as d]
             [dvergr.substrate.paths :as paths]
+            [dvergr.substrate.repository-profile :as profile]
             [dvergr.substrate.store-ids :as store-ids]
             [geschichte.git.command :as command]
             [geschichte.git.http :as git-http]
@@ -104,6 +105,77 @@
                        (cond-> {:remote remote :clone? true} branch (assoc :branch branch)))
     (git-http/clone! conn remote source)))
 
+(def ^:private recovery-token (Object.))
+
+(defn- retained-initialization-error [cleanup error & [initialization-error]]
+  ;; Recovery is an opaque JVM field, NOT closure-valued ex-data. Normal
+  ;; Throwable/ex-data wire/log projections contain only the safe descriptor.
+  (let [retained (proxy [clojure.lang.ExceptionInfo clojure.lang.IDeref]
+                        ["Repository initialization resources need recovery"
+                         {:type ::initialization-recovery-required :phase ((:phase cleanup))} (or initialization-error error)]
+                   (deref [] cleanup))]
+    (when (and initialization-error (not (identical? initialization-error error)))
+      (.addSuppressed retained error))
+    retained))
+
+(defn recover-initialization!
+  "HOST ONLY: retry a failed unpublished initializer's retained cleanup. The
+   original error holds the exact live resources privately; it is not a wire
+   DTO. Abort is retryable and must be idempotent. Release/delete uncertainty
+   requires explicit reconciliation, never a blind repeat or another writer."
+  [error]
+  (let [{:keys [token retry!] :as cleanup} (when (instance? clojure.lang.IDeref error) @error)]
+    (when-not (and (identical? recovery-token token) (fn? retry!))
+      (throw (ex-info "No retained initialization recovery" {:type ::invalid-recovery})))
+    (try (retry!)
+         (catch Throwable next-error (throw (retained-initialization-error cleanup next-error))))))
+
+(defn- initialization-cleanup [cfg conn context hooks]
+  ;; Native-resource ownership, scoped to ONE exclusive initialization call;
+  ;; not an app-state cache or fork-shared registry. The exception retains this
+  ;; closure if abort cannot positively establish that its work has joined.
+  (let [phase (atom :owned)
+        retry! (fn []
+                 (locking phase
+                   (when (= :owned @phase)
+                     (reset! phase :aborting)
+                     (try ((:abort-create! hooks) conn context)
+                          (catch Throwable error (reset! phase :owned) (throw error)))
+                     (reset! phase :joined))
+                   (when (= :joined @phase)
+                     (reset! phase :releasing)
+                     (d/release conn)
+                     (reset! phase :released))
+                   (when (= :released @phase)
+                     (reset! phase :deleting)
+                     (sdh/delete-database! cfg)
+                     (when (d/database-exists? cfg)
+                       (throw (ex-info "Initialization database deletion was incomplete"
+                                       {:type ::cleanup-delete-incomplete})))
+                     (reset! phase :cleaned))
+                   (when-not (= :cleaned @phase)
+                     (throw (ex-info "Initialization cleanup needs reconciliation before retry"
+                                     {:type ::cleanup-uncertain :phase @phase})))
+                   true))]
+    {:token recovery-token :retry! retry! :phase #(deref phase)
+     :release! (fn []
+                 (locking phase
+                   (reset! phase :releasing)
+                   (d/release conn)
+                   (reset! phase :initialized-released)))}))
+
+(defn- initialize-profile! [cfg scope profile hooks]
+  (let [conn (sdh/connect cfg)
+        context {:profile profile :scope scope :config cfg}
+        cleanup (initialization-cleanup cfg conn context hooks)
+        result (try ((:initialize! hooks) conn context) nil
+                    (catch Throwable error error))]
+    (try
+      (if result ((:retry! cleanup)) ((:release! cleanup)))
+      (catch Throwable cleanup-error
+        (throw (retained-initialization-error cleanup cleanup-error result))))
+    (when result (throw result))))
+
 (defn ensure-repository!
   "Create and seed a persistent Geschichte repository at `scope`. Existing
   repositories are left untouched. Returns the Datahike config.
@@ -111,37 +183,78 @@
   `:source` (default the sandbox stdlib) is a local checkout or a Git URL, with
   `:branch` for a local one. When the stdlib seed cannot be imported the
   repository starts empty; with `:fallback? false` (a user's repository) the
-  failure is an error and nothing is created."
+  failure is an error and nothing is created.
+
+  Trusted hosts may instead request :repository-profile from their explicit
+  :repository-profiles map. Its initializer receives a pristine connection;
+  no ordinary init/import is appended. All hooks are synchronous and must join
+  their own work before returning. Abort must be idempotent; uncertain abort
+  retains its connection through recover-initialization!. Lifecycle hooks must
+  not call recovery reentrantly. prepare-open! is restricted to synchronous
+  validation/governance registration; it must not start asynchronous work.
+  Creation requires
+  an exclusively owned fresh scope (e.g. a new room's random UUID), not an
+  exists?/create pair used as a cross-process ownership lock. Existing stores
+  are never reinitialized."
   ([scope] (ensure-repository! scope {}))
-  ([scope {:keys [source branch fallback? remote] :or {fallback? true}}]
-   (let [cfg (repository-config scope)]
+  ([scope {:keys [source branch fallback? remote repository-profile repository-profiles] :or {fallback? true}}]
+   (let [cfg (repository-config scope)
+         hooks (profile/resolve! repository-profiles repository-profile)]
+     (when (and hooks (or source branch remote))
+       (throw (ex-info "A profiled repository cannot also request a sandbox clone"
+                       {:type ::conflicting-initialization})))
      (when-not (d/database-exists? cfg)
        (when-let [parent (.getParentFile (io/file scope))]
          (.mkdirs parent))
        (d/create-database cfg)
-       (let [conn (sdh/connect cfg)]
-         (try
-           (repo/init! conn {:name "dvergr workspace"})
-           (let [source (or source (sandbox-repo))]
-             (try
-               (import-seed! conn source (or remote (if fallback? "upstream" "origin")) branch)
-               (catch Throwable error
-                 (if fallback?
-                   (fallback-workspace! conn source error)
-                   (do (d/release conn)
-                       (sdh/delete-database! cfg)
-                       (throw (ex-info (str "Could not import " source ": " (ex-message error))
-                                       {:type ::import-failed :source source}
-                                       error)))))))
-           (finally (try (d/release conn) (catch Throwable _ nil))))))
+       (if hooks
+         (initialize-profile! cfg scope repository-profile hooks)
+         (let [conn (sdh/connect cfg)]
+           (try
+             (repo/init! conn {:name "dvergr workspace"})
+             (let [source (or source (sandbox-repo))]
+               (try
+                 (import-seed! conn source (or remote (if fallback? "upstream" "origin")) branch)
+                 (catch Throwable error
+                   (if fallback?
+                     (fallback-workspace! conn source error)
+                     (do (d/release conn)
+                         (sdh/delete-database! cfg)
+                         (throw (ex-info (str "Could not import " source ": " (ex-message error))
+                                         {:type ::import-failed :source source}
+                                         error)))))))
+             (finally (try (d/release conn) (catch Throwable _ nil)))))))
      cfg)))
 
 (defn create-system
-  "Open a persistent repository as a Geschichte Yggdrasil system."
-  [& {:keys [scope system-name source]}]
+  "Open a persistent repository as a Geschichte Yggdrasil system. A trusted
+   profile's prepare-open! must succeed before the adapter can be published."
+  [& {:keys [scope system-name source repository-profile repository-profiles]}]
   (let [scope (or scope (paths/workspace-store))
-        cfg (ensure-repository! scope (cond-> {} source (assoc :source source)))]
-    (gy/create (sdh/connect cfg) {:system-name system-name})))
+        hooks (profile/resolve! repository-profiles repository-profile)
+        cfg (ensure-repository! scope (cond-> {:repository-profile repository-profile
+                                               :repository-profiles repository-profiles}
+                                        source (assoc :source source)))
+        conn (sdh/connect cfg)]
+    (try
+      (when hooks ((:prepare-open! hooks) conn {:profile repository-profile :scope scope :config cfg}))
+      (gy/create conn {:system-name system-name})
+      (catch Throwable error
+        ;; This opening attempt does not own persisted data or store-global
+        ;; governance. Never delete/ungovern a pre-existing/shared repository.
+        (try
+          (d/release conn)
+          (catch Throwable release-error
+            (throw (retained-initialization-error
+                    {:token recovery-token :phase (constantly :releasing)
+                     :retry! (fn []
+                               ;; Retain the exact handle for host diagnosis;
+                               ;; an uncertain release cannot be blindly retried.
+                               (throw (ex-info "Repository opening release needs reconciliation"
+                                               {:type ::cleanup-uncertain :phase :releasing
+                                                :store (get-in @conn [:config :store :id])})))}
+                    release-error error))))
+        (throw error)))))
 
 (defn delete-repository! [scope]
   (let [cfg (repository-config scope)]
