@@ -323,3 +323,22 @@ against the exact original metadata and grants, before live context publication.
 Its exact acknowledgement retry is idempotent. This helper is not yet wired to
 ordinary room creation and does not assert cross-store atomicity, native
 readiness evidence, automatic creation retry, or legacy migration.
+
+`dvergr.system.rooms/provision-profiled-room!` is the explicit HOST creation
+composition. It requires a bound daemon root and a non-engine host thread;
+trusted policy hooks are supplied separately from the closed intent options.
+After validating policy, it records pending intent, initializes the exclusive
+new repository, then acquires and prepares messages/repository/KB adapters in a
+private context. Mandatory resource governance precedes publication. Readiness
+CAS runs before the context enters the live registry. The returned IDs and
+paths have the same shape as ordinary room provisioning, but an existing slug
+is deliberately not success or an automatic resume.
+
+Failures retain the original error and any opaque preparation owner under the
+already durable Room ID. A changed grant refuses readiness; a lost readiness
+acknowledgement may leave durable ready state without a published context. Both
+are publication uncertainty, never an excuse to compensate potentially live
+resources. Fulltext declarations are deliberately omitted here: asynchronous
+index builds require their own explicitly owned lifecycle. This API is not an
+authorization endpoint and is not enabled by generic room creation or transport
+handlers; an embedder must select the host policy and authorize activation.
