@@ -23,6 +23,7 @@
             [clojure.java.io :as io]
             [dvergr.system.db :as sdb]
             [dvergr.system.room-preparation :as preparation]
+            [dvergr.system.room-intent :as room-intent]
             [dvergr.kb.schema :as kbs]
             [dvergr.chat.schema :as cschema]
             [dvergr.resource :as resource]
@@ -31,6 +32,7 @@
             [dvergr.scheduler.schema :as sched-schema]
             [dvergr.runtime.ctx :as rctx]
             [dvergr.substrate.geschichte :as geschichte]
+            [dvergr.substrate.repository-profile :as repository-profile]
             [geschichte.workspace :as gworkspace]
             [dvergr.substrate.paths :as paths]
             [dvergr.substrate.store-ids :as store-ids]
@@ -39,6 +41,7 @@
             [yggdrasil.adapters.datahike :as dh-adapter]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [taoensso.telemere :as tel]
             [yggdrasil.gc :as ygg-gc]
             [yggdrasil.protocols :as ygg-protocols]))
@@ -51,6 +54,9 @@
 ;; registry is Tier-1 shared (root). See `dvergr.runtime.ctx`.
 (defonce ^:private room-ctxs (atom {}))
 (defonce ^:private room-hydration-errors (atom {}))
+;; Native HOST bootstrap coordination, not forkable semantic state. Engine/
+;; child callers are refused before acquiring this process-local monitor.
+(defonce ^:private profiled-creation-lock (Object.))
 
 (defn room-ctx-for
   "The room's own execution context (created by provision/hydrate), or nil.
@@ -429,6 +435,73 @@
             {:level :error :id :rooms/hydrate-failed
              :data {:room id :error (.getMessage e)}}
             "Room hydration failed — context was withheld")))))))
+
+(defn provision-profiled-room!
+  "HOST ONLY explicit creation, not a transport/authorization API. Options are
+   the closed room-intent/create! input; trusted policies are a separate host
+   argument. Requires a bound root context and a non-engine host thread.
+
+   Records complete pending control-store intent first, prepares all owned
+   native adapters, CASes readiness, then publishes the context. Failure keeps
+   intent/data and the original recovery owner under its known room ID. An
+   existing slug is NEVER success or automatic retry. Fulltext is deliberately
+   not started here: async builds need separately owned lifecycle handling."
+  [options trusted-profiles]
+  (when (or (simple/on-drain-thread?) (not (ec/execution-context-bound?))
+            (not (identical? (ec/current-execution-context) (rctx/current-root))))
+    (throw (ex-info "Profiled Room creation requires a bound host root thread"
+                    {:type ::requires-host-root})))
+  (when-not (keyword? (:repository-profile options))
+    (throw (ex-info "Explicit repository profile is required" {:type ::invalid-repository-profile})))
+  ;; Validate the host policy BEFORE creating even control-store intent.
+  (repository-profile/resolve! trusted-profiles (:repository-profile options))
+  (locking profiled-creation-lock
+    (let [{:keys [room systems basis]} (room-intent/create! options)
+          id (:room/id room) slug (:room/slug room)
+          by-type (into {} (map (juxt :system/type identity)) systems)
+          repo-path (get-in by-type [:repo :system/scope])
+          msgs-path (get-in by-type [:msgs :system/scope])
+          kb-path (get-in by-type [:kb :system/scope])
+          profile (:repository-profile options)]
+      (try
+        ;; Initialization has its OWN reviewed opaque recovery owner. Its
+        ;; failure must also stay under this already durable Room identity.
+        (geschichte/ensure-repository! repo-path {:repository-profile profile :repository-profiles trusted-profiles})
+        (let [ctx (fork-room-ctx)
+              acquire-new! (fn [cfg]
+                             (when (d/database-exists? cfg)
+                               (throw (ex-info "New Room store scope is already populated"
+                                               {:type ::creation-scope-populated})))
+                             (sdh/connect! cfg))
+              specs [{:id (msgs-system-name msgs-path)
+                      :acquire! #(acquire-new! (msgs-cfg msgs-path))
+                      :prepare! (fn [conn]
+                                  (sdh/provision! {:conn conn :register? false :extra-schema sched-schema/schema
+                                                   :seed-tx [(merge (cschema/create-chat-entity
+                                                                     {:id (msgs-chat-id slug) :title (:room/name room)})
+                                                                    {:room/slug slug :room/type :internal})]})
+                                  (ensure-msgs-resources! conn)
+                                  (dh-adapter/create conn {:system-name (msgs-system-name msgs-path)}))}
+                     (mandatory-system-spec (get by-type :repo) trusted-profiles slug)
+                     {:id (kb-system-name kb-path)
+                      :acquire! #(acquire-new! (kb-cfg kb-path))
+                      :prepare! (fn [conn]
+                                  (sdh/provision! {:conn conn :register? false :schema? false
+                                                   :extra-schema (kbs/knowledge-datahike-schema)})
+                                  (dh-adapter/create conn {:system-name (kb-system-name kb-path)}))}]]
+          (preparation/with-prepared!
+            ctx specs
+            (fn []
+              (room-intent/mark-ready! basis)
+              (swap! room-ctxs assoc id ctx)
+              (swap! room-hydration-errors dissoc id)
+              {:room-id id :room-ctx ctx
+               :repo-id (get-in by-type [:repo :system/id]) :repo-path repo-path
+               :msgs-id (get-in by-type [:msgs :system/id]) :msgs-path msgs-path
+               :kb-id (get-in by-type [:kb :system/id]) :kb-path kb-path})))
+        (catch Throwable error
+          (swap! room-hydration-errors assoc id error)
+          (throw error))))))
 
 (defn provision-room!
   "Create a room/project with its OWN execution context (RF5 S2) holding its own
