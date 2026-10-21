@@ -118,6 +118,13 @@
       (.addSuppressed retained error))
     retained))
 
+(defn initialization-recovery-required?
+  "HOST ONLY: recognize this initializer's opaque recovery owner, never a
+   forgeable ex-data descriptor. Does not retry or release anything."
+  [error]
+  (let [{:keys [token retry!]} (when (instance? clojure.lang.IDeref error) @error)]
+    (boolean (and (identical? recovery-token token) (fn? retry!)))))
+
 (defn recover-initialization!
   "HOST ONLY: retry a failed unpublished initializer's retained cleanup. The
    original error holds the exact live resources privately; it is not a wire
@@ -226,19 +233,28 @@
              (finally (try (d/release conn) (catch Throwable _ nil)))))))
      cfg)))
 
+(defn prepare-system!
+  "HOST ONLY: prepare an ALREADY OWNED existing connection and construct its
+   adapter without registering it. This function neither acquires nor releases
+   a lease; the caller retains cleanup ownership even if preparation fails."
+  [conn {:keys [scope system-name repository-profile repository-profiles]}]
+  (let [hooks (profile/resolve! repository-profiles repository-profile)]
+    (when hooks
+      ((:prepare-open! hooks) conn {:profile repository-profile :scope scope :config (:config @conn)}))
+    (gy/create conn {:system-name system-name})))
+
 (defn create-system
   "Open a persistent repository as a Geschichte Yggdrasil system. A trusted
    profile's prepare-open! must succeed before the adapter can be published."
   [& {:keys [scope system-name source repository-profile repository-profiles]}]
   (let [scope (or scope (paths/workspace-store))
-        hooks (profile/resolve! repository-profiles repository-profile)
         cfg (ensure-repository! scope (cond-> {:repository-profile repository-profile
                                                :repository-profiles repository-profiles}
                                         source (assoc :source source)))
         conn (sdh/connect cfg)]
     (try
-      (when hooks ((:prepare-open! hooks) conn {:profile repository-profile :scope scope :config cfg}))
-      (gy/create conn {:system-name system-name})
+      (prepare-system! conn {:scope scope :system-name system-name :repository-profile repository-profile
+                             :repository-profiles repository-profiles})
       (catch Throwable error
         ;; This opening attempt does not own persisted data or store-global
         ;; governance. Never delete/ungovern a pre-existing/shared repository.

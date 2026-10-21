@@ -279,8 +279,8 @@ Initialization owns an exclusively fresh scope and receives its pristine
 connection instead of ordinary initialization/sandbox import. The host must
 join its initialization work. Reopening runs synchronous validation/governance
 registration before adapter publication; it must not start asynchronous work.
-These substrate APIs do not yet persist profiles in the room registry or
-change ordinary room creation/hydration.
+These substrate APIs themselves do not persist room profile intent or publish
+Rooms; the host bootstrap described below owns that separate boundary.
 
 Abort must be idempotent and positively join work before connection release
 or deletion. Failed abort retains the exact native resources in an opaque JVM
@@ -290,3 +290,36 @@ does not rerun initialization and is idempotent after successful cleanup.
 Release/deletion uncertainty refuses blind retries; it requires explicit host
 reconciliation. Lifecycle hooks must not call recovery reentrantly. Failed
 reopening never deletes a pre-existing repository or removes shared governance.
+
+### Profiled Room bootstrap
+
+The registry persists only a repository's keyword `:system/repository-profile`,
+never its executable hooks. `dvergr.system.rooms/hydrate-rooms!` accepts the
+trusted host's `:repository-profiles` map. A profiled Room needs exactly one
+messages system with exactly its expected room/chat identity. The bootstrap
+prepares that system's resource governance first and all profiled repository
+adapters next, before registering any mandatory adapter. Missing policy or a
+failed preparation withholds the Room; reopening never initializes a missing
+profiled repository. Several permission grants to one system are deduplicated
+by registry UUID, not by native connection object.
+
+`dvergr.system.room-preparation/with-prepared!` is an internal synchronous host
+bootstrap seam, not participant preparation or semantic world state. It records
+every acquired lease before preparation, unregisters only its exact adapters,
+and releases each acquired lease once on positively safe failure. Unknown
+registration, uncertain cleanup dispatch, or started publication retain an
+opaque private owner rather than releasing possibly live resources. Ordinary
+retry/reset cannot bypass that owner; `dvergr.system.rooms/recover-room-preparation!`
+only retries positively safe cleanup. Child contexts do not own an independent
+root lifecycle and are not closed as though they did.
+
+`dvergr.system.room-intent/create!` records pending creation intent in ONE control
+database transaction: stable Room/system/grant UUIDs, an explicit default
+repository, its profile, and owner grants. It refuses existing slugs. It does
+not open native stores or make the Room ready. Pending and unsupported-version
+intents are refused by ordinary hydration. After the host has completed owned
+native preparation, `dvergr.system.room-intent/mark-ready!` guards the transition
+against the exact original metadata and grants, before live context publication.
+Its exact acknowledgement retry is idempotent. This helper is not yet wired to
+ordinary room creation and does not assert cross-store atomicity, native
+readiness evidence, automatic creation retry, or legacy migration.

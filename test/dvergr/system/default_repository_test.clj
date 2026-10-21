@@ -14,6 +14,34 @@
 (defn- repository [name]
   (db/register-system! {:type :repo :name name :scope (str "/virtual/" (random-uuid))}))
 
+(deftest repository-lifecycle-intent-is-persisted-data-not-executable-policy
+  (with-store
+    (fn [conn]
+      (let [profile :fixture/canonical-knowledge-v1
+            called (atom false)
+            id (db/register-system! {:type :repo :name "Typed" :scope "/virtual/typed"
+                                     :repository-profile profile
+                                     :repository-profiles {profile {:initialize! #(reset! called true)}}})
+            legacy (repository "Untyped")
+            room (db/create-room! {:slug "typed-default" :default-repository-id id})]
+        (db/attach! room id :owner)
+        (is (= profile (:system/repository-profile (db/system-by-id id))))
+        (is (= profile (:system/repository-profile (db/default-repository room))))
+        (is (= profile (:system/repository-profile (first (filter #(= id (:system/id %)) (db/all-systems))))))
+        (is (nil? (:system/repository-profile (db/system-by-id legacy))))
+        (is (not @called))
+        (is (not (contains? (db/system-by-id id) :repository-profiles)))
+        (let [before @conn]
+          (doseq [options [{:type :kb :repository-profile profile}
+                           {:type :data :repository-profile profile}
+                           {:type :repo :repository-profile nil}
+                           {:type :repo :repository-profile false}
+                           {:type :repo :repository-profile "canonical"}
+                           {:type :repo :repository-profile {:initialize! identity}}]]
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (db/register-system! (merge {:name "Invalid" :scope "/virtual/nope"} options))))
+            (is (= before @conn))))))))
+
 (deftest explicit-default-needs-owner-grant-and-never-follows-attachment-order
   (with-store
     (fn [conn]
