@@ -25,11 +25,23 @@
 (defn- retained-error [state recover! error cleanup-error]
   (let [retained (proxy [clojure.lang.ExceptionInfo clojure.lang.IDeref]
                         ["Room bootstrap retains unresolved native ownership"
-                         {:type ::recovery-required :phase (:phase @state)} error]
+                         (assoc (select-keys @state [:phase :room/id]) :type ::recovery-required) error]
                    (deref [] {:token owner-token :recover! recover!}))]
     (when (and cleanup-error (not (identical? cleanup-error error)))
       (.addSuppressed retained cleanup-error))
     retained))
+
+(defn retain-registration-failure
+  "INTERNAL HOST ownership quarantine after a live Room constructor started.
+   Its context can already hold bus pumps/admission even when registration
+   threw. Retain that exact context privately; no blind reconstruction, release
+   or automatic recovery is safe without joined runtime reconciliation."
+  [room-id ctx error]
+  (let [state (atom {:phase :room-registration-uncertain :room/id room-id :ctx ctx})
+        recover! (fn []
+                   (binding [ec/*execution-context* (:ctx @state)]
+                     (refuse! :room-registration-needs-reconciliation)))]
+    (retained-error state recover! error nil)))
 
 (defn recover!
   "HOST ONLY: retry positively safe cleanup. An uncertain native dispatch or

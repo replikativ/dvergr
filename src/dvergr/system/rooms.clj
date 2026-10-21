@@ -73,6 +73,19 @@
 (defn- retained-preparation? [error]
   (or (preparation/recovery-required? error) (geschichte/initialization-recovery-required? error)))
 
+(defn retain-room-registration-failure!
+  "INTERNAL HOST failure sink, not a retry or authorization API. Preserve the
+   exact context and original constructor error in the existing ownership gate.
+   A live constructor may already have started pumps before it throws."
+  [room-id ctx error]
+  (let [held (preparation/retain-registration-failure room-id ctx error)
+        [before _] (swap-vals! room-hydration-errors assoc room-id held)
+        previous (get before room-id)]
+    ;; Never drop a predecessor owner if another lifecycle operation was also
+    ;; uncertain. No compensating teardown or attempt to reinterpret its cause.
+    (when (and previous (not (identical? previous error))) (.addSuppressed held previous))
+    held))
+
 (defn- assert-no-retained-preparation! []
   (when (some retained-preparation? (vals @room-hydration-errors))
     (throw (ex-info "Room bootstrap ownership must be reconciled before reset or release"
@@ -335,21 +348,26 @@
       (boolean (get @room-hydration-errors room-id)))
     true))
 
+(defn canonical-messages-identity?
+  "Pure bounded identity check for a prepared messages snapshot. Exactly one
+   room marker must own its expected chat ID. Other agent working ChatContexts
+   legitimately have chat IDs in this same store, but no room marker."
+  [snapshot slug]
+  (let [expected (msgs-chat-id slug)
+        identities (into [] (comp (map :e) (distinct) (take 2))
+                         (concat (take 2 (d/datoms snapshot :aevt :room/slug))
+                                 (take 2 (d/datoms snapshot :avet :chat/id expected))))]
+    (= [{:room/slug slug :chat/id expected}]
+       (mapv #(d/pull snapshot [:room/slug :chat/id] %) identities))))
+
 (defn- mandatory-system-spec
   [{:system/keys [type scope repository-profile]} repository-profiles slug]
   (case type
     :msgs {:id (msgs-system-name scope)
            :acquire! #(sdh/connect (msgs-cfg scope))
            :prepare! (fn [conn]
-                       (let [snapshot @conn
-                             ;; One identity is required. Two distinct candidate
-                             ;; EIDs already prove ambiguity: never pull a whole
-                             ;; corrupted store just to decide this predicate.
-                             identities (into [] (comp (map :e) (distinct) (take 2))
-                                              (concat (d/datoms snapshot :aevt :room/slug)
-                                                      (d/datoms snapshot :aevt :chat/id)))]
-                         (when-not (= [{:room/slug slug :chat/id (msgs-chat-id slug)}]
-                                      (mapv #(d/pull snapshot [:room/slug :chat/id] %) identities))
+                       (let [snapshot @conn]
+                         (when-not (canonical-messages-identity? snapshot slug)
                            (throw (ex-info "Mandatory messages store has a missing, foreign or ambiguous room/chat identity"
                                            {:type ::missing-message-identity :scope scope}))))
                        (ensure-msgs-resources! conn)

@@ -51,6 +51,9 @@
 (deftest profiled-hydration-prepares-real-adapters-before-publication
   (fixture
    (fn [{:keys [room-id msgs repository]}]
+     ;; Working agent ChatContexts share this store; their chat IDs are not
+     ;; additional canonical Room markers and must survive cold hydration.
+     (d/transact msgs (mapv (fn [_] {:chat/id (random-uuid) :chat/title "Agent context"}) (range 3)))
      (let [opens (atom 0)
            hooks {:initialize! (fn [& _] (throw (AssertionError. "Hydration cannot initialize")))
                   :abort-create! (fn [& _] (throw (AssertionError. "Hydration cannot delete")))
@@ -98,7 +101,7 @@
        (let [row (d/q '[:find ?e . :where [?e :room/slug _]] @msgs)]
          (case damage
            :foreign (d/transact msgs [[:db/add row :room/slug "another-room"]])
-           :extra (d/transact msgs [{:chat/id (random-uuid) :chat/title "Unrelated"}]))
+           :extra (d/transact msgs [{:chat/id (random-uuid) :room/slug "extra-room" :chat/title "Foreign room"}]))
          (let [opened (atom false)]
            (rooms/hydrate-rooms! {:repository-profiles
                                   {:fixture/knowledge {:initialize! (fn [& _]) :abort-create! (fn [& _])
