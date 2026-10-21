@@ -54,6 +54,9 @@
    {:db/ident :system/name    :db/valueType :db.type/string  :db/cardinality :db.cardinality/one}
    {:db/ident :system/owner   :db/valueType :db.type/ref     :db/cardinality :db.cardinality/one} ; party
    {:db/ident :system/scope   :db/valueType :db.type/string  :db/cardinality :db.cardinality/one} ; db-scope uuid-str | repo path
+   ;; Lifecycle intent only; executable policy is supplied by the trusted host
+   ;; on create/open, never loaded from this registry or repository content.
+   {:db/ident :system/repository-profile :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}
    {:db/ident :system/created :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}
 
    ;; --- Rooms: top-level projects ---
@@ -65,6 +68,8 @@
    {:db/ident :room/db-scope :db/valueType :db.type/string  :db/cardinality :db.cardinality/one} ; own message DB
    {:db/ident :room/default-repository :db/valueType :db.type/ref :db/cardinality :db.cardinality/one
     :db/doc "Explicit default repository selected at provisioning; not inferred from grants or names."}
+   {:db/ident :room/provisioning-state :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}
+   {:db/ident :room/provisioning-version :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
    {:db/ident :room/parties  :db/valueType :db.type/ref     :db/cardinality :db.cardinality/many} ; members
    {:db/ident :room/created  :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}
    ;; a slug claimed by the principal (dvergr.principal) that creates a room over an op,
@@ -175,14 +180,21 @@
 (defn register-system!
   "Register an attachable system (a KB, repo, …). `type` is `:kb`/`:repo`,
    `scope` is its store locator (a db-scope uuid string or a repo path),
-   `owner-id` the owning party uuid. Returns the system uuid."
-  [{:keys [type name scope owner-id]}]
+   `owner-id` the owning party uuid. A repository may carry a keyword
+   :repository-profile lifecycle intent; this does not install or run policy.
+   Returns the system uuid."
+  [{:keys [type name scope owner-id repository-profile] :as options}]
+  (when (and (contains? options :repository-profile)
+             (not (and (= :repo type) (keyword? repository-profile))))
+    (throw (ex-info "Repository profile intent requires a repository and keyword"
+                    {:type ::invalid-repository-profile})))
   (let [conn (get-conn)
         id   (java.util.UUID/randomUUID)
         owner (when owner-id [:party/id owner-id])]
     (d/transact conn [(cond-> {:system/id id :system/type type :system/name name
                                :system/scope scope :system/created (now)}
-                        owner (assoc :system/owner owner))])
+                        owner (assoc :system/owner owner)
+                        repository-profile (assoc :system/repository-profile repository-profile))])
     id))
 
 (defn system-by-id [id]
@@ -193,7 +205,7 @@
    them as yggdrasil systems on daemon boot (the composite is in-memory)."
   ([] (all-systems @(get-conn)))
   ([db]
-   (d/q '[:find [(pull ?e [:system/id :system/type :system/scope :system/name]) ...]
+   (d/q '[:find [(pull ?e [:system/id :system/type :system/scope :system/name :system/repository-profile]) ...]
           :where [?e :system/id]] db)))
 
 (defn- foreign-scope
@@ -303,7 +315,7 @@
   ([room-id] (default-repository @(get-conn) room-id))
   ([db room-id]
    (when (uuid? room-id)
-     (let [system (d/q '[:find (pull ?system [:system/id :system/type :system/name :system/scope]) .
+     (let [system (d/q '[:find (pull ?system [:system/id :system/type :system/name :system/scope :system/repository-profile]) .
                          :in $ ?id
                          :where [?room :room/id ?id]
                          [?room :room/default-repository ?system]
@@ -319,6 +331,7 @@
 ;; The full registry projection — everything the in-memory Room/UI needs.
 (def ^:private room-pull
   [:room/id :room/slug :room/name :room/type :room/db-scope
+   :room/provisioning-state :room/provisioning-version
    :room/telegram-chat-id :room/agent-ids :room/parent-slug])
 
 (defn room-by-slug [slug]

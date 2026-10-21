@@ -22,6 +22,7 @@
   (:require [datahike.api :as d]
             [clojure.java.io :as io]
             [dvergr.system.db :as sdb]
+            [dvergr.system.room-preparation :as preparation]
             [dvergr.kb.schema :as kbs]
             [dvergr.chat.schema :as cschema]
             [dvergr.resource :as resource]
@@ -35,6 +36,7 @@
             [dvergr.substrate.store-ids :as store-ids]
             [dvergr.substrate.datahike :as sdh]
             [dvergr.substrate.kontor-book :as kontor-book]
+            [yggdrasil.adapters.datahike :as dh-adapter]
             [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.engine.core :as ec]
             [taoensso.telemere :as tel]
@@ -62,6 +64,26 @@
 
 (declare clear-room-ctxs!)
 
+(defn- retained-preparation? [error]
+  (or (preparation/recovery-required? error) (geschichte/initialization-recovery-required? error)))
+
+(defn- assert-no-retained-preparation! []
+  (when (some retained-preparation? (vals @room-hydration-errors))
+    (throw (ex-info "Room bootstrap ownership must be reconciled before reset or release"
+                    {:type ::pending-room-preparation}))))
+
+(defn recover-room-preparation!
+  "HOST ONLY: finish positively safe cleanup of one withheld Room attempt.
+   Success permits a fresh hydration; uncertain dispatch/publication still
+   requires explicit reconciliation and cannot be bypassed by clearing state."
+  [room-id]
+  (let [error (get @room-hydration-errors room-id)]
+    (if (geschichte/initialization-recovery-required? error)
+      (geschichte/recover-initialization! error)
+      (preparation/recover! error))
+    (swap! room-hydration-errors dissoc room-id)
+    true))
+
 (defn release-room-stores!
   "Release the Datahike connection of every store registered in a room's
    context, all of its leases, and drop the room contexts: the daemon owns
@@ -69,6 +91,7 @@
    connection left open would be handed out again to a same-process restart.
    Best-effort per store; call once everything that writes has stopped."
   []
+  (assert-no-retained-preparation!)
   (doseq [[_ ctx] @room-ctxs]
     (binding [ec/*execution-context* ctx]
       (doseq [[_ system] (try (ygg/registered-systems) (catch Throwable _ {}))
@@ -81,6 +104,7 @@
   "Drop all per-room execution contexts. Call on daemon stop! so a same-process
    restart doesn't reuse stale forked ctxs pointing at the previous daemon root."
   []
+  (assert-no-retained-preparation!)
   (reset! room-ctxs {})
   (reset! room-hydration-errors {}))
 
@@ -289,6 +313,10 @@
     (:child-ctx (ygg/fork! {:systems :none :purpose :room}))))
 
 (defn- needs-hydration? [room-id]
+  (when-let [error (get @room-hydration-errors room-id)]
+    (when (retained-preparation? error)
+      (throw (ex-info "Reconcile retained room bootstrap ownership before retrying hydration"
+                      {:type ::pending-room-preparation :room/id room-id} error))))
   (if-let [existing (get @room-ctxs room-id)]
     (do
       ;; A transport-only restart keeps the room runtime alive. Replacing its
@@ -301,6 +329,60 @@
       (boolean (get @room-hydration-errors room-id)))
     true))
 
+(defn- mandatory-system-spec
+  [{:system/keys [type scope repository-profile]} repository-profiles slug]
+  (case type
+    :msgs {:id (msgs-system-name scope)
+           :acquire! #(sdh/connect (msgs-cfg scope))
+           :prepare! (fn [conn]
+                       (let [snapshot @conn
+                             ;; One identity is required. Two distinct candidate
+                             ;; EIDs already prove ambiguity: never pull a whole
+                             ;; corrupted store just to decide this predicate.
+                             identities (into [] (comp (map :e) (distinct) (take 2))
+                                              (concat (d/datoms snapshot :aevt :room/slug)
+                                                      (d/datoms snapshot :aevt :chat/id)))]
+                         (when-not (= [{:room/slug slug :chat/id (msgs-chat-id slug)}]
+                                      (mapv #(d/pull snapshot [:room/slug :chat/id] %) identities))
+                           (throw (ex-info "Mandatory messages store has a missing, foreign or ambiguous room/chat identity"
+                                           {:type ::missing-message-identity :scope scope}))))
+                       (ensure-msgs-resources! conn)
+                       (dh-adapter/create conn {:system-name (msgs-system-name scope)}))}
+    :repo (let [cfg (geschichte/repository-config scope)]
+            {:id (repo-system-name scope)
+             :acquire! (fn []
+                         (when-not (d/database-exists? cfg)
+                           (throw (ex-info "Profiled repository is missing; hydration cannot initialize it"
+                                           {:type ::missing-profiled-repository :scope scope})))
+                         (sdh/connect cfg))
+             :prepare! #(geschichte/prepare-system! % {:scope scope :system-name (repo-system-name scope)
+                                                       :repository-profile repository-profile
+                                                       :repository-profiles repository-profiles})})))
+
+(defn- hydrate-profiled-room! [id room-ctx systems repository-profiles slug]
+  (let [;; Attachment permissions produce several rows for one registry system.
+        ;; Collapse registry identity, NOT acquired connection identity/leases.
+        systems (vals (reduce (fn [by-id system]
+                                (let [id (:system/id system)]
+                                  (when (and (contains? by-id id) (not= system (get by-id id)))
+                                    (throw (ex-info "Conflicting registry rows for one system"
+                                                    {:type ::conflicting-system-rows :system/id id})))
+                                  (assoc by-id id system))) {} systems))
+        mandatory? #(or (= :msgs (:system/type %)) (contains? % :system/repository-profile))
+        mandatory (vec (sort-by #(if (= :msgs (:system/type %)) 0 1) (filter mandatory? systems)))
+        optional (remove mandatory? systems)]
+    (when-not (= 1 (count (filter #(= :msgs (:system/type %)) mandatory)))
+      (throw (ex-info "A profiled Room requires exactly one mandatory messages system"
+                      {:type ::missing-mandatory-messages :room/id id})))
+    (preparation/with-prepared!
+      room-ctx (mapv #(mandatory-system-spec % repository-profiles slug) mandatory)
+      (fn []
+        (swap! room-ctxs assoc id room-ctx)
+        (swap! room-hydration-errors dissoc id)))
+    ;; Existing optional best-effort adapters are not part of mandatory
+    ;; readiness. Keep their native I/O outside the publication callback.
+    (doseq [system optional] (register-system-into-current! system))))
+
 (defn hydrate-rooms!
   "Recreate each room's OWN execution context (RF5 S2) on daemon boot and
    register that room's systems INTO it — so per-room msgs/KB/repo survive a
@@ -312,32 +394,41 @@
    may retry. A new daemon root requires release-room-stores! first; hydration
    refuses to silently replace its predecessor's live contexts. Best-effort
    per newly hydrated room."
-  []
-  (doseq [{:room/keys [id]} (sdb/all-rooms)
-          :when (needs-hydration? id)]
-    (let [room-ctx (fork-room-ctx)]
-      (try
-        (binding [ec/*execution-context* room-ctx]
+  ([] (hydrate-rooms! {}))
+  ([{:keys [repository-profiles]}]
+   (doseq [{:room/keys [id slug] :as room-intent} (sdb/all-rooms)
+           :when (needs-hydration? id)]
+     (let [room-ctx (fork-room-ctx)]
+       (try
+         (when (and (or (contains? room-intent :room/provisioning-state)
+                        (contains? room-intent :room/provisioning-version))
+                    (not (and (= 1 (:room/provisioning-version room-intent))
+                              (= :ready (:room/provisioning-state room-intent)))))
+           (throw (ex-info "Room creation intent is not ready for ordinary hydration"
+                           {:type ::unready-room-intent :room/id id})))
+         (binding [ec/*execution-context* room-ctx]
           ;; The mandatory messages/accounting system is always first. If it
           ;; cannot be governed, the fresh fork has not registered any Room
           ;; systems and can be safely withheld without a separate fork-close
           ;; lifecycle (Spindel forks share their root lifecycle).
-          (doseq [{:keys [system]}
-                  (sort-by #(if (= :msgs (get-in % [:system :system/type])) 0 1)
-                           (sdb/systems-for-room id))]
-            (register-system-into-current! system)))
-        (swap! room-ctxs assoc id room-ctx)
-        (swap! room-hydration-errors dissoc id)
-        (catch Throwable e
-          (swap! room-hydration-errors assoc id e)
+           (let [systems (mapv :system (sdb/systems-for-room id))]
+             (if (some #(contains? % :system/repository-profile) systems)
+               (hydrate-profiled-room! id room-ctx systems repository-profiles slug)
+               (do
+                 (doseq [system (sort-by #(if (= :msgs (:system/type %)) 0 1) systems)]
+                   (register-system-into-current! system))
+                 (swap! room-ctxs assoc id room-ctx)
+                 (swap! room-hydration-errors dissoc id)))))
+         (catch Throwable e
+           (swap! room-hydration-errors assoc id e)
           ;; Fork contexts share the root lifecycle and are not independently
           ;; closeable. Mandatory messages governance is established before its
           ;; system is registered, so this fresh unpublished context has no
           ;; accounting system/capability to retain when that step fails.
-          ((requiring-resolve 'taoensso.telemere/log!)
-           {:level :error :id :rooms/hydrate-failed
-            :data {:room id :error (.getMessage e)}}
-           "Room hydration failed — context was withheld"))))))
+           ((requiring-resolve 'taoensso.telemere/log!)
+            {:level :error :id :rooms/hydrate-failed
+             :data {:room id :error (.getMessage e)}}
+            "Room hydration failed — context was withheld")))))))
 
 (defn provision-room!
   "Create a room/project with its OWN execution context (RF5 S2) holding its own
