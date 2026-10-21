@@ -154,10 +154,11 @@
         ;; Yggdrasil — CoW branching for git and Datahike
         ;; 0.3.46 merges a diverged Geschichte overlay three-way (#24): a fork
         ;; whose parent gained a commit meanwhile merges instead of fencing.
-        ;; Explicit owned historical overlays (#29), matching Spindel's contract.
+        ;; Independent owned cleanup leases (#30) let copied sibling overlays
+        ;; settle after their temporary source branch has already been disposed.
         ;; Keep this direct pin aligned; an old Maven pin would override it.
         org.replikativ/yggdrasil   {:git/url "https://github.com/replikativ/yggdrasil"
-                                    :git/sha "dee7438acbf428323779e6d59fc18db4aa9d7556"
+                                    :git/sha "b271739dbfa8ddbd5dfac7db314e821212cdfa00"
                                     :exclusions  [org.babashka/sci]}
 
         ;; Scriptum — CoW Lucene indices for fulltext search
