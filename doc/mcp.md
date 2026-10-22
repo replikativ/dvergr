@@ -355,7 +355,9 @@ around 40, and every definition costs context in every session.
   `job_cancel` stops it. A benchmark job's status carries `progress` (`cells-done`,
   `cells-total`, `faults`, and `phase`: `running`, `settling` while its fixture room is
   archived after the last cell, `done`) and `settled`; poll until `status` is no longer
-  `running` and `settled` is not `false`, as `room-run` does. A job is a durable Run of its room, and the attempts it starts are its
+  `running` and `settled` is not `false`, as `room-run` does. A finished experiment job whose
+  cells failed before they made an Attempt (a world setup that threw) lists them in its result's
+  `failed-runs`, each with its `run`, `reason` and `error`. A job is a durable Run of its room, and the attempts it starts are its
   child Runs, so a client can restart and poll again (`job_list`), and a job outlives the
   daemon: after a restart it reads as it finished, or `failed` with reason `orphaned` if the
   daemon stopped while it ran. A workflow runs up to `parallelism` attempts at once (default 4).
