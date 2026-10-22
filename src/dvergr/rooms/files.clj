@@ -59,7 +59,8 @@
 (def max-batch-files "How many paths one `room_write` names." 200)
 (def write-capabilities
   "Host embedding contracts supported by the canonical batch writer."
-  #{:expected-worktree :applied-receipt :file-modes :durable-publication :explicit-workspace :expected-subtree :validated-basis})
+  #{:expected-worktree :applied-receipt :file-modes :durable-publication :explicit-workspace :expected-subtree :validated-basis
+    :validated-publication-basis})
 
 ;; ---------------------------------------------------------------------------
 ;; Paths and the workspace
@@ -618,7 +619,9 @@
         expected (into {} (for [[p c] entries] [p (when (bytes? c) (str (blob/blob-id c)))]))]
     (when (and publication
                (not (and (map? publication) (map? (:identity publication))
-                         (fn? (:authorize! publication)) (fn? (:before-dispatch! publication)))))
+                         (fn? (:authorize! publication)) (fn? (:before-dispatch! publication))
+                         (or (not (contains? publication :validate-basis!))
+                             (fn? (:validate-basis! publication))))))
       (refuse "Durable publication requires host identity, authorization and journaling hooks" {}))
     ;; This monitor serializes participating Dvergr operations, not arbitrary
     ;; filesystem or external repository writers. Writer-side basis checks are
@@ -814,6 +817,15 @@
    current `:authorize!` and durable `:before-dispatch!` hooks. Repeated ops
    recover before writing. Post-dispatch uncertainty NEVER restores files or
    authorizes automatic retry; retain the journal until scoped recovery.
+
+   Optional HOST publication :validate-basis! receives the exact immutable DB
+   used to prepare final publication, after this batch's writes/staging. It must
+   return exactly true before applying admission. The prepared checkpoint is
+   atomically rechecked with receipt/ref publication. Hosts own their semantic,
+   output-fidelity and reviewed-basis checks; this callback is not authority.
+   Duplicate receipt recovery precedes it. Never accept predicates from RPC/SCI.
+   A refusal may follow intermediate worktree writes; existing conditional
+   cleanup/uncertainty rules still apply, not an inferred rollback.
 
    Optional `:expected-worktree` describes EVERY absolute batch path as an
    opened `{:content uuid :size n :mode n}` entry, or nil if absent. The SAME

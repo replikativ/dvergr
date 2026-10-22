@@ -303,6 +303,10 @@
    exact descriptor is revalidated; ambient selection is never consulted."
   ([room workspace expected message] (commit-paths-in-workspace! room workspace expected message {}))
   ([room workspace expected message {:keys [receipt? expected-modes publication required-subtree removed-paths subtree-basis stage-witness]}]
+   (when (and (map? publication) (contains? publication :validate-basis!)
+              (not (fn? (:validate-basis! publication))))
+     (throw (ex-info "An explicit publication validator must be a host function"
+                     {:type ::invalid-publication-validator})))
    (binding [ec/*execution-context* (:ctx room)]
      (let [{:keys [conn]} (git/assert-workspace-current! workspace)
            rel #(str/replace (str %) #"^/+" "")
@@ -339,8 +343,10 @@
              (let [options {:message message :author (configured-author conn)}
                    published
                    (when publication
-                     (let [{:keys [identity authorize! before-dispatch!]} publication
-                           plan (cond-> (publication/prepare conn options (mapv #(str "/" %) paths))
+                     (let [{:keys [identity authorize! before-dispatch! validate-basis!]} publication
+                           plan (cond-> (if (contains? publication :validate-basis!)
+                                          (publication/prepare conn options (mapv #(str "/" %) paths) validate-basis!)
+                                          (publication/prepare conn options (mapv #(str "/" %) paths)))
                                   required-subtree (assoc :required-subtree required-subtree))
                            _ (when-not (= index (:index plan))
                                (throw (ex-info "Staged files changed during publication preparation"

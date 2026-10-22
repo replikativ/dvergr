@@ -127,6 +127,23 @@ This does not certify rollback or arbitrary trusted-host handler I/O. Legacy
 `write!` and `write-to!` retain their prior contracts; no new executor or grant
 is introduced.
 
+Durable publication also accepts an optional trusted HOST `:validate-basis!`
+function. `dvergr.rooms.publication/prepare` captures one immutable DB, prepares
+the Geschichte commit from that exact value and passes the same value to this
+function after the batch's file writes/staging. Only literal synchronous true
+permits applying admission. The existing prepared checkpoint/max-tx guard then
+fences the final receipt/ref transaction, including a no-op. It is not a
+serialized predicate, transport capability, authority grant or second writer.
+Hosts must verify complete semantic validity, exact output identities and their
+own preservation policy. If acceptance promises the originally reviewed basis,
+they must additionally compare unchanged-file and definition read sets; fresh
+validity alone does not prove unchanged meaning. Duplicate receipt recovery is
+historical and runs before this fresh validator. A refusal may leave intermediate
+worktree writes subject to existing conditional cleanup and uncertainty rules;
+it never implies a successful rollback. `files/write-capabilities` advertises
+`:validated-publication-basis`; hosts requiring it must not silently omit it on
+older dependencies. No RPC or SCI surface accepts this function.
+
 Execution selection is separate from that registry resolver. A trusted host
 can call `dvergr.substrate.geschichte/select-workspace!` with the exact runtime
 system name in the **Run world's** context before constructing its tools.

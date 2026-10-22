@@ -114,15 +114,33 @@
        (not-any? #(str/includes? path %) ["\\" "\u0000" "//"])
        (not-any? #{"." ".." ".git"} (str/split path #"/"))))
 
+(defn- prepare* [conn options paths validate-basis!]
+  (when-not (and (coll? paths) (<= 1 (count paths) 200)
+                 (= (count paths) (count (set paths))) (every? canonical-path? paths)
+                 (or (nil? validate-basis!) (fn? validate-basis!)))
+    (throw (ex-info "Invalid publication paths or host validator" {:type ::invalid})))
+  (let [db @conn
+        plan (assoc (repo/prepare-commit (atom db) options) :publication/paths (vec (sort paths)))]
+    (when (and validate-basis! (not (true? (validate-basis! db))))
+      (throw (ex-info "Host refused prepared publication basis" {:type ::invalid-basis})))
+    plan))
+
 (defn prepare
   "Prepare publication of a host-validated file batch. The canonical writer
    must already have checked that no staged changes escape these touched paths.
-   Freeze the complete path set so fresh receipt projection cannot omit entries."
-  [conn options paths]
-  (when-not (and (coll? paths) (<= 1 (count paths) 200)
-                 (= (count paths) (count (set paths))) (every? canonical-path? paths))
-    (throw (ex-info "Invalid publication paths" {:type ::invalid})))
-  (assoc (repo/prepare-commit conn options) :publication/paths (vec (sort paths))))
+   Freeze the complete path set so fresh receipt projection cannot omit entries.
+
+   Optional trusted HOST validate-basis! receives the SAME immutable DB used by
+   prepare-commit and must synchronously return exactly true. It runs outside
+   the serialized writer, before the applying journal. The final transaction's
+   prepared checkpoint fences every intervening write. No predicate/DB/handle
+   is persisted or supplied by RPC/SCI. A callback is not itself authorization,
+   a preservation policy or proof an earlier reviewed basis remains unchanged."
+  ([conn options paths] (prepare* conn options paths nil))
+  ([conn options paths validate-basis!]
+   (when-not (fn? validate-basis!)
+     (throw (ex-info "An explicit publication validator must be a host function" {:type ::invalid})))
+   (prepare* conn options paths validate-basis!)))
 
 (defn receipt
   "Build a typed host receipt for exactly the touched regular-file entries.
