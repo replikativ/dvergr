@@ -241,6 +241,14 @@ A host adds its own ops with `ops/register-op!` (a spec entry as in `specificati
 it, the REPL's `dvergr.ops` has it, and each call is authorized as dvergr's own. A host without
 a dvergr daemon calls `ops/invoke` with `{:execution-ctx ctx}` as the daemon.
 
+The MCP host-tool projection reads one operation-registry snapshot per update.
+Replacing an operation under the same name updates its public schema, description
+and annotations; unchanged definitions do not send list-change notifications.
+Only currently registered host schemas and their JSON projections are retained,
+so registering one operation does not reconvert every unchanged schema. This
+transport cache contains no implementation or authorization decisions: handlers
+still resolve the current host, operation and principal on every invocation.
+
 ## Profiles and toolsets
 
 ### Embedding without the standalone daemon

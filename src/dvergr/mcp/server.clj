@@ -32,6 +32,7 @@
             [dvergr.rooms.facts :as facts]
             [dvergr.chat.context :as chat-context]
             [dvergr.substrate.paths :as paths]
+            [malli.json-schema :as mjs]
             [org.replikativ.spindel.engine.core :as ec]
             [jsonista.core :as json])
   (:import (java.net ServerSocket Socket)
@@ -108,25 +109,27 @@
    handler resolves the live daemon, invokes the op (which ctx-binds + calls the
    shared fn), and returns the data as JSON. Reads and writes are both exposed
    as callable tools."
-  [op {:keys [doc kind]}]
-  (let [tname (ops/op->name op)
-        annotations (surface/op-annotations op kind)]
-    {:name tname
-     :def  {:name tname :title (:title annotations) :description doc
-            :inputSchema (strict-schema (ops/input-schema op))
-            :annotations annotations
-            :dvergr/toolset (surface/tool-toolset tname op false)}
-     :handler
-     (fn [context arguments]
-       (if-let [dmn (current-daemon)]
-         (try
-           (surface/data-result (ops/invoke dmn (context-principal context) op
-                                            (cond->> (keywordize arguments)
-                                              (:room (some-> context :selection deref))
-                                              (surface/pinned-args @(:selection context)))))
-           (catch Throwable e
-             (surface/error-result (str "Error: " (.getMessage e)))))
-         (surface/error-result no-daemon)))}))
+  ([op spec]
+   (op->tool op spec (strict-schema (mjs/transform (:schema spec)))))
+  ([op {:keys [doc kind]} input-schema]
+   (let [tname (ops/op->name op)
+         annotations (surface/op-annotations op kind)]
+     {:name tname
+      :def  {:name tname :title (:title annotations) :description doc
+             :inputSchema input-schema
+             :annotations annotations
+             :dvergr/toolset (surface/tool-toolset tname op false)}
+      :handler
+      (fn [context arguments]
+        (if-let [dmn (current-daemon)]
+          (try
+            (surface/data-result (ops/invoke dmn (context-principal context) op
+                                             (cond->> (keywordize arguments)
+                                               (:room (some-> context :selection deref))
+                                               (surface/pinned-args @(:selection context)))))
+            (catch Throwable e
+              (surface/error-result (str "Error: " (.getMessage e)))))
+          (surface/error-result no-daemon)))})))
 
 (def ^:private ops-tools
   (mapv (fn [[op spec]] (op->tool op spec)) ops/specification))
@@ -291,6 +294,11 @@
   (atom (into {} (map (juxt :name :handler)) fixed-tools)))
 
 (def ^:private tools-lock (Object.))
+
+(def ^:private host-op-schemas
+  ;; Transport metadata only. Retain just CURRENT host schemas/projections,
+  ;; never implementations, authorizers, principals or room execution state.
+  (atom {}))
 
 (declare broadcast-notification!)
 
@@ -637,13 +645,27 @@
   (let [changed?
         (locking tools-lock
           (let [defs @tool-definitions
+                ;; One captured registry supplies schema, docs and kind. Looking
+                ;; up an op again while projecting could mix two registrations.
+                snapshot (into (sorted-map)
+                               (remove (fn [[op _]] (contains? ops/specification op)))
+                               (ops/operations))
+                prior-schemas @host-op-schemas
+                schemas (into {}
+                              (for [[op spec] snapshot
+                                    :let [source (:schema spec)
+                                          prior (get prior-schemas op)]]
+                                [op (if (and prior (= source (:source prior))) prior
+                                        {:source source :json (strict-schema (mjs/transform source))})]))
                 want (into (sorted-map)
-                           (for [[op spec] (ops/operations)
-                                 :when (not (contains? ops/specification op))]
-                             (let [t (op->tool op spec)] [(:name t) t])))
+                           (for [[op spec] snapshot]
+                             (let [t (op->tool op spec (:json (get schemas op)))] [(:name t) t])))
                 old (into {} (comp (filter :dvergr/host-op?) (map (juxt :name identity))) defs)
-                new (into {} (map (fn [[n t]] [n (assoc (:def t) :dvergr/host-op? true)])) want)]
-            (when (not= (keys old) (keys new))
+                new (into (sorted-map) (map (fn [[n t]] [n (assoc (:def t) :dvergr/host-op? true)])) want)]
+            ;; Successful projection evicts removed schemas; failed projection
+            ;; leaves the old published surface and its cache intact.
+            (reset! host-op-schemas schemas)
+            (when (not= old new)
               (reset! tool-definitions (into (vec (remove :dvergr/host-op? defs)) (vals new)))
               (swap! tool-handlers #(merge (apply dissoc % (keys old))
                                            (into {} (map (fn [[n t]] [n (:handler t)])) want)))
