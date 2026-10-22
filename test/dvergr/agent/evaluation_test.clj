@@ -346,6 +346,93 @@
       (finally
         (d/close-room! room)))))
 
+(defn- cancel-in-settlement-handoff
+  ([stage] (cancel-in-settlement-handoff stage nil))
+  ([stage failed-discard]
+   (let [room (test-room (keyword (str "evaluation-handoff-" (name stage))))
+         team (roster/make-agent (roster/make-roster)
+                                 {:id :candidate :program {:kind :echo}})
+         env (definition :test/handoff {})
+         group (evaluation/cleanup-group)
+         entered (promise) release (promise)
+         hire program/hire-prepared-in! observe program/observe
+         discard forks/discard-deferred!
+         verified (atom 0)
+         evaluator (assoc exact-evaluator :verify
+                          (fn [& args]
+                            (swap! verified inc)
+                            (apply (:verify exact-evaluator) args)))
+         pause! (fn [handle]
+                  (deliver entered handle)
+                  @release
+                  handle)]
+     (try
+       (with-redefs [program/hire-prepared-in!
+                     (fn [& args]
+                       (let [handle (apply hire args)]
+                         (when (= stage :admission)
+                          ;; Native work has returned, but the evaluation has
+                          ;; not received its handle. No timing assumption.
+                           @(program/result-spin handle)
+                           (pause! handle))
+                         handle))
+                     program/observe
+                     (fn [parent handle]
+                       (let [durable (observe parent handle)]
+                         (when (= stage :observation) (pause! handle))
+                         durable))
+                     forks/discard-deferred!
+                     (fn [& args]
+                       (if (and failed-discard (= :evaluation-cancelled (second args)))
+                         failed-discard
+                         (apply discard args)))]
+         (binding [ec/*execution-context* (:ctx room)]
+           (let [evaluation (evaluation/evaluate room team :candidate env evaluator {:cleanup-group group})]
+             (sp/spawn! evaluation)
+             (let [handle (deref entered 30000 ::timeout)]
+               (is (not= ::timeout handle) "The exact native handoff seam was reached")
+               (when-not (= ::timeout handle)
+                 (let [before (observe room handle)]
+                   (is (= :completed (:run/status before)))
+                   (is (= :deferred (:run/settlement-status before)))
+                   (spin-core/cancel-spin! evaluation)
+                   (deliver release true)
+                   (is (not= ::timeout
+                             (try (deref evaluation 5000 ::timeout)
+                                  (catch Throwable _ ::cancelled))))
+                   (if failed-discard
+                     (is (thrown? clojure.lang.ExceptionInfo
+                                  (evaluation/await-cleanups-for! room group 5000)))
+                     (is (true? (evaluation/await-cleanups-for! room group 5000))))
+                   (let [after (observe room handle)]
+                     (is (= (if failed-discard :deferred :discarded)
+                            (:run/settlement-status after)))
+                     (is (= (boolean failed-discard)
+                            (some? (registry/lookup (:run/world after)))))
+                     (is (zero? @verified))
+                     (is (empty? (store/-list-attempts (:store room) (:id room) {})))
+                     (is (empty? (run/active-runs (:id room)))))))))))
+       (finally
+         (deliver release true)
+        ;; The regression must leave even the OLD implementation's failed
+        ;; fixture recoverable; only these exact locally owned worlds qualify.
+         (binding [ec/*execution-context* (:ctx room)]
+           (evaluation/await-cleanups-for! room group 5000)
+           (doseq [row (run/runs room {:limit 10})
+                   :let [fork (registry/lookup (:run/world row))]
+                   :when (and fork (forks/deferred? fork))]
+             (forks/discard-deferred! fork :test-handoff-recovery)))
+         (d/close-room! room))))))
+
+(deftest cancellation-after-run-completion-before-scoring-retains-no-world
+  (cancel-in-settlement-handoff :observation))
+
+(deftest cancellation-before-a-completed-admission-handoff-retains-no-world
+  (cancel-in-settlement-handoff :admission))
+
+(deftest cancelled-admission-reports-failed-discard-with-world-still-recoverable
+  (cancel-in-settlement-handoff :admission {:ok? false :error "test discard failure"}))
+
 (deftest cancellation-during-host-scoring-cannot-certify-or-release
   (let [room (test-room :evaluation-cancel-scoring)
         team (roster/make-agent (roster/make-roster)
@@ -560,37 +647,61 @@
         team (roster/make-agent (roster/make-roster)
                                 {:id :candidate :program {:kind :echo}})
         env (definition :test/setup-timeout
-              ;; Admission now consumes this same budget; allow real fork and
-              ;; store setup before exercising the blocked setup worker.
-              {:limits {:timeout-ms 1000 :cancel-timeout-ms 2000}
+              {:limits {:timeout-ms 60000 :cancel-timeout-ms 2000}
                :world {:isolation :ctx :settlement :discard
                        :setup {:setup/id :test/slow :setup/version 1}}})
+        group (evaluation/cleanup-group)
         entered (promise)
         interrupted (promise)
+        expired-at (promise)
+        deadlines (atom [])
+        hold (java.util.concurrent.CountDownLatch. 1)
+        hire program/hire-prepared-in!
         setup (evaluation/make-world-setup
                {:id :test/slow
                 :prepare
                 (fn [_]
                   (deliver entered true)
                   (try
-                    (Thread/sleep 10000)
+                    (.await hold)
                     (catch InterruptedException error
                       (deliver interrupted true)
                       (throw error))))})]
     (try
       (binding [ec/*execution-context* (:ctx room)]
-        (let [started (System/currentTimeMillis)
-              error (try
-                      @(evaluation/evaluate room team :candidate env
-                                            exact-evaluator
-                                            {:world-setup setup})
-                      nil
-                      (catch clojure.lang.ExceptionInfo error error))]
-          (is (= true (deref entered 1000 ::timeout)))
-          (is (= true (deref interrupted 1000 ::timeout)))
-          (is (= ::evaluation/world-setup-failed
-                 (:type (ex-data error))))
-          (is (< (- (System/currentTimeMillis) started) 5000))))
+        (with-redefs-fn
+          {#'evaluation/remaining-ms
+           (fn [deadline]
+             (swap! deadlines conj deadline)
+             (if (realized? entered)
+               (do (deliver expired-at (System/nanoTime)) 0)
+               60000))
+           #'program/hire-prepared-in!
+           (fn [& args]
+             (let [handle (apply hire args)]
+               ;; Expire this SAME execution deadline only once setup has
+               ;; actually entered. Cold admission is not the latency under
+               ;; test. The wait is on the native admission worker.
+               (when-not (true? (deref entered 30000 ::timeout))
+                 (throw (ex-info "World setup did not enter" {})))
+               handle))}
+          (fn []
+            (let [error (try
+                          @(evaluation/evaluate room team :candidate env
+                                                exact-evaluator
+                                                {:world-setup setup :cleanup-group group})
+                          nil
+                          (catch clojure.lang.ExceptionInfo error error))]
+              (is (= true (deref entered 1000 ::timeout)))
+              (is (= true (deref interrupted 1000 ::timeout)))
+              (is (= ::evaluation/world-setup-failed
+                     (:type (ex-data error))))
+              (is (realized? expired-at))
+              (when (realized? expired-at)
+                (is (< (- (System/nanoTime) @expired-at) 5000000000)))
+              (is (<= 2 (count @deadlines)))
+              (is (apply = @deadlines) "setup expiry does not reset the admission deadline")
+              (is (true? (evaluation/await-cleanups-for! room group 5000)))))))
       (let [[cancelled] (run/runs room)]
         (is (= :cancelled (:run/status cancelled)))
         (is (= :world-setup-cancelled (:run/reason cancelled)))
@@ -600,6 +711,8 @@
       (is (empty? (episode/attempts room)))
       (is (empty? (run/active-runs (:id room))))
       (finally
+        (.countDown hold)
+        (evaluation/await-cleanups-for! room group 5000)
         (d/close-room! room)))))
 
 (deftest world-setup-failure-retains-recovery-when-discard-fails
@@ -920,6 +1033,9 @@
 
 (deftest admission-and-execution-share-one-budget
   (let [entered (promise) release (promise)
+        executing (promise)
+        hire program/hire-prepared-in!
+        execute @#'program/execute-deterministic-program
         deadlines (atom [])
         room (d/make-room {:id :evaluation-shared-deadline
                            :store (->BlockingStartStore (memory/make) entered release)})
@@ -934,7 +1050,22 @@
            (fn [deadline]
              ;; Admission has time; once it completes the same deadline is
              ;; exhausted. No race between wall-clock sleep and CI scheduling.
-             (if (= 1 (count (swap! deadlines conj deadline))) 60000 0))}
+             (if (= 1 (count (swap! deadlines conj deadline))) 60000 0))
+           #'program/execute-deterministic-program
+           (fn [& args]
+             (let [execution (apply execute args)]
+               (sp/spin
+                (deliver executing true)
+                (sp/await execution))))
+           #'program/hire-prepared-in!
+           (fn [& args]
+             (let [handle (apply hire args)]
+               ;; This test exercises expiry DURING execution, not the
+               ;; separately tested world-setup cancellation path. Admission
+               ;; is native work: wait here, never on the engine drain.
+               (when-not (true? (deref executing 10000 ::timeout))
+                 (throw (ex-info "Candidate did not enter execution" {})))
+               handle))}
           (fn []
             (let [result (future @(evaluation/evaluate room team :candidate env exact-evaluator))]
               (is (uuid? (deref entered 10000 ::timeout)))
@@ -998,7 +1129,7 @@
         (let [admission (with-redefs [clojure.core/future-call
                                       (fn [f] (deliver queued f) (promise))]
                           (#'evaluation/tracked-admission
-                           room group #(swap! admitted inc) (fn [_])))]
+                           room group #(swap! admitted inc) (fn [_]) (fn [_ _] {:ok? true})))]
           ((:cancel! admission))
           (is (thrown? clojure.lang.ExceptionInfo
                        (evaluation/await-cleanups-for! room group 1))
@@ -1010,28 +1141,109 @@
                        ((:await admission))))))
       (finally (d/close-room! room)))))
 
-(deftest successful-handoff-remains-owned-until-physical-completion
+(deftest cancelled-admission-remains-owned-until-physical-completion
   (let [room (test-room :tracked-admission-completion)
         group (evaluation/cleanup-group)
         returned (promise)
         observed (promise)
-        cancelled (promise)]
+        cancelled (promise)
+        discarded (atom [])]
     (try
       (binding [ec/*execution-context* (:ctx room)]
         (with-redefs [program/result-spin (fn [h] (deliver observed h) returned)]
           (let [admission (#'evaluation/tracked-admission
-                           room group (constantly :handle) #(deliver cancelled %))]
+                           room group (constantly :handle) #(deliver cancelled %)
+                           (fn [handle result]
+                             (swap! discarded conj [handle result])
+                             {:ok? true}))]
             (is (= :handle ((:await admission))))
             (is (= :handle (deref observed 5000 ::timeout)))
             ((:cancel! admission))
+            (is (false? ((:handoff! admission))) "cancellation wins the ownership transfer")
+            (is (false? ((:await-handoff admission))))
             (is (= :handle (deref cancelled 5000 ::timeout)))
             (is (thrown? clojure.lang.ExceptionInfo
                          (evaluation/await-cleanups-for! room group 1)))
             (deliver returned {:run/status :cancelled})
-            (is (true? (evaluation/await-cleanups-for! room group 5000))))))
+            (is (true? (evaluation/await-cleanups-for! room group 5000)))
+            (is (= [[:handle {:run/status :cancelled}]] @discarded)))))
       (finally
         (deliver returned {:run/status :cancelled})
         (d/close-room! room)))))
+
+(deftest scorer-transfer-cannot-be-reclaimed-by-admission-cancellation
+  (let [room (test-room :tracked-scorer-transfer)
+        group (evaluation/cleanup-group)
+        completed (promise)
+        observed (promise)
+        abandoned (atom [])]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (with-redefs [program/result-spin (fn [_] (deliver observed true) completed)]
+          (let [admission (#'evaluation/tracked-admission
+                           room group (constantly :handle)
+                           #(swap! abandoned conj [:cancel %])
+                           (fn [handle result]
+                             (swap! abandoned conj [:discard handle result])
+                             {:ok? true}))]
+            (is (= :handle ((:await admission))))
+            (is (true? (deref observed 5000 ::timeout)))
+            (is (true? ((:handoff! admission))))
+            ((:cancel! admission))
+            (is (true? ((:await-handoff admission))))
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (evaluation/await-cleanups-for! room group 1))
+                "a handoff alone is not physical Run completion")
+            (deliver completed {:run/status :completed})
+            (is (true? (evaluation/await-cleanups-for! room group 5000)))
+            (is (empty? @abandoned)
+                "only the scorer may settle or compensate after transfer"))))
+      (finally
+        (deliver completed {:run/status :completed})
+        (d/close-room! room)))))
+
+(deftest uncertified-discard-must-acknowledge-before-cleanup-join
+  (doseq [ack [{:ok? true} {:ok? false :reason :test-discard-failed} nil]]
+    (let [room (test-room (keyword (str "tracked-discard-ack-" (random-uuid))))
+          group (evaluation/cleanup-group)
+          completed (promise)
+          discarding (promise)
+          release (promise)]
+      (try
+        (binding [ec/*execution-context* (:ctx room)]
+          (with-redefs [program/result-spin (fn [_] completed)]
+            (let [admission (#'evaluation/tracked-admission
+                             room group (constantly :handle) (fn [_])
+                             (fn [handle result]
+                               (deliver discarding [handle result])
+                               @release
+                               ack))]
+              (is (= :handle ((:await admission))))
+              (deliver completed {:run/status :completed :run/settlement-status :deferred})
+              (is (thrown? clojure.lang.ExceptionInfo
+                           (evaluation/await-cleanups-for! room group 1))
+                  "completed native work is still owned before a decision")
+              ((:cancel! admission))
+              (is (= [:handle {:run/status :completed :run/settlement-status :deferred}]
+                     (deref discarding 5000 ::timeout)))
+              (is (thrown? clojure.lang.ExceptionInfo
+                           (evaluation/await-cleanups-for! room group 1))
+                  "physical discard is still in progress")
+              (deliver release true)
+              (if (true? (:ok? ack))
+                (is (true? (evaluation/await-cleanups-for! room group 5000)))
+                (let [failure (try
+                                (evaluation/await-cleanups-for! room group 5000)
+                                nil
+                                (catch clojure.lang.ExceptionInfo error error))]
+                  (is (= ::evaluation/cleanup-incomplete (:type (ex-data failure))))
+                  (is (= ack (-> failure ex-data :failures first :error ex-data :result)))))
+              (is (true? (evaluation/await-cleanups-for! room group 5000)))
+              (is (false? ((:handoff! admission)))))))
+        (finally
+          (deliver completed {:run/status :completed})
+          (deliver release true)
+          (d/close-room! room))))))
 
 (deftest failed-abandon-cannot-release-a-live-child-cleanup-gate
   (let [room (test-room :tracked-admission-abandon-error)
@@ -1045,7 +1257,8 @@
         (with-redefs [program/result-spin (fn [_] (deliver observed true) completed)]
           (let [admission (#'evaluation/tracked-admission
                            room group #(do (deliver entered true) @admit)
-                           (fn [_] (throw (ex-info "cancel transport failed" {}))))]
+                           (fn [_] (throw (ex-info "cancel transport failed" {})))
+                           (fn [_ _] {:ok? true}))]
             (is (= true (deref entered 5000 ::timeout)))
             ((:cancel! admission))
             (deliver admit :handle)

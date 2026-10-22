@@ -61,8 +61,16 @@ wallet or tearing down its resources. The group covers queued admission,
 late-admitted Runs and their physical completion, as well as detached
 certification. Cancelling the evaluation Spin does not close this boundary:
 admission finishes without interruption, its arriving Run is cancelled, and
-the barrier remains until Run cleanup and resource return complete. A timeout
+the barrier remains until Run cleanup and resource return complete. A completed
+Run is not yet a settlement handoff: admission keeps responsibility for its
+uncertified deferred world until a registered certification worker accepts it.
+Cancellation before that transfer joins the Run and discards that exact world;
+after transfer, the certification worker alone owns compensation or settlement.
+Both paths remain registered until physical cleanup is acknowledged. A timeout
 or cleanup error throws; it is not evidence that resources are safe to release.
+Experiments also register their admission controller before submitting cells.
+The barrier joins its actual completion, not merely its posted cancellation
+request, then includes any evaluation cleanup tasks the controller started late.
 The group identifies an operation, not a permanently closed scope: do not
 start another evaluation in that group concurrently with its final join.
 
