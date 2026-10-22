@@ -701,12 +701,21 @@
                                    rows))
                 :experiment
                 ;; The Scorecard of this job's experiment: a room may keep several.
-                (let [exps (or (some-> (get @job-experiments id) hash-set)
-                               (->> (run/runs room-value {:root-run-id id :limit 1000})
-                                    (filter #(= id (:run/parent %)))
+                (let [cells (->> (run/runs room-value {:root-run-id id :limit 1000})
+                                 (filter #(= id (:run/parent %))))
+                      exps (or (some-> (get @job-experiments id) hash-set)
+                               (->> cells
                                     (keep #(attempts/attempt room-value (:run/id %)))
                                     (keep #(get-in % [:attempt/receipt :attempt/metrics :experiment-content-id]))
                                     set))
+                      ;; A cell whose world setup failed has a failed Run and
+                      ;; no Attempt, so no progress row: without these the
+                      ;; job reads as completed with nothing to show.
+                      failed (->> cells
+                                  (filter #(= :failed (:run/status %)))
+                                  (remove #(attempts/attempt room-value (:run/id %)))
+                                  (mapv (fn [r] (cond-> {:run (id->str (:run/id r)) :error (:run/error r)}
+                                                  (:run/reason r) (assoc :reason (name (:run/reason r)))))))
                       sc (some #(first (experiment/scorecards room-value {:experiment-content-id % :limit 1}))
                                exps)]
                   (cond-> {:room (id->str (:id room-value))}
@@ -715,7 +724,8 @@
                     (= 1 (count exps)) (assoc :experiment (str (first exps)))
                     sc (assoc :summary (:scorecard/summary sc)
                               :scorecard (str (:scorecard/content-id sc)))
-                    (nil? sc) (assoc :incomplete (experiment/progress room-value))))
+                    (nil? sc) (assoc :incomplete (experiment/progress room-value))
+                    (seq failed) (assoc :failed-runs failed)))
                 nil)))))
 
 (defn- refused-reason

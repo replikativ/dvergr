@@ -447,6 +447,33 @@
                 (is (= ["room"] (:verifier-trust (ops/invoke *daemon* dvergr.principal/local-principal :scorecard/detail
                                                              {:room (:room started) :id (:id sc)}))))))))))))
 
+(deftest a-benchmark-whose-world-setup-fails-says-why
+  ;; Such a cell leaves a failed Run and no Attempt: the job used to read as
+  ;; completed with an empty progress and no error anywhere but run_list.
+  (let [r (ops/resolve-room *daemon* (:id (ops/invoke *daemon* dvergr.principal/local-principal :room/create
+                                                      {:title "Setup fails" :slug "setup-fails"})))]
+    (catalog/seed! r {"/workflows/broken-setup/workflow.edn"
+                      (pr-str {:title "Broken setup" :task "Write /out/a.md." :capture ["/out"]})
+                      "/workflows/broken-setup/checker.clj"
+                      "(ns c) (defn check [_] {:checks {:ok? true} :reward 1.0})"
+                      "/workflows/broken-setup/gold.edn" "{}"
+                      "/workflows/broken-setup/fixtures/brief.md" "Write a."})
+    (with-redefs [room-wf/world-setup
+                  (fn [_]
+                    ((requiring-resolve 'dvergr.agent.evaluation/make-world-setup)
+                     {:id :test/broken-setup :version 1 :basis {}
+                      :prepare (fn [_] (throw (ex-info "fixtures could not be installed" {})))}))]
+      (let [started (ops/invoke *daemon* dvergr.principal/local-principal :catalog/benchmark
+                                {:workflow "setup-fails/broken-setup" :models ["claude-haiku-4-5"]})
+            done (loop [n 0]
+                   (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status {:job (:id started) :wait-ms 20000})]
+                     (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))
+            failed (get-in done [:result :failed-runs])]
+        (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
+        (is (seq failed) (pr-str (:result done)))
+        (is (every? #(= "world-setup-failed" (:reason %)) failed) (pr-str failed))
+        (is (every? #(str/includes? (str (:error %)) "fixtures could not be installed") failed) (pr-str failed))))))
+
 (deftest a-table-of-cases-becomes-a-certified-workflow
   (let [room (:id (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:title "Books" :slug "books"}))
         r (ops/resolve-room *daemon* room)]
