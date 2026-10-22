@@ -458,6 +458,8 @@
   "HOST ONLY explicit creation, not a transport/authorization API. Options are
    the closed room-intent/create! input; trusted policies are a separate host
    argument. Requires a bound root context and a non-engine host thread.
+   :type defaults to :project; :personal-ai requires :owner-id. The requested
+   type is recorded before native initialization and retained at publication.
 
    Records complete pending control-store intent first, prepares all owned
    native adapters, CASes readiness, then publishes the context. Failure keeps
