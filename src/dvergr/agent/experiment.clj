@@ -510,53 +510,59 @@
    cells (structured cancellation). The first cell that rejects rejects the
    whole and cancels the rest; cells that contain their failures (complete-only
    experiments) never reject. Each cell's outcome is delivered to its own
-   deferred and read back in cell order."
-  [cell-fns parallelism]
-  (let [cell-fns (vec cell-fns)
-        n (count cell-fns)]
-    (if (zero? n)
-      (sp/spin [])
-      (sp/spin
-       (let [outcomes (vec (repeatedly n sync/deferred))
+   deferred and read back in cell order. The optional host `track-controller!`
+   registers physical cleanup ownership before the first cell is submitted."
+  ([cell-fns parallelism] (run-admitted cell-fns parallelism nil))
+  ([cell-fns parallelism track-controller!]
+   (let [cell-fns (vec cell-fns)
+         n (count cell-fns)]
+     (if (zero? n)
+       (sp/spin [])
+       (sp/spin
+        (let [outcomes (vec (repeatedly n sync/deferred))
              ;; the first cell to fail, whichever finishes first: a fail-fast
              ;; experiment stops there, not at the failure's turn in order
-             first-failure (sync/deferred)
-             failed? (atom false)
-             admission (work/parallel {:concurrency (max 1 parallelism)
-                                       :capacity n :ingress-capacity n}
-                                      (fn [i]
-                                        (work/task
-                                         (let [outcome (try {:ok (sp/await ((nth cell-fns i)))}
-                                                            (catch Throwable e {:error e}))]
-                                           (when (and (:error outcome) (compare-and-set! failed? false true))
-                                             (sync/deliver! first-failure (:error outcome)))
-                                           (sync/deliver! (nth outcomes i) outcome)
-                                           outcome))))]
-         (try
-           (doseq [i (range n)]
-             (when-not (work/submit! admission i)
-               (throw (ex-info "Experiment cell not admitted" {:type ::cell-not-admitted :cell i}))))
-           (work/close! admission)
-           (let [values (sp/await
-                         (comb/race
-                          (sp/spin
-                           (loop [i 0 acc (transient [])]
-                             (if (= i n)
-                               (persistent! acc)
-                               (let [{:keys [ok error]} (sp/await (nth outcomes i))]
-                                 (if error
-                                   (throw error)
-                                   (recur (inc i) (conj! acc ok)))))))
-                          (sp/spin (throw (sp/await first-failure)))))]
-             (sp/await (work/completion admission))
-             values)
-           (catch Throwable e
-             (work/cancel! admission)
-             (throw e))
-           (finally
+              first-failure (sync/deferred)
+              failed? (atom false)
+              admission (work/parallel {:concurrency (max 1 parallelism)
+                                        :capacity n :ingress-capacity n}
+                                       (fn [i]
+                                         (work/task
+                                          (let [outcome (try {:ok (sp/await ((nth cell-fns i)))}
+                                                             (catch Throwable e {:error e}))]
+                                            (when (and (:error outcome) (compare-and-set! failed? false true))
+                                              (sync/deliver! first-failure (:error outcome)))
+                                            (sync/deliver! (nth outcomes i) outcome)
+                                            outcome))))]
+          (try
+           ;; Register the host's physical completion edge BEFORE any cell can
+           ;; start. A fail-fast error may return before posted cancellation is
+           ;; processed; its cleanup group must still own this controller.
+            (when track-controller! (track-controller! admission))
+            (doseq [i (range n)]
+              (when-not (work/submit! admission i)
+                (throw (ex-info "Experiment cell not admitted" {:type ::cell-not-admitted :cell i}))))
+            (work/close! admission)
+            (let [values (sp/await
+                          (comb/race
+                           (sp/spin
+                            (loop [i 0 acc (transient [])]
+                              (if (= i n)
+                                (persistent! acc)
+                                (let [{:keys [ok error]} (sp/await (nth outcomes i))]
+                                  (if error
+                                    (throw error)
+                                    (recur (inc i) (conj! acc ok)))))))
+                           (sp/spin (throw (sp/await first-failure)))))]
+              (sp/await (work/completion admission))
+              values)
+            (catch Throwable e
+              (work/cancel! admission)
+              (throw e))
+            (finally
              ;; cancelled while awaiting: the cells go with it (a no-op once
              ;; the controller has drained)
-             (work/cancel! admission))))))))
+              (work/cancel! admission)))))))))
 
 (defn passed?
   "The pass criterion of a cell: every check of its receipt held. A Scorecard
@@ -972,7 +978,8 @@
                           ;; complete-only cells contain their failures, so
                           ;; every cell runs; a fail-fast experiment stops at
                           ;; the first cell that fails, cancelling the rest
-                          (sp/await (run-admitted cell-fns parallelism)))
+                          (sp/await (run-admitted cell-fns parallelism
+                                                  #(evaluation/track-controller! room cleanup-group %))))
             errors (filterv :error results)
             refused (filterv :refused results)]
         (when (and (seq errors) (not complete-only?))

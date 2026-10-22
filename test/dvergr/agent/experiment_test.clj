@@ -8,6 +8,7 @@
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.observation :as observation]
+            [dvergr.agent.program :as program]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
             [dvergr.chat.agent :as chat-agent]
@@ -19,7 +20,10 @@
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms.forks :as forks]
             [hasch.core :as hasch]
-            [org.replikativ.spindel.engine.core :as ec])
+            [org.replikativ.spindel.core :as sp]
+            [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.spin.sync :as sync]
+            [org.replikativ.spindel.work :as work])
   (:import [java.util.concurrent CountDownLatch TimeUnit]))
 
 (defn- environment
@@ -389,6 +393,68 @@
                     (d/discard fork))))))))
       (finally
         (d/close-room! room)))))
+
+(deftest fail-fast-cleanup-owns-controller-before-late-native-admission
+  (let [{:keys [team definition]} (fixture)
+        room (d/make-room {:id :experiment-controller-cleanup :store (memory/make)})
+        group (evaluation/cleanup-group)
+        cancel work/cancel! evaluate evaluation/evaluate hire program/hire-prepared-in!
+        controller (promise) late-entered (promise) late-return (promise)
+        calls (atom 0)]
+    (binding [ec/*execution-context* (:ctx room)]
+      (let [release (sync/deferred)]
+        (try
+          (with-redefs [work/cancel! (fn [admission]
+                                      ;; Model the real posted-cancellation
+                                      ;; window without blocking the drain.
+                                       (deliver controller admission)
+                                       true)
+                        evaluation/evaluate
+                        (fn [& args]
+                          (sp/spin
+                           ;; Validation constructs Spins without executing
+                           ;; them. Count only actual admitted cell bodies.
+                           (if (= 1 (swap! calls inc))
+                             (throw (ex-info "deliberate early failure" {}))
+                             (do (sp/await release)
+                                 (sp/await (apply evaluate args))))))
+                        program/hire-prepared-in!
+                        (fn [& args]
+                          (let [handle (apply hire args)]
+                            (deliver late-entered handle)
+                            @late-return
+                            handle))]
+            (let [failed (future
+                           (try
+                             @(experiment/run room team definition
+                                              {(:ref exact-evaluator) exact-evaluator}
+                                              {:parallelism 1 :cleanup-group group})
+                             ::unexpected
+                             (catch Throwable _ ::failed)))
+                  admission (deref controller 30000 ::timeout)]
+              (is (not= ::timeout admission))
+              (is (= ::failed (deref failed 5000 ::timeout)))
+              (is (empty? (run/runs room)))
+              (is (thrown? clojure.lang.ExceptionInfo
+                           (evaluation/await-cleanups-for! room group 1))
+                  "An empty evaluation-task scan cannot release a live controller")
+              (sync/deliver! release true)
+              (let [handle (deref late-entered 10000 ::timeout)]
+                (is (not= ::timeout handle))
+                (when-not (= ::timeout admission) (cancel admission))
+                (deliver late-return true)
+                (is (true? (evaluation/await-cleanups-for! room group 10000)))
+                (is (empty? (run/active-runs (:id room))))
+                (is (empty? (store/-list-attempts (:store room) (:id room) {})))
+                (doseq [row (run/runs room)]
+                  (is (= :discarded (:run/settlement-status row)))
+                  (is (nil? (registry/lookup (:run/world row))))))))
+          (finally
+            (sync/deliver! release true)
+            (deliver late-return true)
+            (when (realized? controller) (cancel @controller))
+            (evaluation/await-cleanups-for! room group 10000)
+            (d/close-room! room)))))))
 
 (deftest later-cell-failure-leaves-no-retained-run-worlds
   (let [{:keys [team definition]} (fixture)
