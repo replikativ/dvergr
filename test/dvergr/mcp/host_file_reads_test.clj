@@ -16,7 +16,8 @@
             [muschel.fs :as fs]
             [muschel.fs.geschichte :as mounted]
             [org.replikativ.spindel.engine.core :as ec]
-            [org.replikativ.spindel.engine.impl.simple :as simple]))
+            [org.replikativ.spindel.engine.impl.simple :as simple])
+  (:import [java.util.concurrent CountDownLatch]))
 
 (def ^:private versions ["2024-11-05" "2025-03-26" "2025-06-18" "2025-11-25" "2026-07-28"])
 (def ^:private alice {:principal/id "party/explicit-alice" :principal/kind :human
@@ -67,6 +68,52 @@
                           :room-files {:resolve-read resolver}}}]
        (with-redefs [server/current-daemon (constantly host)]
          (f {:room room :host host :owned owned :other other :stamp stamp :calls calls :allowed? allowed?}))))))
+
+(deftest captured-host-lifetime-covers-resource-authorization-through-actual-body-fetch
+  (with-host
+    true
+    (fn [{:keys [room host]}]
+      (let [ready (atom true) active (atom false) entries (atom 0)
+            entered (promise) gate (CountDownLatch. 1)
+            blocking (atom false) reads (atom 0) authorizations (atom 0)
+            read! files/read-file-in authorize (get-in host [:config :auth :authorize])
+            host (-> host
+                     (assoc-in [:config :auth :authorize]
+                               (fn [& args] (is @active) (swap! authorizations inc) (apply authorize args)))
+                     (assoc-in [:config :host-lifecycle :with-operation]
+                               (fn [f]
+                                 (when-not @ready (throw (ex-info "Exact owner retired" {})))
+                                 (swap! entries inc)
+                                 (reset! active true)
+                                 (try (f) (finally (reset! active false))))))
+            send (session "2026-07-28" alice)
+            args {:room (name (:id room)) :path "identity.txt"}
+            uri (str "room://" (:room args) "/files/identity.txt")]
+        (with-redefs [server/current-daemon (constantly host)
+                      files/read-file-in (fn [& args]
+                                           (is @active "lifetime remains owned AFTER resolver returned its DB")
+                                           (swap! reads inc)
+                                           (when @blocking (deliver entered true) (.await gate))
+                                           (apply read! args))]
+          (is (= "room-repo-owned" (:text (data (tool send "room_read" args)))))
+          (is (= 1 @entries))
+          (reset! blocking true)
+          (let [result (future (send "resources/read" {:uri uri}))]
+            (try
+              (is (= true (deref entered 3000 ::timeout)))
+              (is @active)
+              (is (not (realized? result)))
+              (reset! ready false)
+              (let [before-reads @reads before-auth @authorizations
+                    refused (send "resources/read" {:uri uri})]
+                (is (some? (:error refused)))
+                (is (= before-reads @reads))
+                (is (= before-auth @authorizations) "retired captured host cannot even authorize"))
+              (.countDown gate)
+              (is (= "room-repo-owned" (get-in (deref result 3000 {}) [:result :contents 0 :text])))
+              (is (false? @active))
+              (is (= 2 @entries))
+              (finally (.countDown gate) (deref result 3000 nil)))))))))
 
 (deftest tools-and-both-resource-paths-share-one-owned-snapshot-in-every-protocol
   (doseq [owned-first? [true false]]

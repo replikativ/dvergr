@@ -1238,6 +1238,7 @@
   ([room {:keys [close-context?] :or {close-context? true}}]
    (when (and room (not= :closed (get-in @(:meta room)
                                          [fork-transfer-state-key :state])))
+     (preparation/assert-not-host-owner! room)
      (let [fence-token* (volatile! nil)]
        (try
          (drain-room-listeners! room :close #(vreset! fence-token* %))

@@ -262,6 +262,24 @@ process-level listener configuration, not forkable room state. At shutdown,
 stop the listener before `(server/set-host! nil)`. Without a host, MCP resolves
 the standalone daemon as before.
 
+An embedder may configure `[:config :host-lifecycle :with-operation]` with a
+trusted `(fn [f] ...)` that retains its **original** application owner through
+the synchronous call. `dvergr.ops/invoke` wraps authorization, execution and
+result filtering; the MCP file-resource path wraps authorization through actual
+body fetching, including directory fallback. Wrapping only the file resolver
+is insufficient because its returned immutable DB is still used afterward.
+Malformed configured hooks refuse. When absent, standalone behavior is unchanged.
+
+The hook must invoke its body exactly once on the calling thread; saved,
+deferred and repeated forwarding is refused. It provides no authority, executor
+or automatic shutdown coordinator. Operations must return resource-independent
+results: lazy/deferred native access after return is outside this lifetime.
+The embedder must close admission and
+physically join its calls before releasing the captured host/root, and an old
+captured host must refuse after retirement rather than borrowing a replacement
+installation. This seam does not own subscriptions, arbitrary coding tools or
+detached background jobs: those still require their existing lifecycle owners.
+
 A connection sees one selection of tools, chosen by `--profile` / `--toolsets` (the relay puts
 them into `initialize` `_meta` as `dvergr/profile` and `dvergr/toolsets`). Tools outside it are
 neither listed nor callable.

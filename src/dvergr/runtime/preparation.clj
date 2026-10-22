@@ -1,5 +1,5 @@
 (ns dvergr.runtime.preparation
-  "Process-local, physically joined preparation leases for joined participants.
+  "Process-local, physically joined participant and HOST operation leases.
    These are runtime resources, never copied into a child Room's metadata."
   (:require [dvergr.room.registry :as registry]
             [org.replikativ.spindel.engine.core :as ec]
@@ -24,6 +24,86 @@
             (:participant/incarnation current))
          (identical? (:active participant) (:active current))
          (not= :dvergr.discourse/participant-closed @(:active participant)))))
+
+(defn- assert-not-self-drain! [room leases]
+  (when (some #(and (= :host-operation (:kind %))
+                    (identical? (Thread/currentThread) (:thread %))) leases)
+    (throw (ex-info "A HOST operation cannot drain itself"
+                    {:type ::self-drain :room-id (:id room)})))
+  nil)
+
+(defn assert-not-host-owner!
+  "Refuse self-drain before fencing or cancelling any Room work."
+  [room]
+  (locking (:meta room)
+    (assert-not-self-drain! room (vals (get @(:meta room) leases-key))))
+  nil)
+
+(defn with-host-current!
+  "Run a short synchronous decision on the owning thread while the exact HOST
+   lease remains current. Not permission; never block or release resources here."
+  [{:keys [room state id thread] :as lease} f]
+  (locking (:meta room)
+    (when-not (and (= :host-operation (:kind lease))
+                   (identical? thread (Thread/currentThread))
+                   (identical? lease (get-in @(:meta room) [leases-key id]))
+                   (= :pending @state)
+                   (binding [ec/*execution-context* (:ctx room)]
+                     (identical? room (registry/lookup (:id room))))
+                   (admitted? room)
+                   (nil? (:dvergr/fork-transfer-state @(:meta room))))
+      (throw (ex-info "HOST operation is no longer current"
+                      {:type ::stale-host-operation :room-id (:id room)})))
+    (f)))
+
+(defn with-host-operation!
+  "Own synchronous HOST resource access before dispatch, through physical exit.
+   `f` receives its private lease and must physically join any work it starts
+   before returning or throwing. Detached asynchronous native access is invalid.
+   No executor, participant, permission or context rebinding is supplied.
+
+   Room cancellation requests interruption but retains ownership until finally.
+   The retirement gate prevents stale drain snapshots from interrupting a pooled
+   calling thread after this operation returned. Never call on an engine drain."
+  [room f]
+  (when (simple/on-drain-thread?)
+    (throw (ex-info "HOST operations require a worker thread"
+                    {:type ::blocking-host-operation :room-id (:id room)})))
+  (when-not (fn? f)
+    (throw (ex-info "HOST operation requires a function" {})))
+  (let [thread (Thread/currentThread)
+        active (atom true)
+        completion (promise)
+        lease {:id (random-uuid) :kind :host-operation :room room :thread thread
+               :state (atom :pending)
+               :cancel! #(locking active (when @active (.interrupt thread)))
+               :finished? #(realized? completion)
+               :join! (fn [timeout-ms]
+                        (when-not (true? (deref completion timeout-ms nil))
+                          (throw (ex-info "HOST operation has not physically exited"
+                                          {:type ::unconfirmed-drain}))))}]
+    (locking (:meta room)
+      (prune! room)
+      (when-not (and (binding [ec/*execution-context* (:ctx room)]
+                       (identical? room (registry/lookup (:id room))))
+                     (admitted? room)
+                     (nil? (:dvergr/fork-transfer-state @(:meta room))))
+        (throw (ex-info "HOST operation admission is closed"
+                        {:type ::admission-closed :room-id (:id room)})))
+      (when (>= (count (get @(:meta room) leases-key)) max-room-preparations)
+        (throw (ex-info "HOST operation capacity exhausted"
+                        {:type ::capacity-exhausted :room-id (:id room)})))
+      (swap! (:meta room) assoc-in [leases-key (:id lease)] lease))
+    (try
+      (f lease)
+      (finally
+        (locking active (reset! active false))
+        (try
+          (locking (:meta room)
+            (when (identical? lease (get-in @(:meta room) [leases-key (:id lease)]))
+              (swap! (:meta room) update leases-key dissoc (:id lease))))
+          ;; No Room/native access follows this final acknowledgement.
+          (finally (deliver completion true)))))))
 
 (defn admit!
   "Retain a lease BEFORE dispatch. `cancel!` must not block; `join!` must join
@@ -84,6 +164,7 @@
   nil)
 
 (defn- drain! [room leases]
+  (assert-not-self-drain! room leases)
   (when (and (simple/on-drain-thread?) (seq leases))
     (throw (ex-info "Cannot join participant preparation on the engine"
                     {:type ::blocking-drain :room-id (:id room)})))
@@ -110,7 +191,8 @@
 
 (defn drain-agent! [room agent-id]
   (drain! room (locking (:meta room)
-                 (vec (filter #(= agent-id (:agent-id %))
+                 (vec (filter #(and (not= :host-operation (:kind %))
+                                    (= agent-id (:agent-id %)))
                               (vals (get @(:meta room) leases-key)))))))
 
 (defn drain-participant! [room participant]
@@ -133,7 +215,7 @@
 (defn assert-agent-quiescent! [room agent-id]
   (locking (:meta room)
     (prune! room)
-    (when (some #(= agent-id (:agent-id %))
+    (when (some #(and (not= :host-operation (:kind %)) (= agent-id (:agent-id %)))
                 (vals (get @(:meta room) leases-key)))
       (throw (ex-info "Agent has live participant preparation"
                       {:type ::not-quiescent :room-id (:id room) :agent-id agent-id}))))

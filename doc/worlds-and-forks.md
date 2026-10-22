@@ -81,6 +81,23 @@ This resolver is not permission to publish: callers must still check the human's
 current permissions, the full retained target identity and expected file state
 at each publication effect.
 
+Blocking trusted HOST work can hold an exact Room lifetime using
+`dvergr.runtime.preparation/with-host-operation!`. It registers before invoking
+the synchronous body, shares the bounded preparation lease table, and is joined
+by Room close and unregister. Fork and replacement refuse outstanding work.
+It does not join an agent, rebind context, create an executor or grant permission.
+The body must physically join any resource work it starts before returning or
+throwing; detached asynchronous access is outside this contract. Applications
+also own their outer installation and root lifetime separately.
+
+Cancellation requests interruption, not completion. The lexical finalizer
+retires its interrupt target before releasing ownership, so an old drain
+snapshot cannot interrupt a later job reusing the thread. Agent-specific drains
+do not select HOST leases. A HOST operation cannot drain itself; Room close
+refuses this at entry, before quiescing listeners. A short owner-thread decision
+can use `dvergr.runtime.preparation/with-host-current!` to refuse cancelled,
+replaced or closing Room incarnations, but still needs ordinary authority checks.
+
 To publish to that exact resolved system without changing a Room's execution
 selection, trusted hosts can use `dvergr.rooms.files/write-to!` with the Room,
 its exact registered Geschichte object, the file batch and ordinary write

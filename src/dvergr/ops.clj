@@ -62,6 +62,7 @@
             [dvergr.discourse :as d]
             [dvergr.model.registry :as reg]
             [dvergr.principal :as principal]
+            [dvergr.runtime.host-lifetime :as host-lifetime]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.yggdrasil :as ygg]
@@ -2099,17 +2100,19 @@
    the seams, a `:config` with `:auth`: a host without a dvergr daemon passes
    `{:execution-ctx ctx}` and configures the seams with `principal/configure!`."
   [daemon principal op args]
-  (when-not (map? principal)
-    (throw (ex-info "invoke needs a principal (dvergr.principal)" {:type ::no-principal :op op})))
-  (when (principal/forged-local? principal)
-    (op-error! "A principal of kind :local that is not the process's is refused"
-               ::principal/denied 403 {:op op}))
-  (if-let [{:keys [impl]} (get (operations) op)]
-    (let [args (or args {})]
-      (authorize! daemon principal op args)
-      (let [result (binding [*principal* principal] (impl daemon args))
-            filt (:filter (authz-decl op))]
-        (if (and filt (not (principal/local? principal)))
-          (filt #(visible? daemon principal op %) result)
-          result)))
-    (throw (ex-info (str "Unknown op: " op) {:op op}))))
+  (host-lifetime/call daemon
+                      (fn []
+                        (when-not (map? principal)
+                          (throw (ex-info "invoke needs a principal (dvergr.principal)" {:type ::no-principal :op op})))
+                        (when (principal/forged-local? principal)
+                          (op-error! "A principal of kind :local that is not the process's is refused"
+                                     ::principal/denied 403 {:op op}))
+                        (if-let [{:keys [impl]} (get (operations) op)]
+                          (let [args (or args {})]
+                            (authorize! daemon principal op args)
+                            (let [result (binding [*principal* principal] (impl daemon args))
+                                  filt (:filter (authz-decl op))]
+                              (if (and filt (not (principal/local? principal)))
+                                (filt #(visible? daemon principal op %) result)
+                                result)))
+                          (throw (ex-info (str "Unknown op: " op) {:op op}))))))
