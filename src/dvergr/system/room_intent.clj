@@ -41,13 +41,18 @@
 
 (defn create!
   "Create ONE atomic registry intent, with stable UUIDs, default and owner
-   grants. Refuses an existing slug rather than adopting/reclassifying it.
+   grants. Optional :type is :project (default), :personal-ai or :group;
+   personal rooms require an owner. The type is part of the atomic intent and
+   readiness CAS, never a post-publication reclassification.
+   Refuses an existing slug rather than adopting/reclassifying it.
    The host must install schema and serialize native provisioning separately."
-  [{:keys [slug name owner-id repository-profile] :as options}]
-  (when-not (and (map? options) (every? #{:slug :name :owner-id :repository-profile} (keys options))
+  [{:keys [slug name owner-id repository-profile] room-type :type :as options}]
+  (when-not (and (map? options) (every? #{:slug :name :owner-id :repository-profile :type} (keys options))
                  (string? slug) (<= 1 (count slug) 256) (not (str/blank? slug))
                  (or (nil? name) (and (string? name) (<= (count name) 512)))
-                 (or (nil? owner-id) (uuid? owner-id)) (keyword? repository-profile))
+                 (or (nil? owner-id) (uuid? owner-id)) (keyword? repository-profile)
+                 (or (not (contains? options :type)) (#{:project :personal-ai :group} room-type))
+                 (or (not= :personal-ai room-type) (uuid? owner-id)))
     (refuse! :invalid-host-options))
   (let [conn (db/get-conn) room-id (random-uuid) at (java.util.Date.)
         systems (mapv (fn [type]
@@ -58,7 +63,7 @@
                           owner-id (assoc :system/owner [:party/id owner-id])
                           (= :repo type) (assoc :system/repository-profile repository-profile))) [:repo :msgs :kb])
         repo-id (:system/id (first systems))
-        room (cond-> {:room/id room-id :room/slug slug :room/name (or name slug) :room/type :project
+        room (cond-> {:room/id room-id :room/slug slug :room/name (or name slug) :room/type (or room-type :project)
                       :room/created at :room/db-scope (str (random-uuid))
                       :room/default-repository [:system/id repo-id]
                       :room/provisioning-state :pending :room/provisioning-version 1}

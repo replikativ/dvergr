@@ -93,10 +93,40 @@
           (is (= before @conn))
           (is (= [:initialize :prepare-open] @events)))))))
 
+(deftest personal-room-is-owned-and-typed-before-native-initialization
+  (with-fixture
+    (fn [{:keys [conn]}]
+      (let [owner (random-uuid)
+            events (atom [])
+            profile (policies events)
+            initialize! (get-in profile [:fixture/knowledge :initialize!])]
+        (d/transact conn [{:party/id owner :party/type :human}])
+        (let [result (rooms/provision-profiled-room!
+                      {:slug "personal-created" :type :personal-ai :owner-id owner
+                       :repository-profile :fixture/knowledge}
+                      (assoc-in profile [:fixture/knowledge :initialize!]
+                                (fn [native options]
+                                  (let [pending (db/room-by-slug "personal-created")]
+                                    (is (= :personal-ai (:room/type pending)))
+                                    (is (= :pending (:room/provisioning-state pending)))
+                                    (is (= owner (get-in (d/pull @conn '[{:room/owner [:party/id]}]
+                                                                 [:room/id (:room/id pending)])
+                                                         [:room/owner :party/id]))))
+                                  (initialize! native options))))
+              room (db/room-by-slug "personal-created")]
+          (is (= :personal-ai (:room/type room)))
+          (is (= :ready (:room/provisioning-state room)))
+          (is (identical? (:room-ctx result) (rooms/room-ctx-for (:room-id result)))))))))
+
 (deftest unknown-policy-and-child-world-are-refused-before-control-intent
   (with-fixture
     (fn [{:keys [conn]}]
       (let [before @conn events (atom [])]
+        (doseq [room-type [nil false :unknown :personal-ai]]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (rooms/provision-profiled-room! {:slug "invalid-type" :type room-type
+                                                        :repository-profile :fixture/knowledge}
+                                                       (policies events)))))
         (is (thrown? clojure.lang.ExceptionInfo
                      (rooms/provision-profiled-room! {:slug "unknown" :repository-profile :fixture/knowledge} {})))
         (let [child (:child-ctx (ygg/fork! {:systems :none :purpose :fixture}))]

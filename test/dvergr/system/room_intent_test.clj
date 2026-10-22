@@ -24,6 +24,7 @@
             room-id (get-in result [:room :room/id])
             attached (db/systems-for-room room-id)]
         (is (= :pending (get-in result [:room :room/provisioning-state])))
+        (is (= :project (get-in result [:room :room/type])))
         (is (= 1 (get-in result [:room :room/provisioning-version])))
         (is (= #{:repo :msgs :kb} (set (map #(get-in % [:system :system/type]) attached))))
         (is (= 3 (count attached)))
@@ -43,22 +44,52 @@
       (let [before @conn]
         (doseq [options [{:slug "invalid" :repository-profile :fixture/v1 :owner-id (random-uuid)}
                          {:slug "invalid" :repository-profile false}
+                         {:slug "invalid" :repository-profile :fixture/v1 :type nil}
+                         {:slug "invalid" :repository-profile :fixture/v1 :type false}
+                         {:slug "invalid" :repository-profile :fixture/v1 :type :other}
+                         {:slug "invalid" :repository-profile :fixture/v1 :type :personal-ai}
                          {:slug "invalid" :repository-profile :fixture/v1 :repository-profiles {}}
                          {:slug "" :repository-profile :fixture/v1}]]
           (is (thrown? clojure.lang.ExceptionInfo (intent/create! options)))
           (is (= before @conn)))))))
 
+(deftest explicit-room-types-survive-readiness-without-reclassification
+  (with-store
+    (fn [conn]
+      (let [owner (random-uuid)]
+        (d/transact conn [{:party/id owner :party/type :human}])
+        (doseq [room-type [:project :personal-ai :group]]
+          (let [created (intent/create! {:slug (name room-type) :type room-type
+                                         :owner-id owner :repository-profile :fixture/v1})
+                expected (:basis created)]
+            (is (= room-type (get-in expected [:room :room/type])))
+            (is (= owner (get-in expected [:room :room/owner :party/id])))
+            (is (= room-type (:room/type (intent/mark-ready! expected))))
+            (is (= room-type (:room/type (intent/mark-ready! expected))))))))))
+
+(deftest changed-room-type-invalidates-readiness
+  (with-store
+    (fn [conn]
+      (let [created (intent/create! {:slug "type-changed" :repository-profile :fixture/v1})
+            room-id (get-in created [:room :room/id])]
+        (d/transact conn [[:db/add [:room/id room-id] :room/type :group]])
+        (is (thrown? clojure.lang.ExceptionInfo (intent/mark-ready! (:basis created))))
+        (is (= :pending (:room/provisioning-state (db/room-by-slug "type-changed"))))))))
+
 (deftest concurrent-creators-cannot-upsert-or-leave-losing-systems
   (with-store
     (fn [conn]
       (let [start (promise)
-            attempts (mapv (fn [_] (future @start
-                                           (try (intent/create! {:slug "contended" :repository-profile :fixture/v1})
-                                                (catch clojure.lang.ExceptionInfo _ :conflict)))) (range 2))]
+            attempts (mapv (fn [room-type] (future @start
+                                                   (try (intent/create! {:slug "contended" :type room-type
+                                                                         :repository-profile :fixture/v1})
+                                                        (catch clojure.lang.ExceptionInfo _ :conflict)))) [:project :group])]
         (deliver start true)
         (let [results (mapv #(deref % 10000 :timeout) attempts)]
           (is (= 1 (count (filter map? results))))
           (is (= 1 (count (filter #{:conflict} results))))
+          (is (= (get-in (first (filter map? results)) [:room :room/type])
+                 (:room/type (db/room-by-slug "contended"))))
           (is (= 1 (d/q '[:find (count ?r) . :where [?r :room/id _]] @conn)))
           (is (= 3 (d/q '[:find (count ?s) . :where [?s :system/id _]] @conn)))
           (is (= 3 (d/q '[:find (count ?g) . :where [?g :grant/id _]] @conn))))))))
