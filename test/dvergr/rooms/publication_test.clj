@@ -30,6 +30,66 @@
     [plan (publication/receipt plan identity
                                {"/wiki/brief.md" (get (:index plan) "wiki/brief.md")})]))
 
+(deftest host-validation-and-preparation-share-one-immutable-db
+  (with-repository
+    (fn [conn]
+      (staged! conn)
+      (let [snapshot @conn original repo/prepare-commit seen (atom []) captured-db (atom nil)
+            plan (with-redefs [repo/prepare-commit
+                               (fn [captured options]
+                                 (is (= (:max-tx snapshot) (:max-tx @captured)))
+                                 (reset! captured-db @captured)
+                                 ;; Simulate an uncoordinated writer while the
+                                 ;; immutable preparation is in progress.
+                                 (repo/set-config! conn "racing" "writer")
+                                 (original captured options))]
+                   (publication/prepare conn {:message "Frozen validation"} ["/wiki/brief.md"]
+                                        (fn [db] (swap! seen conj db) true)))
+            receipt (publication/receipt plan (publication-identity)
+                                         {"/wiki/brief.md" (get (:index plan) "wiki/brief.md")})]
+        (is (= 1 (count @seen)))
+        (is (identical? @captured-db (first @seen)))
+        (is (= (:max-tx snapshot) (:max-tx plan)))
+        (is (not (identical? snapshot @conn)))
+        (is (thrown? Exception (publication/publish! conn plan receipt)))
+        (is (nil? (repo/head-commit conn)))
+        (is (nil? (publication/lookup @conn (:publication/id receipt))))))))
+
+(deftest host-validation-requires-literal-synchronous-true
+  (with-repository
+    (fn [conn]
+      (staged! conn)
+      (let [before (:max-tx @conn)]
+        (doseq [result [nil false :ok {:ok? true} (promise) (async/promise-chan)]]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (publication/prepare conn {:message "Refuse invalid ACK"} ["/wiki/brief.md"]
+                                            (constantly result)))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Injected validation failure"
+                              (publication/prepare conn {:message "Throwing validator"} ["/wiki/brief.md"]
+                                                   (fn [_] (throw (ex-info "Injected validation failure" {}))))))
+        (doseq [invalid [nil false :untrusted]]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (publication/prepare conn {:message "Not a host function"} ["/wiki/brief.md"] invalid))))
+        (is (= before (:max-tx @conn)))
+        (is (nil? (repo/head-commit conn)))))))
+
+(deftest validated-noop-is-still-fenced-by-the-final-atomic-checkpoint
+  (with-repository
+    (fn [conn]
+      (staged! conn)
+      (let [head (:geschichte.commit/id (repo/commit! conn {:message "Base"}))
+            calls (atom 0)
+            plan (publication/prepare conn {:message "Validated noop"} ["/wiki/brief.md"]
+                                      (fn [_] (swap! calls inc) true))
+            receipt (publication/receipt plan (publication-identity)
+                                         {"/wiki/brief.md" (get (:index plan) "wiki/brief.md")})]
+        (is (:noop? plan))
+        (is (= 1 @calls))
+        (repo/set-config! conn "after-validation" "changed")
+        (is (thrown? Exception (publication/publish! conn plan receipt)))
+        (is (= head (:geschichte.commit/id (repo/head-commit conn))))
+        (is (nil? (publication/lookup @conn (:publication/id receipt))))))))
+
 (deftest duplicate-publication-returns-the-winning-commit-after-later-edits
   (with-repository
     (fn [conn]
