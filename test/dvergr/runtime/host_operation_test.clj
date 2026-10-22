@@ -3,6 +3,7 @@
             [dvergr.discourse :as discourse]
             [dvergr.room.registry :as registry]
             [dvergr.runtime.preparation :as preparation]
+            [dvergr.sandbox.work :as work]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.impl.simple :as simple])
@@ -77,8 +78,20 @@
         (is (= :pending @(:state lease)))
         (is (= ::preparation/not-quiescent (failure-type #(preparation/assert-quiescent! room))))
         (binding [ec/*execution-context* (:ctx room)]
-          (is (= ::preparation/not-quiescent
-                 (failure-type #(registry/register! (assoc room :incarnation (random-uuid)))))))
+          ;; Independent registration fences have no ordering contract: either
+          ;; the active host lease or the existing sandbox incarnation may
+          ;; refuse first. Neither may replace or release the original owner.
+          (is (contains? #{::preparation/not-quiescent ::work/room-incarnation-conflict}
+                         (failure-type #(registry/register! (assoc room :incarnation (random-uuid))))))
+          (let [current (registry/lookup (:id room))]
+            (is (identical? room current))
+            (is (= (:incarnation room) (:incarnation current)))
+            (is (identical? (:ctx room) (:ctx current)))
+            (is (identical? (:meta room) (:meta current))))
+          (is (identical? lease (get-in @(:meta room) [preparation/leases-key (:id lease)])))
+          (is (= :pending @(:state lease)))
+          (is (false? ((:finished? lease))))
+          (is (not (realized? task))))
         (add-watch (:meta room) ::closing
                    (fn [_ _ _ state]
                      (when (= :tearing-down (get-in state [:dvergr/fork-transfer-state :state]))
