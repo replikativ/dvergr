@@ -116,7 +116,25 @@
               getFragment getRawFragment getSchemeSpecificPart getRawSchemeSpecificPart
               isAbsolute isOpaque toString toASCIIString equals hashCode compareTo]
             (repeat true))}
-   'java.util.Date java.util.Date})
+   'java.util.Date java.util.Date
+   ;; Seeded randomness for simulations: the same seed gives the same worlds,
+   ;; so plans compare on common random numbers and a run can be repeated.
+   ;; Draws only: the stream methods (`doubles`, `ints`, …) are left out.
+   'java.util.Random
+   {:class java.util.Random
+    :closed true
+    :instance-methods
+    (zipmap '[nextInt nextLong nextDouble nextFloat nextBoolean nextGaussian
+              nextExponential setSeed toString equals hashCode]
+            (repeat true))}
+   ;; `split` gives each world, customer or invoice its own stream of one seed.
+   'java.util.SplittableRandom
+   {:class java.util.SplittableRandom
+    :closed true
+    :instance-methods
+    (zipmap '[nextInt nextLong nextDouble nextBoolean nextGaussian nextExponential
+              split toString equals hashCode]
+            (repeat true))}})
 
 (def ^:dynamic ^:private *awaited*
   "The spins an evaluation blocked on with `deref` (an atom), or nil outside
@@ -307,7 +325,8 @@
    This context is created once and forked for each session. It provides:
    - Safe subset of clojure.core
    - Standard Clojure namespaces (clojure.string, clojure.set, clojure.walk, clojure.edn)
-   - Basic Java classes (Math, String, numeric wrappers, exception types, java.time, UUID)
+   - Basic Java classes (Math, String, numeric wrappers, exception types, java.time, UUID,
+     seeded Random and SplittableRandom)
    - Denies dangerous operations (eval, load-file, load-string)
    - Resource limits on operation count, wall time, and thread memory allocation
 

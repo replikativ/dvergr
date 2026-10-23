@@ -1074,6 +1074,10 @@
    - Define helper functions for your task
    - Explore data structures
 
+   For simulations, draw from a seeded (java.util.SplittableRandom. seed):
+   the same seed repeats the same worlds, and (.split r) gives each world or
+   entity its own stream. (rand) cannot be repeated.
+
    Example: (clojure_eval {:code \"(reduce + (range 10))\"})
    Returns: => 45"
   :parameters {:type "object"
