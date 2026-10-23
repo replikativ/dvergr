@@ -19,6 +19,49 @@
           (case outcome :released true :interrupted (recur)
                 (throw (ex-info "Test latch expired" {}))))))))
 
+(deftest a-drain-follows-cleanup-transferred-after-its-old-host-snapshot
+  (let [room (d/make-room {:id :host-transfer-snapshot})
+        entered (promise) snapshotted (promise) transferred (promise)
+        transfer (CountDownLatch. 1) resume-drain (CountDownLatch. 1)
+        fail? (atom true) calls (atom 0) draining (atom nil)
+        cancel preparation/cancel!
+        worker (future
+                 (preparation/with-host-operation!
+                   room {:exclusive-key :human}
+                   (fn [lease]
+                     (deliver entered lease)
+                     (await-release! transfer (promise))
+                     (deliver transferred
+                              (preparation/retain-host-cleanup!
+                               lease {:heap (Object.)}
+                               (fn [_] (swap! calls inc)
+                                 (when @fail? (throw (ex-info "Controlled cleanup failure" {})))))))))]
+    (try
+      (is (map? (deref entered 30000 ::expired)))
+      (with-redefs [preparation/cancel!
+                    (fn [lease]
+                      (when (identical? lease @entered)
+                        (deliver snapshotted true)
+                        (await-release! resume-drain (promise)))
+                      (cancel lease))]
+        (reset! draining (future (refusal #(preparation/drain-room! room))))
+        (is (= true (deref snapshotted 30000 ::expired)))
+        (.countDown transfer)
+        (is (map? (deref transferred 30000 ::expired)))
+        (is (not= ::expired (deref worker 30000 ::expired)))
+        (.countDown resume-drain)
+        (is (= ::preparation/drain-failed (deref @draining 30000 ::expired))))
+      (is (= 1 @calls))
+      (is (false? ((:finished? @transferred))))
+      (reset! fail? false)
+      (preparation/drain-room! room)
+      (is (= 2 @calls))
+      (is (empty? (get @(:meta room) preparation/leases-key)))
+      (finally
+        (reset! fail? false) (.countDown transfer) (.countDown resume-drain)
+        (deref worker 30000 nil) (when @draining (deref @draining 30000 nil))
+        (d/close-room! room)))))
+
 (deftest exclusive-host-ownership-survives-transfer-and-cleanup-retry
   (let [room (d/make-room {:id :exclusive-host-cleanup})
         key [:human-sci (random-uuid)] calls (atom {}) fail? (atom true) recovery (atom nil)]

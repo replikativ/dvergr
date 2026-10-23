@@ -180,20 +180,30 @@
     (throw (ex-info "Cannot join participant preparation on the engine"
                     {:type ::blocking-drain :room-id (:id room)})))
   (let [deadline (+ (System/nanoTime) 5000000000)
-        failures (atom [])]
-    (doseq [lease leases]
-      (try (cancel! lease)
-           (catch Throwable t (swap! failures conj t))))
-    (doseq [lease leases]
-      (try ((:join! lease) (max 0 (quot (- deadline (System/nanoTime)) 1000000)))
-           (when-not ((:finished? lease))
-             (throw (ex-info "Preparation join did not acknowledge physical exit"
-                             {:type ::unconfirmed-drain})))
-           (catch Throwable t (swap! failures conj t))))
-    (locking (:meta room) (prune! room))
-    (when-let [error (first @failures)]
-      (throw (ex-info "Participant preparation did not quiesce"
-                      {:type ::drain-failed :room-id (:id room)} error))))
+        selected-ids (set (map :id leases))]
+    (loop [pending leases]
+      (let [failures (atom [])]
+        (doseq [lease pending]
+          (try (cancel! lease)
+               (catch Throwable t (swap! failures conj t))))
+        (doseq [lease pending]
+          (try ((:join! lease) (max 0 (quot (- deadline (System/nanoTime)) 1000000)))
+               (when-not ((:finished? lease))
+                 (throw (ex-info "Preparation join did not acknowledge physical exit"
+                                 {:type ::unconfirmed-drain})))
+               (catch Throwable t (swap! failures conj t))))
+        (let [remaining (locking (:meta room)
+                          (prune! room)
+                          ;; Follow original slots by CURRENT identity. A HOST
+                          ;; may transfer after our snapshot; its ACK is not
+                          ;; the replacement cleanup's ACK. Preserve the drain's
+                          ;; selected scope rather than cancelling other agents.
+                          (vec (filter #(contains? selected-ids (:id %))
+                                       (vals (get @(:meta room) leases-key)))))]
+          (when-let [error (first @failures)]
+            (throw (ex-info "Participant preparation did not quiesce"
+                            {:type ::drain-failed :room-id (:id room)} error)))
+          (when (seq remaining) (recur remaining))))))
   nil)
 
 (defn drain-room! [room]

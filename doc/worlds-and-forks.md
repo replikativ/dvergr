@@ -110,6 +110,39 @@ physical drain to retry. Waiting for that original exit respects the join bound;
 resource-release callbacks retain their ordinary synchronous cleanup contract.
 Self-drain and stale-thread interrupt protection survive transfer. These leases
 remain private runtime resources, excluded from persisted and copied metadata.
+Drains follow selected slots by their current lease identity, including a cleanup
+transfer occurring after the drain snapshot; the old owner's exit alone cannot
+acknowledge its replacement cleanup. The original join deadline is retained.
+
+### Owned native SCI invocations
+
+Trusted application adapters use `dvergr.sandbox/start-evaluation!` with a
+synchronous `:with-interpreter` callback. On the actual native worker that
+callback acquires the original application lifetime, actual Room lease and
+interpreter monitor, rechecks authority, then invokes its sealed `evaluate!`
+callback once with the selected interpreter. The callback cannot be reused on
+another thread or after the wrapper returns. No Room tools or permissions are
+implicitly injected. The raw synchronous `dvergr.sandbox/eval-code` API remains
+available; its timed facade alone does not own application or Room resources.
+
+`dvergr.sandbox/await-evaluation!` returns a bounded receipt. A timeout or explicit
+`dvergr.sandbox/cancel-evaluation!` can produce that receipt before actual worker
+exit. `dvergr.sandbox/join-evaluation!` acknowledges the worker's physical
+completion, including its ownership wrapper; Future cancellation is never that
+acknowledgement. A single monotonic deadline includes queued admission, and the
+actual body checks it again before entry. A cancelled admission waiter never
+enters SCI. Normal result delivery follows physical completion.
+
+Output and requested printed values are bounded while written, with truncation
+flags; printing happens inside the interpreter scope. Deadline control never
+accesses Room/application handles. Interrupted Spin dereferences cancel pending
+work in their selected world on the evaluator thread before SCI can catch the
+interruption. Ordinary timed dereference fallback and already-cached nodes are
+preserved. Cancellation remains cooperative: inline native work or user cleanup
+ignoring interruption can retain ownership after receipt delivery. Detached work
+is not an implicitly joined task tree. Hosts must quarantine affected interpreters
+until actual work exits and retirement succeeds, and retain both Room and outer
+application recovery ownership if retirement fails.
 
 To publish to that exact resolved system without changing a Room's execution
 selection, trusted hosts can use `dvergr.rooms.files/write-to!` with the Room,
