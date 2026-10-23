@@ -32,6 +32,14 @@
         (is (sandbox/join-evaluation! handle 30000)))
       (finally (context/close-context! world)))))
 
+(deftest ordinary-legacy-result-maps-retain-their-original-shape
+  (let [interpreter (sandbox/create-base-ctx)]
+    (doseq [options [[] [:timeout-ms 30000]]]
+      (is (= {:value 42 :stdout "" :stderr "" :success true}
+             (dissoc (apply sandbox/eval-code interpreter "(+ 20 22)" options) :meter)))
+      (is (= {:value "42" :stdout "" :stderr "" :success true}
+             (dissoc (apply sandbox/eval-code interpreter "(+ 20 22)" (concat options [:realize? true])) :meter))))))
+
 (deftest owned-evaluation-realizes-and-bounds-output-before-releasing-owner
   (let [owned? (atom false) interpreter (sandbox/create-base-ctx)
         handle (sandbox/start-evaluation!

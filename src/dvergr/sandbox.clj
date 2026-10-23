@@ -540,12 +540,13 @@
       (let [value (sci/eval-string* sci-ctx code)
             printed (when realize? (print-value value output-limit))]
         (cond-> {:value (if realize? (:text printed) value) :success true}
-          realize? (assoc :value-truncated? (:truncated? printed)))))))
+          (:truncated? printed) (assoc :value-truncated? true))))))
 
 (defn- captured-output [stdout stderr result]
   (let [out ((:snapshot stdout)) err ((:snapshot stderr))]
-    (assoc result :stdout (:text out) :stderr (:text err)
-           :stdout-truncated? (:truncated? out) :stderr-truncated? (:truncated? err))))
+    (cond-> (assoc result :stdout (:text out) :stderr (:text err))
+      (:truncated? out) (assoc :stdout-truncated? true)
+      (:truncated? err) (assoc :stderr-truncated? true))))
 
 (defn- evaluation-error [error]
   {:success false
