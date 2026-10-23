@@ -26,8 +26,9 @@
          (not= :dvergr.discourse/participant-closed @(:active participant)))))
 
 (defn- assert-not-self-drain! [room leases]
-  (when (some #(and (= :host-operation (:kind %))
-                    (identical? (Thread/currentThread) (:thread %))) leases)
+  (when (some #(and (identical? (Thread/currentThread) (:thread %))
+                    (or (= :host-operation (:kind %))
+                        (when-let [finished? (:origin-finished? %)] (not (finished?))))) leases)
     (throw (ex-info "A HOST operation cannot drain itself"
                     {:type ::self-drain :room-id (:id room)})))
   nil)
@@ -64,46 +65,56 @@
 
    Room cancellation requests interruption but retains ownership until finally.
    The retirement gate prevents stale drain snapshots from interrupting a pooled
-   calling thread after this operation returned. Never call on an engine drain."
-  [room f]
-  (when (simple/on-drain-thread?)
-    (throw (ex-info "HOST operations require a worker thread"
-                    {:type ::blocking-host-operation :room-id (:id room)})))
-  (when-not (fn? f)
-    (throw (ex-info "HOST operation requires a function" {})))
-  (let [thread (Thread/currentThread)
-        active (atom true)
-        completion (promise)
-        lease {:id (random-uuid) :kind :host-operation :room room :thread thread
-               :state (atom :pending)
-               :cancel! #(locking active (when @active (.interrupt thread)))
-               :finished? #(realized? completion)
-               :join! (fn [timeout-ms]
-                        (when-not (true? (deref completion timeout-ms nil))
-                          (throw (ex-info "HOST operation has not physically exited"
-                                          {:type ::unconfirmed-drain}))))}]
-    (locking (:meta room)
-      (prune! room)
-      (when-not (and (binding [ec/*execution-context* (:ctx room)]
-                       (identical? room (registry/lookup (:id room))))
-                     (admitted? room)
-                     (nil? (:dvergr/fork-transfer-state @(:meta room))))
-        (throw (ex-info "HOST operation admission is closed"
-                        {:type ::admission-closed :room-id (:id room)})))
-      (when (>= (count (get @(:meta room) leases-key)) max-room-preparations)
-        (throw (ex-info "HOST operation capacity exhausted"
-                        {:type ::capacity-exhausted :room-id (:id room)})))
-      (swap! (:meta room) assoc-in [leases-key (:id lease)] lease))
-    (try
-      (f lease)
-      (finally
-        (locking active (reset! active false))
-        (try
-          (locking (:meta room)
-            (when (identical? lease (get-in @(:meta room) [leases-key (:id lease)]))
-              (swap! (:meta room) update leases-key dissoc (:id lease))))
+   calling thread after this operation returned. Never call on an engine drain.
+   Optional :exclusive-key refuses another retained native owner of that key;
+   it supplies neither permission nor a reentrant bypass."
+  ([room f] (with-host-operation! room {} f))
+  ([room {:keys [exclusive-key] :as options} f]
+   (when (simple/on-drain-thread?)
+     (throw (ex-info "HOST operations require a worker thread"
+                     {:type ::blocking-host-operation :room-id (:id room)})))
+   (when-not (fn? f)
+     (throw (ex-info "HOST operation requires a function" {})))
+   (when-not (and (map? options) (every? #{:exclusive-key} (keys options))
+                  (or (not (contains? options :exclusive-key)) (some? exclusive-key)))
+     (throw (ex-info "Invalid HOST operation options" {:type ::invalid-options})))
+   (let [thread (Thread/currentThread)
+         active (atom true)
+         completion (promise)
+         lease (cond-> {:id (random-uuid) :kind :host-operation :room room :thread thread
+                        :state (atom :pending)
+                        :cancel! #(locking active (when @active (.interrupt thread)))
+                        :finished? #(realized? completion)
+                        :join! (fn [timeout-ms]
+                                 (when-not (true? (deref completion timeout-ms nil))
+                                   (throw (ex-info "HOST operation has not physically exited"
+                                                   {:type ::unconfirmed-drain}))))}
+                 (contains? options :exclusive-key) (assoc :exclusive-key exclusive-key))]
+     (locking (:meta room)
+       (prune! room)
+       (when-not (and (binding [ec/*execution-context* (:ctx room)]
+                        (identical? room (registry/lookup (:id room))))
+                      (admitted? room)
+                      (nil? (:dvergr/fork-transfer-state @(:meta room))))
+         (throw (ex-info "HOST operation admission is closed"
+                         {:type ::admission-closed :room-id (:id room)})))
+       (when (or (>= (count (get @(:meta room) leases-key)) max-room-preparations)
+                 (and (contains? options :exclusive-key)
+                      (some #(= exclusive-key (:exclusive-key %))
+                            (vals (get @(:meta room) leases-key)))))
+         (throw (ex-info "HOST operation capacity exhausted"
+                         {:type ::capacity-exhausted :room-id (:id room)})))
+       (swap! (:meta room) assoc-in [leases-key (:id lease)] lease))
+     (try
+       (f lease)
+       (finally
+         (locking active (reset! active false))
+         (try
+           (locking (:meta room)
+             (when (identical? lease (get-in @(:meta room) [leases-key (:id lease)]))
+               (swap! (:meta room) update leases-key dissoc (:id lease))))
           ;; No Room/native access follows this final acknowledgement.
-          (finally (deliver completion true)))))))
+           (finally (deliver completion true))))))))
 
 (defn admit!
   "Retain a lease BEFORE dispatch. `cancel!` must not block; `join!` must join
@@ -264,6 +275,42 @@
           (swap! (:meta room) update leases-key dissoc (:id lease))))))
   nil)
 
+(defn- room-cleanup-lease [room entries release! previous]
+  (let [remaining (atom entries)
+        monitor (Object.)
+        origin-finished? (or (:finished? previous) (constantly true))]
+    (cond-> {:id (or (:id previous) (random-uuid)) :kind :room-cleanup :room room
+             :resource remaining :state (or (:state previous) (atom :pending))
+             :cancel! (or (:cancel! previous) (constantly nil))
+             :finished? #(and (origin-finished?) (empty? @remaining))
+             :join! (fn [timeout-ms]
+                      (when previous
+                        (when (and (identical? (Thread/currentThread) (:thread previous))
+                                   (not (origin-finished?)))
+                          (throw (ex-info "A HOST owner cannot join its own cleanup"
+                                          {:type ::self-drain :room-id (:id room)})))
+                        ;; The original owner may still be unwinding. Transfer
+                        ;; is not its physical ACK and permits no early release.
+                        ((:join! previous) timeout-ms)
+                        (when-not (origin-finished?)
+                          (throw (ex-info "HOST cleanup is waiting for physical exit"
+                                          {:type ::unconfirmed-drain :room-id (:id room)}))))
+                      ;; Never invoke resource callbacks under the Room monitor.
+                      (locking monitor
+                        (let [failures (atom [])]
+                          (doseq [[key entry] @remaining]
+                            (try
+                              (release! entry)
+                              (swap! remaining
+                                     #(if (identical? entry (get % key)) (dissoc % key) %))
+                              (catch Throwable error (swap! failures conj error))))
+                          (when-let [error (first @failures)]
+                            (throw (ex-info "Room context cleanup is incomplete"
+                                            {:type ::cleanup-unconfirmed :room-id (:id room)
+                                             :remaining (count @remaining)} error))))))}
+      previous (assoc :thread (:thread previous) :origin-finished? origin-finished?)
+      (contains? previous :exclusive-key) (assoc :exclusive-key (:exclusive-key previous)))))
+
 (defn retain-room-cleanup!
   "Retain a detached cache batch until every exact entry acknowledges release.
    Called under the Room monitor by its pre-unregister hook, while that exact
@@ -283,33 +330,36 @@
                (>= (count (get @(:meta room) leases-key)) max-room-preparations))
       (throw (ex-info "Room cleanup capacity exhausted"
                       {:type ::capacity-exhausted :room-id (:id room)})))
-    (let [remaining (atom entries)
-          monitor (Object.)
-          lease {:id (random-uuid) :kind :room-cleanup :room room
-                 :resource remaining :state (atom :pending)
-                 :cancel! (constantly nil)
-                 :finished? #(empty? @remaining)
-                 :join! (fn [_]
-                          ;; The lifecycle reservation excludes competing close
-                          ;; operations. Keep the receipt itself serialized too:
-                          ;; no exact resource may be released concurrently.
-                          (locking monitor
-                            (let [failures (atom [])]
-                              (doseq [[key entry] @remaining]
-                                (try
-                                  (release! entry)
-                                  (swap! remaining
-                                         #(if (identical? entry (get % key))
-                                            (dissoc % key) %))
-                                  (catch Throwable error (swap! failures conj error))))
-                              (when-let [error (first @failures)]
-                                (throw (ex-info "Room context cleanup is incomplete"
-                                                {:type ::cleanup-unconfirmed
-                                                 :room-id (:id room)
-                                                 :remaining (count @remaining)} error))))))}]
+    (let [lease (room-cleanup-lease room entries release! nil)]
       (when (seq entries)
         ;; Retain BEFORE the caller detaches these entries from its live cache.
         (swap! (:meta room) assoc-in [leases-key (:id lease)] lease))
+      lease)))
+
+(defn retain-host-cleanup!
+  "Transfer an exact HOST owner's slot to retryable cleanup, including its
+   exclusive key. Recovery remains possible during cancellation/teardown and
+   does not require a second capacity slot. The original owner must cease all
+   access to transferred entries. Release waits for its physical exit before
+   invoking cleanup, and failed entries retain ownership until a later drain."
+  [{:keys [room id thread] :as previous} entries release!]
+  (when (simple/on-drain-thread?)
+    (throw (ex-info "HOST cleanup requires a worker thread"
+                    {:type ::blocking-cleanup :room-id (:id room)})))
+  (when-not (and (map? entries) (seq entries) (fn? release!))
+    (throw (ex-info "Invalid HOST cleanup transfer" {:type ::invalid-cleanup})))
+  (locking (:meta room)
+    (when-not (and (= :host-operation (:kind previous))
+                   (identical? thread (Thread/currentThread))
+                   (identical? previous (get-in @(:meta room) [leases-key id]))
+                   (binding [ec/*execution-context* (:ctx room)]
+                     (identical? room (registry/lookup (:id room)))))
+      (throw (ex-info "HOST cleanup no longer owns its exact operation"
+                      {:type ::stale-host-operation :room-id (:id room)})))
+    (let [lease (room-cleanup-lease room entries release! previous)]
+      ;; Replacement is atomic. The old finally removes only its own identity,
+      ;; then publishes its physical ACK without removing this recovery owner.
+      (swap! (:meta room) assoc-in [leases-key id] lease)
       lease)))
 
 (registry/add-pre-unregister-hook! ::drain drain-room!)

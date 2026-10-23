@@ -98,6 +98,19 @@ refuses this at entry, before quiescing listeners. A short owner-thread decision
 can use `dvergr.runtime.preparation/with-host-current!` to refuse cancelled,
 replaced or closing Room incarnations, but still needs ordinary authority checks.
 
+An optional `:exclusive-key` in the HOST operation's options refuses another
+retained native owner of that key, including a recovery owner. It is
+non-reentrant and grants no authority. Hosts handling failed resource retirement
+can call `dvergr.runtime.preparation/retain-host-cleanup!` on their exact current
+lease. This transfers the same slot and exclusive key without requiring spare
+capacity, including during cancellation or teardown. The original owning thread
+must cease access to transferred resources. Cleanup first waits for its physical
+exit; successful entries are removed and failed entries remain for a later
+physical drain to retry. Waiting for that original exit respects the join bound;
+resource-release callbacks retain their ordinary synchronous cleanup contract.
+Self-drain and stale-thread interrupt protection survive transfer. These leases
+remain private runtime resources, excluded from persisted and copied metadata.
+
 To publish to that exact resolved system without changing a Room's execution
 selection, trusted hosts can use `dvergr.rooms.files/write-to!` with the Room,
 its exact registered Geschichte object, the file batch and ordinary write
