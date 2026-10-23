@@ -67,7 +67,7 @@ named tool set in agent config — plain data.
 
 `clojure_eval` runs Clojure in a per-session [SCI](https://github.com/babashka/sci)
 context (`dvergr.sandbox`). `(def x 1)` and `(defn …)` persist across evals within the
-session; other sessions are isolated. Each call gets a **60s hard timeout** and is
+session; other sessions are isolated. Each call gets a **60s caller deadline** and is
 cancellable.
 
 ### Surface agents get

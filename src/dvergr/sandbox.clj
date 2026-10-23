@@ -13,6 +13,7 @@
             [clojure.string :as str]
             [datahike.api :as dh]
             [org.replikativ.spindel.engine.core :as rtc]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.engine.component :as component]
             [org.replikativ.spindel.sci.world :as sci-world]
@@ -34,9 +35,10 @@
             [dvergr.authority :as authority]
             [dvergr.effects :as effects]
             [dvergr.runtime.ctx :as runtime-ctx]
+            [dvergr.runtime.invocation :as invocation]
+            [dvergr.runtime.bounded-output :as output]
             [dvergr.system.db :as sdb])
-  (:import [java.io StringWriter]
-           [java.lang.management ManagementFactory]))
+  (:import [java.lang.management ManagementFactory]))
 
 ;; ---------------------------------------------------------------------------
 ;; Consumer namespace-injector registry
@@ -120,8 +122,23 @@
 
 (def ^:dynamic ^:private *awaited*
   "The spins an evaluation blocked on with `deref` (an atom), or nil outside
-   `eval-code*`'s timeout path."
+   an owned evaluation worker."
   nil)
+
+(def ^:dynamic ^:private *evaluation-aborted?* nil)
+
+(defn- cancel-pending-spin! [world task]
+  (when world
+    (binding [rtc/*execution-context* world]
+      ;; Refuse already-cached nodes; this is not a cancellation/completion CAS.
+      (when-not (rtc/spin-current-result (spin-core/spin-id task))
+        (try (spin-core/cancel-spin! task) (catch Throwable _ nil))))))
+
+(defn- interrupted-cause? [error]
+  (loop [cause error remaining 8]
+    (when (and cause (pos? remaining))
+      (or (instance? InterruptedException cause)
+          (recur (.getCause ^Throwable cause) (dec remaining))))))
 
 (defn- waiting-on
   "Call `f`, with `x` in `*awaited*` while `f` blocks on it: a deref that
@@ -129,11 +146,25 @@
    that is interrupted stays recorded."
   [x f]
   (if (and *awaited* (instance? org.replikativ.spindel.spin.core.Spin x))
-    (let [entry (Object.)]
+    (let [entry (Object.) world rtc/*execution-context*
+          cancel-pending #(cancel-pending-spin! world x)]
       (swap! *awaited* assoc entry x)
-      (let [v (f)]
-        (swap! *awaited* dissoc entry)
-        v))
+      (try
+        (let [v (f)]
+          (when (and *evaluation-aborted?* (*evaluation-aborted?*))
+            (cancel-pending))
+          (swap! *awaited* dissoc entry)
+          v)
+        (catch Throwable error
+          ;; Cancel before SCI can catch the interrupt and continue. The
+          ;; supported Spin promise wait is interruptible. Cancellation can
+          ;; run user finally code, so it belongs on this still-owned worker,
+          ;; never on the deadline thread or under a retirement monitor.
+          (when (or (interrupted-cause? error)
+                    (.isInterrupted (Thread/currentThread))
+                    (and *evaluation-aborted?* (*evaluation-aborted?*)))
+            (cancel-pending))
+          (throw error))))
     (f)))
 
 (defn- sandbox-deref
@@ -150,7 +181,7 @@
   (when execution-ctx
     (binding [rtc/*execution-context* execution-ctx]
       (doseq [s (vals @awaited)]
-        (try (spin-core/cancel-spin! s) (catch Throwable _ nil))))))
+        (cancel-pending-spin! execution-ctx s)))))
 
 (def ^:private core-extras
   "clojure.core 1.11/1.12 additions SCI's default set lacks. Copied from the REAL
@@ -257,7 +288,8 @@
    For non-interruptible blocking syscalls, pair with eval-code's :timeout-ms option
    which uses future/deref as an outer fence.
 
-   Typical usage (managed by eval-code automatically when :timeout-ms is passed):
+   Legacy standalone usage. eval-code uses the owned invocation guard instead.
+   Always cancel this helper before leaving the calling thread's operation:
      (let [{:keys [cancel!]} (make-timeout 5000)]
        (try (eval-code ctx code)
             (finally (cancel!))))"
@@ -277,9 +309,10 @@
                           (try
                             (Thread/sleep (long timeout-ms))
                              ;; Timeout elapsed — signal the eval thread unless cancelled
-                            (when-not @cancelled?
-                              (reset! fired? true)
-                              (.interrupt target))
+                            (locking cancelled?
+                              (when-not @cancelled?
+                                (reset! fired? true)
+                                (.interrupt target)))
                             (catch InterruptedException _
                                ;; Watchdog interrupted by cancel! — exit quietly
                               nil)))
@@ -287,7 +320,7 @@
                    (.setDaemon true)
                    .start)]
     {:cancel! (fn []
-                (reset! cancelled? true)
+                (locking cancelled? (reset! cancelled? true))
                 (.interrupt watchdog))
      :fired?  (fn [] @fired?)}))
 
@@ -492,228 +525,182 @@
       (map? r) (assoc :meter {:cpu-ms (quot (- (.getCurrentThreadCpuTime mx) cpu0) 1000000)
                               :wall-ms (quot (- (System/nanoTime) t0) 1000000)}))))
 
-(defn- eval-code*
-  "Evaluate Clojure code in the session's SCI context.
+(defn print-value
+  "Print a result inside its owned interpreter scope, bounding captured text
+   while printing. The caller still controls print-length/level and realization."
+  ([value] (print-value value 65536))
+  ([value limit]
+   (let [{:keys [writer snapshot]} (output/create limit)]
+     (binding [*out* writer] (pr value))
+     (snapshot))))
 
-   Returns map with:
-   - :value     - evaluation result
-   - :stdout    - captured stdout
-   - :stderr    - captured stderr
-   - :success   - boolean, true if evaluation succeeded
-   - :error     - error map if failed {:message :type :data :stacktrace}
+(defn- eval-value! [sci-ctx code stdout stderr realize? output-limit]
+  (sci-ctx-store/with-ctx sci-ctx
+    (sci/binding [sci/out stdout sci/err stderr]
+      (let [value (sci/eval-string* sci-ctx code)
+            printed (when realize? (print-value value output-limit))]
+        (cond-> {:value (if realize? (:text printed) value) :success true}
+          (:truncated? printed) (assoc :value-truncated? true))))))
 
-   Options:
-     :timeout-ms - wall-clock timeout in milliseconds. Combines two mechanisms:
-                   1. make-timeout watchdog that interrupts the eval thread (handles
-                      responsive IO and SCI computation via the interrupt-fn hook).
-                   2. future/deref as an outer fence that unblocks the caller even if
-                      the eval thread is stuck in a non-interruptible syscall.
-                   Returns {:success false :error {:message \"Timed out...\"}} on timeout.
+(defn- captured-output [stdout stderr result]
+  (let [out ((:snapshot stdout)) err ((:snapshot stderr))]
+    (cond-> (assoc result :stdout (:text out) :stderr (:text err))
+      (:truncated? out) (assoc :stdout-truncated? true)
+      (:truncated? err) (assoc :stderr-truncated? true))))
 
-   Example:
-     (eval-code ctx \"(+ 1 2)\")
-     => {:value 3 :stdout \"\" :stderr \"\" :success true}
+(defn- evaluation-error [error]
+  {:success false
+   :error {:message (.getMessage ^Throwable error) :type (str (class error))
+           :data (when (instance? clojure.lang.ExceptionInfo error) (ex-data error))
+           :stacktrace (when (instance? Exception error) (sci/stacktrace error))}})
 
-     (eval-code ctx \"(Thread/sleep 10000)\" :timeout-ms 1000)
-     => {:success false :error {:message \"Timed out after 1000ms\" ...}}
+(defn start-evaluation!
+  "Start HOST-owned SCI evaluation with separate result and physical exit.
+   :with-interpreter is a trusted synchronous fn of [evaluate! control]. It
+   acquires the ORIGINAL application/actual Room lifetime and interpreter gate,
+   rechecks authority, then calls evaluate! with that interpreter at most once
+   on this actual worker. It retains ownership until evaluation and cleanup end.
 
-   The eval runs with SCI's ctx-store bound (injected fns that re-enter the
-   interpreter find it). eval-string* sets the store only during eval, so a
-   LAZY value in the result would trip get-ctx when realized later —
-   `:realize? true` pr-strs the value INSIDE the store binding, forcing
-   realization while it's still set, and returns the printed string as
-   :value."
-  [sci-ctx code & {:keys [timeout-ms cancel? realize?]}]
-  (if timeout-ms
-    ;; Timeout path: watchdog + future/deref outer fence.
-    ;;
-    ;; The watchdog MUST be started inside the future so it captures the eval
-    ;; thread (not the calling thread) as its interrupt target.
-    ;;
-    ;; Two-layer design:
-    ;;   Layer 1 — watchdog interrupts the eval thread after timeout-ms.
-    ;;             Caught by: interrupt-fn (SCI fn-body entries),
-    ;;             responsive IO (sockets/NIO that honour Thread.interrupt).
-    ;;   Layer 2 — outer deref with timeout-ms + 5s safety buffer.
-    ;;             Unblocks the caller even if the eval thread is stuck in a
-    ;;             non-interruptible syscall (rare; eval thread leaks but caller
-    ;;             gets a result).
-    ;;
-    ;; If a :cancel? 0-arity predicate is supplied, a tiny poller thread
-    ;; watches it and fires the same watchdog cancel! early — so user-
-    ;; initiated cancellation triggers the exact same path as a real
-    ;; timeout (interrupted eval, structured TimeoutException, no leaks).
-    (let [stdout      (StringWriter.)
-          stderr      (StringWriter.)
-          cancel-poll-stop (atom false)
-          cancel-fired (atom false)
-          awaited     (atom {})
-          eval-ctx    rtc/*execution-context*
-          eval-future (future
-                        (binding [*awaited* awaited]
-                          (metered
-                           (fn []
-                        ;; Watchdog starts here on the eval thread
-                             (let [{:keys [cancel! fired?]} (make-timeout timeout-ms)
-                                   eval-thread (Thread/currentThread)
-                                   _ (when cancel?
-                                       (let [t (Thread.
-                                                #(loop []
-                                                   (when-not @cancel-poll-stop
-                                                     (if (try (cancel?) (catch Throwable _ false))
-                                                   ;; Mirror watchdog semantics:
-                                                   ;; mark fired and interrupt the
-                                                   ;; eval thread so SCI's
-                                                   ;; interrupt-fn / responsive IO
-                                                   ;; sees it and unwinds the
-                                                   ;; computation cleanly.
-                                                       (do (reset! cancel-fired true)
-                                                           (.interrupt eval-thread))
-                                                       (do (Thread/sleep 100) (recur))))))]
-                                         (.setDaemon t true)
-                                         (.setName t "dvergr-eval-cancel-poll")
-                                         (.start t)))]
-                               (try
-                                 (sci-ctx-store/with-ctx sci-ctx
-                                   (sci/binding [sci/out stdout sci/err stderr]
-                                     (let [result (sci/eval-string* sci-ctx code)
-                                           result (if realize? (pr-str result) result)]
-                                       {:value result :stdout (str stdout) :stderr (str stderr)
-                                        :success true})))
-                                 (catch Throwable e
-                              ;; Catch Throwable so JVM Errors (StackOverflowError,
-                              ;; OutOfMemoryError) also produce a structured result
-                              ;; rather than crashing the future unhandled.
-                              ;;
-                              ;; If the watchdog fired, the exception is the
-                              ;; downstream effect of Thread.interrupt() —
-                              ;; surface it as a CLEAN timeout error rather
-                              ;; than a confusing bare InterruptedException
-                              ;; (or whatever the interrupted op raised),
-                              ;; matching the layer-2 outer-fence message.
-                              ;; Otherwise the eval-thread inner catch (the
-                              ;; watchdog path through @spin / LockSupport)
-                              ;; would surface to the agent as e.g. "sleep
-                              ;; interrupted / InterruptedException" and the
-                              ;; agent has to GUESS it was a timeout.
-                                   (cond
-                                     @cancel-fired
-                                     {:error   {:message "Evaluation cancelled by user"
-                                                :type    "CancellationException"
-                                                :data    {:cause :user-cancel}}
-                                      :stdout  (str stdout)
-                                      :stderr  (str stderr)
-                                      :success false}
+   control contains HOST-only check!/entered?/aborted?/reason/cancel!/cancel-awaited!
+   callbacks, never sandbox or transport values. A timed-out result can arrive
+   before physical exit; retain/quarantine the interpreter until its real exit.
+   Only work this invocation actually awaited is cancellation-tracked. Arbitrary
+   detached computation is not an implicitly joined task tree.
 
-                                     (fired?)
-                                     {:error   {:message (str "Timed out after " timeout-ms "ms"
-                                                              " — your code likely got stuck"
-                                                              " (a (spin …) that never resolved,"
-                                                              " an infinite loop, or oversized"
-                                                              " inference). Try fewer particles,"
-                                                              " bound your loops, or check for"
-                                                              " hung @spin / await.")
-                                                :type    "TimeoutException"
-                                                :data    {:timeout-ms timeout-ms
-                                                          :cause :watchdog-interrupt}}
-                                      :stdout  (str stdout)
-                                      :stderr  (str stderr)
-                                      :success false}
+   Options: timeout-ms (includes queue/admission), cancel?, realize?, bounded
+   output-limit (default64K), execution-context, with-interpreter, trusted executor.
+   Saving/reading source never invokes this entrypoint."
+  [code {:keys [with-interpreter timeout-ms cancel? realize? output-limit execution-context executor]
+         :or {output-limit 65536} :as options}]
+  (when-not (and (string? code) (fn? with-interpreter)
+                 (every? #{:with-interpreter :timeout-ms :cancel? :realize? :output-limit :execution-context :executor}
+                         (keys options)))
+    (throw (ex-info "Invalid owned SCI evaluation" {:type ::invalid-evaluation})))
+  (let [stdout (output/create output-limit) stderr (output/create output-limit)
+        cancelled-result
+        (fn [{:keys [kind body-entered?]}]
+          (captured-output
+           stdout stderr
+           {:success false :partial? body-entered?
+            :error {:type (case kind :timeout "TimeoutException" :rejected "RejectedExecutionException"
+                                "CancellationException")
+                    :message (case kind :timeout (str "Timed out after " timeout-ms "ms")
+                                   :rejected "Evaluation dispatch was refused" "Evaluation was cancelled")
+                    :data {:cause kind :timeout-ms timeout-ms}}}))
+        native
+        (invocation/start!
+         (fn [native]
+           (when (simple/on-drain-thread?)
+             (throw (ex-info "SCI evaluation requires a native worker" {:type ::engine-thread})))
+           ;; Dynamic engine markers travel with bound-fn. They are not proof
+           ;; this executor thread is draining; the physical thread guard above
+           ;; is. Do not carry a caller's drain marker into blocking user code.
+           (binding [rtc/*spin-id* nil simple/*in-drain?* false]
+             (let [thread (Thread/currentThread) forwarding (volatile! :open)
+                   awaited (atom {}) eval-context (atom nil)
+                   current! (fn []
+                              (when-not (and (identical? thread (Thread/currentThread))
+                                             (not= :closed @forwarding))
+                                (throw (ex-info "Evaluation callback is no longer owned"
+                                                {:type ::stale-evaluation-callback}))))
+                   cancel-awaited (fn [] (current!) (cancel-awaited! awaited @eval-context))
+                   control {:check! #(do (current!) (invocation/check! native))
+                            :aborted? #(invocation/aborted? native)
+                            :reason #(invocation/reason native)
+                            :entered? #(invocation/body-entered? native)
+                            :cancel! #(invocation/cancel! native %)
+                            :cancel-awaited! cancel-awaited}
+                   evaluate
+                   (fn [sci-ctx]
+                     (current!)
+                     (when-not (= :open @forwarding)
+                       (throw (ex-info "Evaluation callback already entered" {:type ::duplicate-evaluation})))
+                     (invocation/check! native)
+                     (vreset! forwarding :entered)
+                     (let [body (fn []
+                                  (reset! eval-context rtc/*execution-context*)
+                                  (binding [*awaited* awaited
+                                            *evaluation-aborted?* #(invocation/aborted? native)]
+                                    (try
+                                      (let [result (invocation/with-deadline!
+                                                     native
+                                                     #(captured-output
+                                                       stdout stderr
+                                                       (metered (fn []
+                                                                  (try (eval-value! sci-ctx code (:writer stdout) (:writer stderr)
+                                                                                    realize? output-limit)
+                                                                       (catch Throwable error (evaluation-error error)))))))]
+                                        ;; The owning wrapper sees the same
+                                        ;; classified stop receipt as the caller.
+                                        (if (invocation/aborted? native)
+                                          (:result (invocation/result-now native)) result))
+                                      (catch Throwable error
+                                        (if (invocation/aborted? native)
+                                          (:result (invocation/result-now native))
+                                          (captured-output stdout stderr (evaluation-error error))))
+                                      (finally
+                                        (when (invocation/aborted? native) (cancel-awaited))))))]
+                       (try
+                         (if execution-context
+                           (binding [rtc/*execution-context* execution-context] (body))
+                           (body))
+                         (finally (vreset! forwarding :completed)))))]
+               (try
+                 (let [result (with-interpreter evaluate control)]
+                   (when (and (= :open @forwarding) (not (invocation/aborted? native)))
+                     (throw (ex-info "Owned evaluation never selected an interpreter"
+                                     {:type ::evaluation-not-entered})))
+                   (when-not (and (map? result) (boolean? (:success result)))
+                     (throw (ex-info "Owned evaluation wrapper returned no result map"
+                                     {:type ::invalid-evaluation-result})))
+                   result)
+                 (finally (vreset! forwarding :closed))))))
+         {:timeout-ms timeout-ms :cancel? cancel? :cancel-result cancelled-result :executor executor})]
+    {:id (:id native) ::invocation native}))
 
-                                     :else
-                                     {:error {:message (.getMessage e)
-                                              :type     (str (class e))
-                                              :data     (when (instance? clojure.lang.ExceptionInfo e)
-                                                          (ex-data e))
-                                              :stacktrace (when (instance? Exception e)
-                                                            (sci/stacktrace e))}
-                                      :stdout (str stdout)
-                                      :stderr (str stderr)
-                                      :success false}))
-                                 (finally
-                              ;; Always cancel the watchdog when eval finishes
-                                   (cancel!)
-                                   (reset! cancel-poll-stop true)
-                                 ;; interrupted (even if the code caught it):
-                                 ;; stop what the eval was still blocked on
-                                   (when (or @cancel-fired (fired?))
-                                     (cancel-awaited! awaited eval-ctx)))))))))]
-      ;; Outer fence: poll the eval-future short-interval, so we ALSO
-      ;; honour user cancel even when the inner SCI interrupt-fn isn't
-      ;; reachable (spindel-backed SCI doesn't expose it for every
-      ;; fn-entry, and pure tight loops never cross the boundary). On
-      ;; cancel we future-cancel and return cleanly; the eval thread
-      ;; may leak (same caveat as a real outer-fence timeout) but the
-      ;; caller and the user get immediate feedback.
-      (let [outer-deadline (+ (System/currentTimeMillis) timeout-ms 5000)
-            result
-            (loop []
-              (let [r (deref eval-future 100 ::pending)]
-                (cond
-                  (not= r ::pending)              r
-                  (and cancel? (cancel?))         (do (reset! cancel-poll-stop true)
-                                                      (future-cancel eval-future)
-                                                      (cancel-awaited! awaited eval-ctx)
-                                                      ::cancelled)
-                  (> (System/currentTimeMillis) outer-deadline) (do (cancel-awaited! awaited eval-ctx)
-                                                                    ::timed-out)
-                  :else (recur))))]
-        (case result
-          ::cancelled
-          {:error  {:message "Evaluation cancelled by user"
-                    :type    "CancellationException"
-                    :data    {:cause :outer-fence-cancel}}
-           :stdout  (str stdout)
-           :stderr  (str stderr)
-           :success false}
+(defn await-evaluation!
+  "One caller receipt. worker-finished? is physical acknowledgement as observed
+   at delivery, not a claim that every asynchronous effect has been joined."
+  [handle]
+  (let [result (invocation/await! (::invocation handle))]
+    (assoc result :invocation-id (:id handle)
+           :worker-finished? (invocation/finished? (::invocation handle))
+           :evaluation-entered? (invocation/body-entered? (::invocation handle)))))
 
-          ::timed-out
-          {:error   {:message (str "Timed out after " timeout-ms "ms"
-                                   " (the eval thread didn't respond to"
-                                   " interruption — likely a non-interruptible"
-                                   " blocking syscall). Avoid uninterruptible"
-                                   " blocking IO and bound long computations.")
-                     :type    "TimeoutException"
-                     :data    {:timeout-ms timeout-ms
-                               :cause :outer-fence-non-interruptible}}
-           :stdout  (str stdout)
-           :stderr  (str stderr)
-           :success false}
+(defn cancel-evaluation! [handle]
+  (invocation/cancel! (::invocation handle))
+  handle)
 
-          result)))
-    ;; No timeout — direct eval on caller's thread
-    (let [stdout (StringWriter.)
-          stderr (StringWriter.)]
-      (metered
-       (fn []
-         (try
-           (sci-ctx-store/with-ctx sci-ctx
-             (sci/binding [sci/out stdout sci/err stderr]
-               (let [result (sci/eval-string* sci-ctx code)
-                     result (if realize? (pr-str result) result)]
-                 {:value result :stdout (str stdout) :stderr (str stderr) :success true})))
-           (catch Exception e
-             {:error {:message (.getMessage e)
-                      :type    (str (class e))
-                      :data    (ex-data e)
-                      :stacktrace (sci/stacktrace e)}
-              :stdout (str stdout)
-              :stderr (str stderr)
-              :success false})))))))
+(defn join-evaluation! [handle timeout-ms]
+  (invocation/join! (::invocation handle) timeout-ms))
+
+(defn evaluation-finished? [handle]
+  (invocation/finished? (::invocation handle)))
 
 (defn eval-code
-  "Evaluate code in an SCI interpreter, selecting `:execution-context` for
-   ambient Spindel/Yggdrasil capabilities when supplied.
+  "Evaluate in the selected SCI/Spindel world. A timed or cancellable call has a
+   bounded result fence, which is NOT physical worker completion. Consumers that
+   own native Room/application resources use start-evaluation! and retain those
+   owners through actual worker exit. Untimed calls remain synchronous.
 
-   The interpreter selects the SCI world; the Spindel context selects the
-   matching substrate world. Other options are `:timeout-ms`, `:cancel?`, and
-   `:realize?`, as documented by the evaluator above."
-  [sci-ctx code & {:keys [execution-context] :as opts}]
-  (let [args (mapcat identity (dissoc opts :execution-context))]
-    (if execution-context
-      (binding [rtc/*execution-context* execution-context]
-        (apply eval-code* sci-ctx code args))
-      (apply eval-code* sci-ctx code args))))
+   Options: timeout-ms, cancel?, realize?, execution-context. Captured output is
+   bounded while written; truncation flags accompany captured text. realize?
+   prints the value INSIDE the interpreter scope, using current print limits."
+  [sci-ctx code & {:keys [timeout-ms cancel? realize? execution-context]}]
+  (if (or timeout-ms cancel?)
+    (let [handle (start-evaluation! code {:timeout-ms timeout-ms :cancel? cancel? :realize? realize?
+                                          :execution-context execution-context
+                                          :with-interpreter (fn [evaluate _] (evaluate sci-ctx))})]
+      ;; Preserve the legacy result-map facade without implying native ownership.
+      (invocation/await! (::invocation handle)))
+    (let [stdout (output/create) stderr (output/create)
+          body #(captured-output stdout stderr
+                                 (metered (fn []
+                                            (try (eval-value! sci-ctx code (:writer stdout) (:writer stderr) realize? 65536)
+                                                 (catch Throwable error (evaluation-error error))))))]
+      (if execution-context
+        (binding [rtc/*execution-context* execution-context] (body))
+        (body)))))
 
 (defn eval-forms
   "Evaluate multiple forms sequentially in the same context.
