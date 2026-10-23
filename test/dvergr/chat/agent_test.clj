@@ -196,6 +196,23 @@
   [n]
   (assoc (response "") :tool-calls [{:id (str "call-" n) :name "fixture" :input {:n n}}]))
 
+(defn- called
+  "An assistant message calling `code` and its tool result."
+  [id code result]
+  [{:message/role :assistant
+    :message/tool-uses [{:tool-use/id id :tool-use/name "clojure_eval" :tool-use/input {:code code}}]}
+   {:message/role :tool-result :message/tool-use-id id :message/content result}])
+
+(deftest a-repeated-call-is-a-doom-loop-only-when-its-result-repeats
+  (let [load "(load-string (slurp \"/out/model/m.clj\"))"]
+    (testing "the same call, failing the same way, is a loop"
+      (is (= "clojure_eval"
+             (:tool-use/name (agent/detect-doom-loop
+                              (mapcat #(called (str "c" %) load "Evaluation error: boom") (range 3)))))))
+    (testing "reloading a file between edits sees the edits: progress"
+      (is (nil? (agent/detect-doom-loop
+                 (concat (called "c1" load "=> 1") (called "c2" load "=> 2") (called "c3" load "=> 3"))))))))
+
 (deftest silent-after-acting-completes-a-run-without-a-reply
   ;; Codex answers its output schema with {content: "", tool_calls: []} when
   ;; it is done: in a Run that acted, two empty replies end it with no reply
