@@ -120,10 +120,6 @@
    ;; Seeded randomness for simulations: the same seed gives the same worlds,
    ;; so plans compare on common random numbers and a run can be repeated.
    ;; Draws only: the stream methods (`doubles`, `ints`, …) are left out.
-   ;; SCI checks a closed class's static methods only when called directly, not
-   ;; when taken as a value, so the one static here, `Random/from`, stays
-   ;; reachable that way. It only wraps a generator the caller already holds
-   ;; in a `Random`: no authority beyond these draws.
    'java.util.Random
    {:class java.util.Random
     :closed true

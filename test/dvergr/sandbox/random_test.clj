@@ -25,7 +25,10 @@
   (testing "draws only: no streams, no SecureRandom"
     (is (refused? interpreter runtime "(.doubles (java.util.Random. 1))"))
     (is (refused? interpreter runtime "(.ints (java.util.SplittableRandom. 1))"))
-    (is (refused? interpreter runtime "(java.security.SecureRandom.)"))))
+    (is (refused? interpreter runtime "(java.security.SecureRandom.)"))
+    (is (refused? interpreter runtime "(java.util.Random/from (java.util.SplittableRandom. 1))"))
+    (is (refused? interpreter runtime "(let [f java.util.Random/from] (f (java.util.SplittableRandom. 1)))")
+        "a static method taken as a value obeys the closed class")))
 
 (deftest seeded-random-in-session-and-managed-world
   (let [runtime (ctx/create-execution-context)]

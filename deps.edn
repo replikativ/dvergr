@@ -27,8 +27,10 @@
         org.clojure/core.async     {:mvn/version "1.6.681"}
 
         ;; SCI — Small Clojure Interpreter for sandboxing. The replikativ build
-        ;; carries forkable interpreter worlds while sci#1084 is upstreamed.
-        org.replikativ/sci         {:mvn/version "0.15.59-replikativ.1"}
+        ;; carries forkable interpreter worlds while sci#1084 is upstreamed;
+        ;; replikativ.2 is rebased onto upstream 0.15.59 and closes static
+        ;; methods used as values (sci#1118).
+        org.replikativ/sci         {:mvn/version "0.15.59-replikativ.2"}
 
         ;; Dvergr uses the async sequence/CPS namespaces directly; keep this a
         ;; direct dependency instead of relying on Spindel's implementation deps.
