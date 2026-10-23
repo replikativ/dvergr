@@ -51,25 +51,30 @@
   3)
 
 (defn detect-doom-loop
-  "Detect if the agent is stuck calling the same tool with the same arguments.
+  "Detect if the agent is stuck calling the same tool with the same arguments
+   and getting the same result back.
 
-   Checks the last N assistant messages for repeated tool calls.
+   Checks the last N assistant messages for repeated tool calls. A repeat
+   whose result differs is progress, not a loop: reloading a file after
+   editing it is the same call, but it sees the edit.
    Returns the repeated tool-use map if a doom loop is detected, nil otherwise."
   [messages]
-  (let [recent-tool-calls (->> (reverse messages)
+  (let [results (into {} (keep (fn [m]
+                                 (when (= :tool-result (:message/role m))
+                                   [(:message/tool-use-id m) (:message/content m)])))
+                      messages)
+        fingerprint #(hash [(select-keys % [:tool-use/name :tool-use/input])
+                            (get results (:tool-use/id %))])
+        recent-tool-calls (->> (reverse messages)
                                (filter #(= :assistant (:message/role %)))
                                (take 4)
                                (mapcat :message/tool-uses)
                                (take (* doom-loop-threshold 2)))
-        fingerprints (map #(hash (select-keys % [:tool-use/name :tool-use/input]))
-                          recent-tool-calls)
-        freqs (frequencies fingerprints)]
+        freqs (frequencies (map fingerprint recent-tool-calls))]
     (when-let [repeated-hash (some (fn [[h cnt]] (when (>= cnt doom-loop-threshold) h))
                                    freqs)]
       ;; Return the actual repeated tool call for diagnostics
-      (first (filter #(= repeated-hash
-                         (hash (select-keys % [:tool-use/name :tool-use/input])))
-                     recent-tool-calls)))))
+      (first (filter #(= repeated-hash (fingerprint %)) recent-tool-calls)))))
 
 (def fragment-nudge
   "Corrective shown to a model that emitted code as its message instead of
