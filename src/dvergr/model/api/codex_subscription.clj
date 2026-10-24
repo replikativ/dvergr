@@ -509,7 +509,7 @@
     (native-request config credentials messages opts))
 
   (create-accumulator [_ model-def]
-    {:wanted (resolve-native-model (:id model-def))
+    {:wanted (resolve-native-model (or (:base-model model-def) (:id model-def)))
      :content ""
      :reasoning ""
      :tool-calls []

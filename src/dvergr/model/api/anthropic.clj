@@ -59,6 +59,7 @@
                       :stream true
                       :messages (format-messages msgs)}
                system (assoc :system system)
+               (:effort opts) (assoc :output_config {:effort (name (:effort opts))})
                (seq tools) (assoc :tools (p/format-tools _ tools)))}))
 
   (create-accumulator [_ model-def]
