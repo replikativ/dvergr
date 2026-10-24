@@ -49,6 +49,7 @@
             [dvergr.discourse.generation :as gen]
             [dvergr.chat.context :as cc]
             [dvergr.chat.agent :as ca]
+            [dvergr.chat.outcome :as turn-outcome]
             [dvergr.agent.run :as run]
             [dvergr.agent.program :as program]
             [dvergr.agent.turn :as turn]
@@ -334,7 +335,8 @@
                   `(tools/make-context {:db-conn :chat-ctx})`. Override
                   when SCI sandbox, KB write namespaces, or pre-wrapped
                   tools are needed.
-   :run-turn-fn — (fn [chat-ctx opts] → :complete | :continue | :error)
+   :run-turn-fn — (fn [chat-ctx opts] → :complete | :continue | :error,
+                  or the closed `dvergr.chat.outcome` stopped outcome)
                   Override for testing or to inject per-turn behaviour
                   (e.g. usage logging). Default calls
                   `dvergr.chat.agent/run-agent-turn!`.
@@ -515,7 +517,9 @@
                                (case reason
                                  :abandoned (abandon!)
                                  :handler-failed
-                                 (run/finish-durably! run-id :failed {:reason :error :error error})
+                                 (run/finish-durably! run-id :failed
+                                                      {:reason (or (turn-outcome/error-stop-reason error) :error)
+                                                       :error error})
                                  (run/finish-durably! run-id :completed {:reason reason})))}))
                          ;; Convenience delegation tools still target the same
                          ;; Run interpreter. Give them the current structural
@@ -922,6 +926,9 @@
                                      (gen/error-result? result)
                                      (do (reset! errored (:dvergr.discourse.generation/error result)) nil)
 
+                                     (turn-outcome/stopped? result)
+                                     (do (reset! errored (turn-outcome/as-error result)) nil)
+
                                ;; LLM finished cleanly (no more tool calls).
                                      (not= result :continue) nil
 
@@ -1056,9 +1063,12 @@
                                (abandon!)
                                (run/finish-durably! run-id status
                                                     (cond-> {}
-                                                      cancelled-run? (assoc :reason :cancel-requested)
-                                                      @wait-reason (assoc :reason @wait-reason)
-                                                      @errored (assoc :reason :error :error @errored)))))))))))))
+                                                      (or cancelled-run? @errored @wait-reason)
+                                                      (assoc :reason (cond
+                                                                       cancelled-run? :cancel-requested
+                                                                       @errored (or (turn-outcome/error-stop-reason @errored) :error)
+                                                                       :else @wait-reason))
+                                                      @errored (assoc :error @errored)))))))))))))
 
             :factory
             (fn [new-ctx]

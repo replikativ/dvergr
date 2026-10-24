@@ -9,6 +9,7 @@
             [dvergr.discourse.llm :as llm]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as cc]
+            [dvergr.chat.outcome :as turn-outcome]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.provider :as model-provider]
             [dvergr.model.providers :as model-providers]
@@ -610,6 +611,63 @@
 ;; soft-wraps on grace-timeout). End-to-end coverage of that flow lives
 ;; in the REPL smoke test for now; a unit test would need a mock
 ;; chat-ctx whose budget signal can be flipped to exhausted on demand.
+
+(deftest controlled-stop-fails-the-run-without-posting-a-placeholder-and-can-answer-again
+  (let [r (d/make-room {:id :controlled-stop-participant :store (memory/make)})
+        calls (atom 0)
+        stopped (promise)
+        key (random-uuid)
+        turn-fn (fn [ctx _]
+                  (if (= 1 (swap! calls inc))
+                    (do (cc/add-message! ctx {:role :assistant :content "Tool calls: [fixture]"})
+                        turn-outcome/repeated-tool-call)
+                    (do (cc/add-message! ctx {:role :assistant :content "recovered answer"}) :complete)))]
+    (try
+      (run/watch-runs! key (fn [{:keys [type run]}]
+                             (when (and (= :run/finished type) (= (:id r) (:run/room run)))
+                               (deliver stopped run))))
+      (binding [ec/*execution-context* (:ctx r)]
+        (d/join r (llm/llm-agent {:id :worker :spec {:provider :mock :model "mock"} :run-turn-fn turn-fn})))
+      (d/post! r (d/message :human :worker "first request"))
+      (let [record (deref stopped wait-ms ::timeout)]
+        (is (= :failed (:run/status record)))
+        (is (= :repeated-tool-call (:run/reason record)))
+        (is (not-any? #(= "Tool calls: [fixture]" (:content %)) (d/messages r)))
+        (is (some #(and (= :_activity (:to %))
+                        (re-find #"repeated identical tool calls" (str (:content %)))) (d/messages r))))
+      (is (= "recovered answer" (:content (await-spin r #(d/ask % :worker {:content "try a different task"})))))
+      (is (empty? (run/active-runs (:id r))))
+      (finally (run/unwatch-runs! key) (d/close-room! r)))))
+
+(deftest cancellation-before-controlled-stop-finalization-keeps-cancel-reason
+  (let [r (d/make-room {:id :cancel-controlled-stop :store (memory/make)})
+        stopped (promise) key (random-uuid) stopping (atom nil)
+        release d/release-obligation!
+        turn-fn (fn [_ {:keys [run-id]}]
+                  (reset! stopping run-id)
+                  turn-outcome/repeated-tool-call)]
+    (try
+      (run/watch-runs! key (fn [{:keys [type run]}]
+                             (when (and (= :run/finished type) (= (:id r) (:run/room run)))
+                               (deliver stopped run))))
+      (with-redefs [d/release-obligation!
+                    (fn [& args]
+                      ;; The stop has been observed, and the participant has
+                      ;; reached its existing finalization boundary. Request
+                      ;; actual cancellation before that boundary samples it.
+                      (when-let [id @stopping]
+                        (reset! stopping nil)
+                        (run/cancel-run! id))
+                      (apply release args))]
+        (binding [ec/*execution-context* (:ctx r)]
+          (d/join r (llm/llm-agent {:id :worker :spec {:provider :mock :model "mock"} :run-turn-fn turn-fn})))
+        (d/post! r (d/message :human :worker "cancel at finalization"))
+        (let [record (deref stopped wait-ms ::timeout)]
+          (is (= :cancelled (:run/status record)))
+          (is (= :cancel-requested (:run/reason record)))
+          (is (= :cancel-requested (:run/reason (run/run r (:run/id record)))))
+          (is (empty? (run/active-runs (:id r))))))
+      (finally (run/unwatch-runs! key) (d/close-room! r)))))
 
 (deftest error-turn-terminates-cleanly
   (testing "Agent returns last assistant message even if a turn errors"
