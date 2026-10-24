@@ -26,7 +26,8 @@
 
    `(c/spawn …)` covers the embed-one-agent-as-a-value case (no pre-existing
    daemon needed — `start!` boots a lite one)."
-  (:require [clojure.java.shell]
+  (:require [dvergr.runtime.threads :as threads]
+            [clojure.java.shell]
             [dvergr.audio.record :as rec]
             [dvergr.actors :as actors]
             [dvergr.orchestration.daemon :as daemon]
@@ -296,7 +297,7 @@
                    (try! n (when (> (count n) (count o)) (peek n))))))
     (doseq [e (:entries @log-atom) :while (not (realized? p))]
       (try! (:entries @log-atom) e))
-    (future (try @p (finally (remove-watch log-atom wid))))
+    (threads/future (try @p (finally (remove-watch log-atom wid))))
     p))
 
 (defn done
@@ -314,7 +315,7 @@
   (let [log-atom (:log (:bus fork))
         p (promise), last-at (atom (System/currentTimeMillis)), wid (random-uuid)]
     (add-watch log-atom wid (fn [_ _ _ _] (reset! last-at (System/currentTimeMillis))))
-    (future
+    (threads/future
       (try
         (loop []
           (when-not (realized? p)

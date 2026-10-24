@@ -22,7 +22,8 @@
    Teardown: spindel `track` has no disposal handle, so a torn-down room's spin
    keeps tracking but no-ops via its `:running?` flag (cleared on unregister).
    A negligible lingering no-op per deleted/discarded room until restart."
-  (:require [datahike.api :as dh]
+  (:require [dvergr.runtime.threads :as threads]
+            [datahike.api :as dh]
             [dvergr.agent.room-context :as room-context]
             [dvergr.chat.context :as chat-context]
             [dvergr.discourse :as disc]
@@ -72,7 +73,7 @@
    result while it's bound). Errors are caught and reported the same
    way; a fire never throws out of the scheduler."
   [room aid s]
-  (future
+  (threads/future
     ;; A future conveys its caller's bindings; the eval is not on the
     ;; scheduler spin's drain.
     (binding [simple/*in-drain?* false

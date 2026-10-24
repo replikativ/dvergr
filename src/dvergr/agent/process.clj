@@ -17,7 +17,8 @@
 
    Effects are applied by `run-effect!`, a multimethod against
    chat-ctx — unknown ops are logged and skipped, never crash."
-  (:require [org.replikativ.spindel.engine.core :as ec]
+  (:require [dvergr.runtime.threads :as threads]
+            [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.signal :as sig]
             [dvergr.chat.context :as chat-ctx]
@@ -427,7 +428,7 @@
               :started-at        (System/currentTimeMillis)
               :terminated-at-ref (AtomicReference. nil)})))]
     (swap-registry! process-chat-ctx assoc pid process)
-    (future
+    (threads/future
       (binding [*current-process*    process
                 ec/*execution-context* world
                 ;; Clojure futures convey dynamic bindings from their creator.

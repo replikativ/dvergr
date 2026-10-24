@@ -5,7 +5,8 @@
    ChatGPT Codex Responses endpoint. The trusted gateway injects file-backed
    subscription credentials. `create-cli` retains the earlier isolated
    `codex exec` adapter for keyring logins and wire-compatibility fallback."
-  (:require [clojure.string :as str]
+  (:require [dvergr.runtime.threads :as threads]
+            [clojure.string :as str]
             [dvergr.chat.tool-schema :as tool-schema]
             [dvergr.model.api.codex-auth :as codex-auth]
             [dvergr.model.provider :as p]
@@ -153,7 +154,7 @@
 (defn- default-runner [command prompt]
   (let [process (.start (doto (ProcessBuilder. ^java.util.List command)
                           (.redirectErrorStream false)))
-        stderr-future (future (slurp (.getErrorStream process)))]
+        stderr-future (threads/future (slurp (.getErrorStream process)))]
     (try
       (with-open [stdin (.getOutputStream process)]
         (.write stdin (.getBytes ^String prompt StandardCharsets/UTF_8)))

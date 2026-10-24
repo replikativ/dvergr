@@ -12,7 +12,8 @@
 
    Like the room message signal (`dvergr.rooms.messages`) it lives in the root
    context, is created when the room registers and dropped when it goes."
-  (:require [dvergr.room.registry :as rreg]
+  (:require [dvergr.runtime.threads :as threads]
+            [dvergr.room.registry :as rreg]
             [dvergr.room.store :as store]
             [dvergr.runtime.ctx :as rctx]
             [org.replikativ.spindel.core :as sp]
@@ -86,12 +87,12 @@
                     (let [wait (- (+ @last-at min-interval-ms) (System/currentTimeMillis))]
                       (if (pos? wait)
                         (when (compare-and-set! pending? false true)
-                          (future (Thread/sleep wait)
-                                  (reset! pending? false)
-                                  (fire!)))
+                          (threads/future (Thread/sleep wait)
+                                          (reset! pending? false)
+                                          (fire!)))
                         (do (reset! last-at (System/currentTimeMillis))
                             ;; Off the drain: a slow consumer must not hold it.
-                            (future
+                            (threads/future
                               (try (f)
                                    (catch Throwable t
                                      (tel/log! {:level :warn :id ::watcher-failed

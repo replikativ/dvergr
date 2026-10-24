@@ -6,7 +6,8 @@
    outcome, invokes a matching host-owned verifier, and produces an attempt
    receipt. Parallelism, races, quorums, and later inference policies compose
    these Spins with the existing Spindel combinators."
-  (:require [clojure.string :as str]
+  (:require [dvergr.runtime.threads :as threads]
+            [clojure.string :as str]
             [dvergr.agent.environment :as environment]
             [dvergr.effects :as effects]
             [dvergr.sandbox.extensions :as extensions]
@@ -163,7 +164,7 @@
     (swap! pending-tasks update scope (fnil assoc {}) token
            {:gate gate :group group})
     (let [worker
-          (future
+          (threads/future
             (deliver started true)
             (let [outcome
                   (try

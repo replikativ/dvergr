@@ -39,7 +39,8 @@
    Conversation state is per-participant (one chat-ctx per agent instance).
    On fork-room, the agent is re-created fresh (no history carryover; this
    matches ToM probe semantics). Future: snapshot-based history carryover."
-  (:require [clojure.string :as str]
+  (:require [dvergr.runtime.threads :as threads]
+            [clojure.string :as str]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
             [dvergr.discourse :as d]
@@ -654,7 +655,7 @@
                                                  .isDone))
                                  (when (compaction/should-compact? chat-ctx)
                                    (reset! compaction-h
-                                           (future
+                                           (threads/future
                                              (binding [ec/*execution-context* turn-ctx]
                                                (try
                                                  (compaction/maybe-compact!

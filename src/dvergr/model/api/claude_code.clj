@@ -19,7 +19,8 @@
    `configure!` pins the CLI binary and appends an optional note to every
    system prompt (the CLI injects host context -- the account email and the
    current date -- that cannot be switched off)."
-  (:require [dvergr.model.provider :as p]
+  (:require [dvergr.runtime.threads :as threads]
+            [dvergr.model.provider :as p]
             [dvergr.model.quirks :as quirks]
             [dvergr.model.subscription :as subscription]
             [dvergr.chat.tool-schema :as tool-schema]
@@ -111,8 +112,8 @@
                  argv [(:path binary) "--version"]
                  process (.start (doto (ProcessBuilder. ^java.util.List (if owned? (cli-process/command argv) argv))
                                    (.redirectErrorStream true)))
-                 output (future (with-open [reader (java.io.InputStreamReader. (.getInputStream process))]
-                                  (cli-process/read-bounded reader 4096 #(stop! process))))]
+                 output (threads/future (with-open [reader (java.io.InputStreamReader. (.getInputStream process))]
+                                          (cli-process/read-bounded reader 4096 #(stop! process))))]
              (try
                (when (and (.waitFor process 2000 TimeUnit/MILLISECONDS) (zero? (.exitValue process)))
                  (let [out (deref output 1000 nil)]
@@ -790,7 +791,7 @@
         on-text (:on-text opts)
         ;; Claude can fill the OS stderr pipe before producing stdout. Drain it
         ;; from process start so neither stream can block the other.
-        stderr-future (future (cli-process/read-bounded stderr-reader 2097152 #(terminate-process! process)))
+        stderr-future (threads/future (cli-process/read-bounded stderr-reader 2097152 #(terminate-process! process)))
         stdout-remaining (volatile! 16777216)
         cancelled? (atom false)
         monitor-done? (atom false)
@@ -799,7 +800,7 @@
         last-activity (atom (System/currentTimeMillis))
         stalled? (atom false)
         stall-monitor
-        (future
+        (threads/future
           (try
             (loop []
               (when (not @monitor-done?)
@@ -816,7 +817,7 @@
                         "Claude Code stall monitor failed"))))
         cancel-monitor
         (when cancel?
-          (future
+          (threads/future
             (try
               (loop []
                 (when (not @monitor-done?)

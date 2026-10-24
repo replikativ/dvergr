@@ -34,6 +34,7 @@
             [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]
+            [org.replikativ.spindel.engine.impl.delayed :as delayed]
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.spin.combinators :as comb]
@@ -1159,6 +1160,21 @@
   [room]
   (boolean (some-> room :meta deref :forked-from)))
 
+(defn- release-fork-timers!
+  "Cancel the timers a fork scheduled in its own execution context.
+
+   A fork room's context is never closed (it shares its root's executor and
+   running flag), so nothing else cancels them: a pending timeout or sleep
+   would keep the whole fork context, and everything it holds, reachable from
+   the timer queue until it fired. Only a room created as an isolated fork owns
+   its context (`:fork-handle` is its ForkHandle's atom, kept after settlement);
+   a forked context starts with no timer handles, so they are the fork's own. A
+   `:none` fork, nested or not, shares another room's context and is left alone."
+  [room]
+  (when-let [c (:ctx room)]
+    (when (and (fork-room? room) (:fork-handle room))
+      (delayed/cancel-all-timers! c))))
+
 (defn- room-home-ctx
   "Context holding `room`'s registry entry. Isolated forks register in parent."
   [room]
@@ -1253,6 +1269,7 @@
          (when (and close-context? (not (fork-room? room)))
            (assert-context-unshared! room))
          (leave-all! room)
+         (release-fork-timers! room)
          (binding [ec/*execution-context* (room-home-ctx room)]
            (rreg/unregister! (:id room)))
         ;; A branchless fork carries the exact root ctx, so Spindel cannot infer from
@@ -2191,9 +2208,19 @@
    affine authority and every partition node must list all children before the
    structural ancestry claim is released."
   [{:fork/keys [handle room-id] :as transfer}]
+  ;; Only the aggregate tree settles the whole world: a partition node's
+  ;; siblings may still be open, and they share this node's context.
+  (when (contains? (ygg/fork-descriptor handle) :fork/partition-of)
+    (throw (ex-info "Release the transferred fork's aggregate tree, not a partition of it"
+                    {:type ::partition-cannot-release
+                     :fork/id room-id})))
   (assert-transferred-node-settled! transfer #{} false)
   (binding [ec/*execution-context* (:parent-ctx handle)]
     (rreg/untrack-fork! room-id (:fork-id handle)))
+  ;; Every leaf of the whole tree has settled (partition leaves share this
+  ;; context): its timers are released here, once, as `release-fork-timers!`
+  ;; does for a fork settled in place.
+  (delayed/cancel-all-timers! (:child-ctx handle))
   nil)
 
 (defmacro with-fork-ctx
@@ -2375,6 +2402,7 @@
                       (ygg/discard-fork! handle)
                       (srooms/drop-fork-grants! pending)))
                   (leave-all! fork)
+                  (release-fork-timers! fork)
                   (binding [ec/*execution-context* (fork-home-ctx fork)]
                     (rreg/untrack-fork! (:id fork) (some-> fork fork-handle :fork-id))
                     (rreg/unregister! (:id fork))
@@ -2544,6 +2572,7 @@
              (try ((requiring-resolve 'dvergr.rooms.messages/refresh!) parent)
                   (catch Throwable _ nil))
              (leave-all! fork)
+             (release-fork-timers! fork)
              (binding [ec/*execution-context* (fork-home-ctx fork)]
                (rreg/untrack-fork! (:id fork) (some-> fork fork-handle :fork-id))
                (rreg/unregister! (:id fork))

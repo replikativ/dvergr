@@ -23,7 +23,8 @@
    adapter is a particular λ that fits its F-side. Swap adapters to
    change F's shape without touching the agent's G-side spin."
   (:refer-clojure :exclude [await])
-  (:require [is.simm.partial-cps.sequence :as aseq]
+  (:require [dvergr.runtime.threads :as threads]
+            [is.simm.partial-cps.sequence :as aseq]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.spin.cps :refer [spin]]
             [org.replikativ.spindel.spin.sync :as sync]
@@ -96,7 +97,7 @@
                  (when-let [f @fut-a] (future-cancel f))
                  nil)]
     (reset! fut-a
-            (future
+            (threads/future
               (when (compare-and-set! phase :pending :running)
                 (binding [ec/*execution-context* ctx]
                   (try

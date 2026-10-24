@@ -1,7 +1,8 @@
 (ns dvergr.agent.subexperiment
   "An SCI child experiment uses ordinary Jobs, evaluation and conserved wallets.
    This adapter owns no candidate state and introduces no new execution engine."
-  (:require [dvergr.agent.experiment-admission :as admission]
+  (:require [dvergr.runtime.threads :as threads]
+            [dvergr.agent.experiment-admission :as admission]
             [dvergr.agent.authority :as authority]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.evaluation :as evaluation]
@@ -65,7 +66,7 @@
                                            (instance? Throwable value) (assoc :error (ex-message value)))))
                      (finally (deliver settled true)))))]
             {:run/id (:id job)
-             ::program/on-settled! (fn [acknowledge!] (future @settled (acknowledge!)))
+             ::program/on-settled! (fn [acknowledge!] (threads/future @settled (acknowledge!)))
              ::program/cancel! #(run/cancel-room-run! (:id control-room) (:id job))}))
         handle (if-let [own! (:own-child! authority)] (own! admit!) (admit!))
         id (:run/id handle)]
