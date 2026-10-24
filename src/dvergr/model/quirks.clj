@@ -279,4 +279,6 @@
                ;; prose can't trip it.
               (and (re-find #"[(\[{]" structural)
                    (neg? (delimiter-balance structural)))
-              (re-find #"<arg_key>|<tool_call>" s))))))
+              ;; GLM's envelope, and Claude's tool_use / invoke forms in
+              ;; any spelling a model mixes them into (`<invoke/tool_use>`)
+              (re-find #"<arg_key>|<tool_call>|</?tool_use[\s>/]|</?invoke[\s>/]" s))))))

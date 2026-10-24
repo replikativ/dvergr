@@ -32,7 +32,13 @@
 
   (testing "a tool-call envelope surviving in content is a leak, not a reply"
     (is (quirks/code-fragment? "Tool calls: [\"clojure_eval\"] <arg_key>code</arg_key>"))
-    (is (quirks/code-fragment? "<tool_call>shell"))))
+    (is (quirks/code-fragment? "<tool_call>shell"))
+    (testing "Claude's forms, also mangled (the shape a Haiku attempt sent, ending after one step)"
+      (is (quirks/code-fragment? "<invoke/tool_use>\n{\"name\": \"clojure_eval\", \"input\": {\"code\": \"(slurp \\\"/inputs/brief.md\\\")\"}}\n</tool_use>"))
+      (is (quirks/code-fragment? "<tool_use>\n{\"name\": \"read_file\"}\n</tool_use>"))
+      (is (quirks/code-fragment? "<invoke name=\"clojure_eval\">")))
+    (testing "prose that names the forms is not a call"
+      (is (not (quirks/code-fragment? "I used the tool_use protocol and invoked the checker."))))))
 
 (deftest code-fragment-leaves-real-replies-alone
   (testing "prose"
