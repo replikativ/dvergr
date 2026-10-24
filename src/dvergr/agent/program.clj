@@ -11,7 +11,8 @@
    (doc/runs.md, Resuming a Run). `run-inputs`/`inputs-id` say what a Run presents to its
    candidate when it starts (assembled prompt, tools, resolved model), which an
    experiment's resume compares per cell."
-  (:require [dvergr.agent.roster :as roster]
+  (:require [clojure.string :as str]
+            [dvergr.agent.roster :as roster]
             [dvergr.agent.sci-program :as sci-program]
             [dvergr.agent.authority :as delegation]
             [dvergr.sandbox.extensions :as extensions]
@@ -796,6 +797,17 @@
 (defn- result-content [value]
   (if (string? value) value (pr-str value)))
 
+(defn- missing-outputs-note
+  "The note for a model that ended its turn before writing the files the
+   environment requires (`:required-outputs`), or nil when they exist."
+  [tool-ctx required]
+  (when-let [missing (seq (remove #(try (tools/workspace-file? tool-ctx %) (catch Exception _ false))
+                                  required))]
+    (str "You ended your turn, but " (str/join ", " missing)
+         (if (next missing) " do not exist yet." " does not exist yet.")
+         " The task is scored on " (if (next required) "those files" "that file")
+         " alone: write " (if (next missing) "them" "it") " before you finish.")))
+
 (defn- last-assistant-content [chat-ctx]
   (some->> (chat-context/get-messages chat-ctx)
            reverse
@@ -1232,6 +1244,9 @@
                          (-> (- (/ (double (or (get-in agent [::resume :spent]) 0)) 1e6)) (max 0.0))
                          spend-wallet
                          (min (/ (double (resource/wallet-microdollars control-room run-id)) 1e6)))
+        ;; files the task is scored on: a turn that ends without them is
+        ;; told once and continues
+        required-outputs (seq (:required-outputs limits))
         effective-limits {:max-model-steps max-model-steps
                           :budget-dollars budget-dollars}]
     (sp/spin
@@ -1350,36 +1365,46 @@
                               resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
                                       (assoc :cancel? #(cancelled-or-expired? supervisor run-id)))]
-                      (with-model-entry-checked supervisor run-id model-inputs [model-spec compaction]
-                        (chat-agent/run-agent-turn!
-                         chat-ctx
-                         {:provider (:provider model-spec)
-                          :model (:model model-spec)
+                      (let [outcome (with-model-entry-checked supervisor run-id model-inputs [model-spec compaction]
+                                      (chat-agent/run-agent-turn!
+                                       chat-ctx
+                                       {:provider (:provider model-spec)
+                                        :model (:model model-spec)
                         ;; The SAME normalized map defines both the model schema
                         ;; and execute-side authority. Empty means no tools.
-                          :tools tool-map
-                          :tool-ctx tool-ctx
-                          :cancel? (turn/cancel?-fn
-                                    chat-ctx (:ctx work-room)
-                                    (fn [] (cancelled-or-expired? supervisor run-id)))
-                          :auto-compact? auto-compact?
+                                        :tools tool-map
+                                        :tool-ctx tool-ctx
+                                        :cancel? (turn/cancel?-fn
+                                                  chat-ctx (:ctx work-room)
+                                                  (fn [] (cancelled-or-expired? supervisor run-id)))
+                                        :auto-compact? auto-compact?
                           ;; the one its inputs id names
-                          :compaction-model (:model compaction)
+                                        :compaction-model (:model compaction)
                       ;; The existing single-exchange core still calls this
                       ;; trace field `turn-number`; semantically it is a model
                       ;; integration step, not a conversational turn.
-                          :turn-number model-step
-                          :run-id run-id
+                                        :turn-number model-step
+                                        :run-id run-id
                         ;; The world this Run works in, for an adapter whose
                         ;; model is an external agent (claude -p): it invokes
                         ;; that agent INTO this room over MCP.
-                          :model-opts (cond-> {:room-id (let [id (:id work-room)]
-                                                          (if (keyword? id) (subs (str id) 1) (str id)))
+                                        :model-opts (cond-> {:room-id (let [id (:id work-room)]
+                                                                        (if (keyword? id) (subs (str id) 1) (str id)))
                                        ;; whose run token it gets (dvergr.principal)
-                                               :actor (:agent/id agent) :run-id run-id}
-                                        (get-in agent [:agent/program :execution-mode])
-                                        (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
-                                               :expected-provider-policy provider-policy))})))))
+                                                             :actor (:agent/id agent) :run-id run-id}
+                                                      (get-in agent [:agent/program :execution-mode])
+                                                      (assoc :execution-mode (get-in agent [:agent/program :execution-mode])
+                                                             :expected-provider-policy provider-policy))}))]
+                        ;; ended its turn without the files the environment
+                        ;; requires: say so once, and go on
+                        (if-let [note (when (and (= :complete outcome) required-outputs
+                                                 (not (:outputs-nudged? @activity)))
+                                        (missing-outputs-note tool-ctx required-outputs))]
+                          ;; the turn's silent finish is superseded too
+                          (do (vswap! activity #(-> % (assoc :outputs-nudged? true) (dissoc :silent?)))
+                              (chat-context/add-system-note! chat-ctx note :important? true)
+                              :continue)
+                          outcome)))))
                  outcome (sp/await (worker-result-spin call))
                  _ (worker-stage! supervisor (:id call) :normal :resumed (:started-nanos call))
                  budget (chat-context/get-budget chat-ctx)]
@@ -1747,12 +1772,17 @@
   (when-not (or (nil? limits) (map? limits))
     (throw (ex-info "hire! :limits must be a map"
                     {:type ::invalid-limits :limits limits})))
-  (when-let [unknown (seq (remove #{:max-model-steps :budget-dollars}
+  (when-let [unknown (seq (remove #{:max-model-steps :budget-dollars :required-outputs}
                                   (keys limits)))]
     (throw (ex-info "hire! :limits contains unknown keys"
                     {:type ::unknown-limit-options
                      :unknown (set unknown)
-                     :allowed #{:max-model-steps :budget-dollars}})))
+                     :allowed #{:max-model-steps :budget-dollars :required-outputs}})))
+  (when-let [paths (:required-outputs limits)]
+    (when-not (and (vector? paths) (seq paths)
+                   (every? #(and (string? %) (str/starts-with? % "/")) paths))
+      (throw (ex-info "hire! limit :required-outputs must be a vector of absolute paths"
+                      {:type ::invalid-required-outputs :required-outputs paths}))))
   (when-let [value (:max-model-steps limits)]
     (when-not (and (integer? value) (<= 1 value 256))
       (throw (ex-info "hire! limit :max-model-steps must be an integer from 1 to 256"
@@ -2527,7 +2557,8 @@
    - `:parent-run` explicit structural parent Run UUID
    - `:settlement` `:automatic` (default), `:review`, `:discard`, or host-owned `:deferred`
    - `:resources`  positive conserved vector split from the parent Run/Room
-   - `:limits`     restrictive LLM `:max-model-steps` / `:budget-dollars`
+   - `:limits`     restrictive LLM `:max-model-steps` / `:budget-dollars`, and
+                   `:required-outputs` (files a turn must not end without)
    Built-in program kinds are deterministic `:scripted` / `:echo`, pinned
    `:sci` source entrypoints and the bounded `:llm` model/tool loop. (No simulation or replay
    interpreter exists; one would implement the same boundary.)"

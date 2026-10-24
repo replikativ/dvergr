@@ -81,11 +81,11 @@
    calling a tool. Names the mistake and the fix, without scolding — and it is
    idempotent: `nudged-for-fragment?` matches on this exact text so we say it at
    most once per turn loop."
-  (str "Your last message was CODE, not a reply to the room. Nobody ran it and "
-       "nobody read it.\n\n"
-       "If you meant to execute it, call the `clojure_eval` tool with that code "
-       "as the `code` argument — code placed in the message body is never "
-       "executed.\n\n"
+  (str "Your last message was CODE or a tool call written as text, not a reply "
+       "to the room. Nobody ran it and nobody read it.\n\n"
+       "If you meant to execute it, call the tool itself (for code, `clojure_eval` "
+       "with the code as the `code` argument) — a call or code placed in the "
+       "message body is never executed.\n\n"
        "If you meant to speak to the humans, write prose."))
 
 (def empty-response-nudge

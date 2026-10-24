@@ -262,6 +262,26 @@
   ;; this, "Sounds good :)" balances to -1 and reads as truncated code.
   #"[:;=8][-o^]?[)\](\[]")
 
+(defn- claude-call-as-text?
+  "A Claude tool call written as text instead of made: the reply opens with a
+   `<tool_use>` / `<invoke>` tag, in any spelling a model mixes them into
+   (`<invoke/tool_use>`), or such a tag carries a `{\"name\": …}` call. Code
+   in fences or backticks is an example, not a call, and a reply that only
+   names the tags is prose."
+  [s]
+  (let [prose (-> s
+                  ;; fenced blocks (CommonMark): opened at a line start by 3+
+                  ;; backticks or tildes, closed only by a line of the same
+                  ;; character at least as long, else running to the end
+                  (str/replace #"(?ms)^ {0,3}(?:(`{3,})|(~{3,}))[^\n]*$.*?(?:^ {0,3}(?:\1`*|\2~*)[ \t]*$|\z)" "")
+                  ;; inline code: closed only by a backtick run of the same
+                  ;; length, across lines too
+                  (str/replace #"(?s)(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)" "")
+                  str/trim)]
+    (boolean
+     (or (re-find #"^</?(?:tool_use|invoke)[\s>/]" prose)
+         (re-find #"(?s)</?(?:tool_use|invoke)[^>]*>\s*\{\s*\"name\"" prose)))))
+
 (defn code-fragment?
   "True when assistant `content` is code fumbled into the prose channel rather
    than a message meant for a human. See the note above — conservative by
@@ -279,4 +299,5 @@
                ;; prose can't trip it.
               (and (re-find #"[(\[{]" structural)
                    (neg? (delimiter-balance structural)))
-              (re-find #"<arg_key>|<tool_call>" s))))))
+              (re-find #"<arg_key>|<tool_call>" s)
+              (claude-call-as-text? s))))))

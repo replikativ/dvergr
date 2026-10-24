@@ -25,7 +25,7 @@ A directory in the room's repository, `workflows/<name>/`:
 
 | File | What |
 |---|---|
-| `workflow.edn` | `{:title :doc :params {…defaults} :task "template with {param}" :profile :capture ["/out"] :timeout-ms :score-on-timeout}` |
+| `workflow.edn` | `{:title :doc :params {…defaults} :task "template with {param}" :profile :capture ["/out"] :outputs ["/out/answer.edn"] :timeout-ms :score-on-timeout}` |
 | `checker.clj` | a namespace with `(check {:files … :params … :gold …}) → {:checks {k bool} :reward 0..1}`, over the files the Attempt left under the captured directories (receipts later) |
 | `gold.edn`, `fixtures/` | the reference facts and the documents a benchmark world starts from, or |
 | `generator.clj` | `(world seed opts) → {:docs … :gold …}`, for generated benchmark sets with splits |
@@ -37,6 +37,10 @@ An Attempt that runs past `:timeout-ms` scores 0, whatever it wrote. With `:scor
 true` it is scored on the files it left instead, its `:completed?` check false and its
 receipt marked timed out: for tasks whose answer is a file the agent keeps current while it
 works.
+
+`:outputs` names the files the answer must be in. An LLM candidate that ends its turn while
+one is missing is told so once and continues, instead of finishing with nothing to score (a
+model sometimes ends by announcing its next step, or writes a tool call as text).
 
 ## Lifecycle
 

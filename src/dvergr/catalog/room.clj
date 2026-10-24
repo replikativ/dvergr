@@ -54,6 +54,9 @@
    [:review {:optional true} :map]
    [:workflow/writes {:optional true} :map]
    [:capture {:optional true} [:vector [:re #"^/[^.]*$"]]]
+   ;; files the answer must be in: an attempt that ends its turn without them
+   ;; is told once and continues
+   [:outputs {:optional true} [:vector {:min 1} [:re #"^/.+"]]]
    ;; give the checker the pages the attempt fetched (`:fetched {url body}`)
    [:fetched {:optional true} :boolean]
    ;; a model that answers the checker's `judge-requests` (e.g. is a new find
@@ -487,8 +490,9 @@
       :task (task b params)
       ;; the basis names the bundle: a changed checker is a different verifier
       :verifier {:id (:verifier/id ref) :version (:verifier/version ref) :basis (:verifier/basis ref)}
-      :limits {:timeout-ms (or timeout-ms (:timeout-ms definition) (* 10 60 1000))
-               :cancel-timeout-ms 30000 :on-timeout :verdict}
+      :limits (cond-> {:timeout-ms (or timeout-ms (:timeout-ms definition) (* 10 60 1000))
+                       :cancel-timeout-ms 30000 :on-timeout :verdict}
+                (:outputs definition) (assoc :required-outputs (:outputs definition)))
       :world (let [fx (cond-> {}
                          ;; the checker is given what the attempt fetched: record it
                         (:fetched definition) (assoc :record true)

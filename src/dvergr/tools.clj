@@ -270,6 +270,15 @@
       (mfs/read-file filesystem path)
       (slurp path))))
 
+(defn workspace-file?
+  "Is `path` a file in the workspace of tool context `ctx`, resolved as the
+   file tools resolve it?"
+  [ctx path]
+  (let [path (tool-path ctx path)]
+    (if-let [filesystem (:filesystem ctx)]
+      (= :file (:type (mfs/stat filesystem path)))
+      (fs/regular-file? path))))
+
 (declare effect-boundary)
 
 (defn- make-parents!
