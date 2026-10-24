@@ -396,12 +396,22 @@
       (testing "an unwatched Run leaves no record"
         (run/cancel-run! unwatched)
         (is (nil? (run/watched-cancel-time unwatched))))
-      (testing "unwatching drops it"
-        (run/unwatch-cancel-time! run-id)
-        (is (nil? (run/watched-cancel-time run-id))))
+      (testing "taking it returns and drops it; a later request records nothing"
+        (let [t (run/watched-cancel-time early)]
+          (is (= t (run/take-cancel-time! early)))
+          (is (nil? (run/watched-cancel-time early)))
+          (run/cancel-run! early)
+          (is (not (contains? @@#'run/watched-cancel-times early)) "no entry recreated")))
+      (testing "a Run watched before it starts has its first request recorded"
+        (let [id (random-uuid)]
+          (run/watch-cancel-time! id)
+          (run/start! room :agent (d/message :alice :agent "work") nil {:id id})
+          (run/cancel-run! id)
+          (is (some? (run/take-cancel-time! id)))
+          (run/finish! id :cancelled)))
       (finally
         (deliver release true)
         (doseq [id [run-id early unwatched]]
-          (run/unwatch-cancel-time! id)
+          (run/take-cancel-time! id)
           (run/finish! id :cancelled))
         (d/close-room! room)))))

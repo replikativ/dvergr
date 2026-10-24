@@ -853,12 +853,17 @@
             ;; the store, so it runs off the drain. (It once hung there at
             ;; :parallelism 8: spins built on several threads at once shared
             ;; ids, spindel#110.)
+            ;; the Run's id, chosen here so its cancellation time is watched
+            ;; before it can be requested (and the Run retire)
+            run-id (random-uuid)
+            _ (run/watch-cancel-time! run-id)
             admission (tracked-admission
                        room cleanup-group
                        #(program/hire-prepared-in! room (or world-parent room) team agent-ref
                                                    hire-opts prepare-world! hosted-protocol
                                                    (assoc (select-keys opts [:experiment-capabilities :delegation-policy])
-                                                          :deadline-nanos deadline-nanos))
+                                                          :deadline-nanos deadline-nanos
+                                                          :id run-id))
                        #(program/cancel! room %)
                        #(abandon-completed-admission! room %1 %2))]
         (try
@@ -875,12 +880,9 @@
                                               :phase :admission :cleanup/group cleanup-group})))
                            admitted)
                          (catch Throwable error
+                           (run/take-cancel-time! run-id)
                            ((:cancel! admission))
                            (throw error)))
-                ;; when the Run was first asked to cancel, as its lifecycle
-                ;; records it: before the deadline, someone else cancelled it
-                ;; and it did not time out
-                _ (run/watch-cancel-time! (program/run-id handle))
                 left (remaining-ms deadline-nanos)
                 initial (try
                           (if (pos? left)
@@ -888,10 +890,12 @@
                                                     left timed-out))
                             timed-out)
                           (catch Throwable error
-                            (run/unwatch-cancel-time! (program/run-id handle))
+                            (run/take-cancel-time! run-id)
                             (throw error)))
-                cancel-requested-at (run/watched-cancel-time (program/run-id handle))
-                _ (run/unwatch-cancel-time! (program/run-id handle))
+                ;; when the Run was first asked to cancel, as its lifecycle
+                ;; recorded it: before the deadline, someone else cancelled it
+                ;; and it did not time out
+                cancel-requested-at (run/take-cancel-time! run-id)
             ;; A delayed timer must not make an overdue result successful. A
             ;; Run someone else had asked to cancel before the deadline was not
             ;; timed out, though its cleanup ran past the deadline.

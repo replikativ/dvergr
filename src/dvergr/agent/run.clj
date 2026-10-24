@@ -782,7 +782,8 @@
 
 (defn watch-cancel-time!
   "Keep when `run-id` is first asked to cancel, past its retirement, until
-   `unwatch-cancel-time!`. A request made before the watch is kept too."
+   taken. Watch before the Run starts (its id chosen by the caller) so no
+   request can be missed; a request already made is kept too."
   [run-id]
   (locking lifecycle-lock
     (swap! watched-cancel-times assoc run-id (cancel-requested-nanos run-id)))
@@ -793,9 +794,15 @@
   [run-id]
   (get @watched-cancel-times run-id))
 
-(defn unwatch-cancel-time! [run-id]
-  (swap! watched-cancel-times dissoc run-id)
-  nil)
+(defn take-cancel-time!
+  "Stop watching `run-id` and return its first cancellation request, or nil:
+   read and removed under the lifecycle lock, so a request in progress is
+   either seen or not recorded at all."
+  [run-id]
+  (locking lifecycle-lock
+    (let [t (get @watched-cancel-times run-id)]
+      (swap! watched-cancel-times dissoc run-id)
+      t)))
 
 (defn- request-cancel!
   [run-id expected-room]
