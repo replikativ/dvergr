@@ -104,9 +104,14 @@ pooled baseline. A correct baseline can earn high quality without claiming
 improvement. Historical
 and artifact scores therefore belong to different experiments.
 
-Each model evaluation defaults to 64 samples, 10 seconds, 128 MiB cumulative
-thread allocation and a finite function-call allowance. Checks are cooperative
-SCI limits on the owned scoring worker, not a hard OS isolation boundary. Invalid
+Each model evaluation defaults to 64 samples, 10 seconds, 4 GiB cumulative
+thread allocation (garbage included: a runaway backstop, not a memory gauge) and
+a finite function-call allowance. Checks are cooperative SCI limits on the owned
+scoring worker, not a hard OS isolation boundary: they run at interpreted function
+calls, so a single native operation (a huge array, `vec` over a long range)
+allocates or runs before any check. A runaway model can therefore exhaust the
+scoring JVM's heap; the evaluator bounds a mistaken model's work, not a hostile
+one's memory. Invalid
 models return a failed verdict with a bounded diagnostic. Evaluator policy and
 kernel/scoring/generation source identities enter the verifier basis.
 
