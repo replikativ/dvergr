@@ -1400,7 +1400,8 @@
                         (if-let [note (when (and (= :complete outcome) required-outputs
                                                  (not (:outputs-nudged? @activity)))
                                         (missing-outputs-note tool-ctx required-outputs))]
-                          (do (vswap! activity assoc :outputs-nudged? true)
+                          ;; the turn's silent finish is superseded too
+                          (do (vswap! activity #(-> % (assoc :outputs-nudged? true) (dissoc :silent?)))
                               (chat-context/add-system-note! chat-ctx note :important? true)
                               :continue)
                           outcome)))))

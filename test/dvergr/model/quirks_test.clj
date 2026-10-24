@@ -37,8 +37,14 @@
       (is (quirks/code-fragment? "<invoke/tool_use>\n{\"name\": \"clojure_eval\", \"input\": {\"code\": \"(slurp \\\"/inputs/brief.md\\\")\"}}\n</tool_use>"))
       (is (quirks/code-fragment? "<tool_use>\n{\"name\": \"read_file\"}\n</tool_use>"))
       (is (quirks/code-fragment? "<invoke name=\"clojure_eval\">")))
-    (testing "prose that names the forms is not a call"
-      (is (not (quirks/code-fragment? "I used the tool_use protocol and invoked the checker."))))))
+    (testing "prose that names the forms, or shows them as an example, is not a call"
+      (is (not (quirks/code-fragment? "I used the tool_use protocol and invoked the checker.")))
+      (is (not (quirks/code-fragment? "Use <tool_use> to wrap the payload.")))
+      (is (not (quirks/code-fragment? "The protocol wraps a call in `<tool_use>{\"name\": …}</tool_use>`.")))
+      (is (not (quirks/code-fragment?
+                "A call looks like this:\n\n```xml\n<tool_use>\n{\"name\": \"read_file\"}\n</tool_use>\n```\n\nThat is all."))))
+    (testing "a call carried in a reply, after some text, is still a call"
+      (is (quirks/code-fragment? "Reading the brief.\n<tool_use>\n{\"name\": \"read_file\", \"input\": {}}\n</tool_use>")))))
 
 (deftest code-fragment-leaves-real-replies-alone
   (testing "prose"
