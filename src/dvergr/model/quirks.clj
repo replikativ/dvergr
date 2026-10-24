@@ -270,10 +270,13 @@
    names the tags is prose."
   [s]
   (let [prose (-> s
-                  ;; fenced blocks, ``` or ~~~, closed or running to the end
-                  (str/replace #"(?s)(```|~~~).*?(\1|$)" "")
-                  ;; inline code, however many backticks delimit it
-                  (str/replace #"(`+)[^\n]*?\1" "")
+                  ;; fenced blocks (CommonMark): opened at a line start by 3+
+                  ;; backticks or tildes, closed only by a line of the same
+                  ;; character at least as long, else running to the end
+                  (str/replace #"(?ms)^ {0,3}(?:(`{3,})|(~{3,}))[^\n]*$.*?(?:^ {0,3}(?:\1`*|\2~*)[ \t]*$|\z)" "")
+                  ;; inline code: closed only by a backtick run of the same
+                  ;; length, across lines too
+                  (str/replace #"(?s)(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)" "")
                   str/trim)]
     (boolean
      (or (re-find #"^</?(?:tool_use|invoke)[\s>/]" prose)
