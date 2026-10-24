@@ -25,13 +25,18 @@ A directory in the room's repository, `workflows/<name>/`:
 
 | File | What |
 |---|---|
-| `workflow.edn` | `{:title :doc :params {…defaults} :task "template with {param}" :profile :capture ["/out"] :timeout-ms}` |
+| `workflow.edn` | `{:title :doc :params {…defaults} :task "template with {param}" :profile :capture ["/out"] :timeout-ms :score-on-timeout}` |
 | `checker.clj` | a namespace with `(check {:files … :params … :gold …}) → {:checks {k bool} :reward 0..1}`, over the files the Attempt left under the captured directories (receipts later) |
 | `gold.edn`, `fixtures/` | the reference facts and the documents a benchmark world starts from, or |
 | `generator.clj` | `(world seed opts) → {:docs … :gold …}`, for generated benchmark sets with splits |
 | `calibration.edn` | a reference answer and damaged variants (see below) |
 
 It is ordinary room content: versioned, forked and merged with the room, reviewable as a diff.
+
+An Attempt that runs past `:timeout-ms` scores 0, whatever it wrote. With `:score-on-timeout
+true` it is scored on the files it left instead, its `:completed?` check false and its
+receipt marked timed out: for tasks whose answer is a file the agent keeps current while it
+works.
 
 ## Lifecycle
 

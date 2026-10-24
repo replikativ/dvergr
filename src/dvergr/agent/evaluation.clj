@@ -270,7 +270,8 @@
 
    `id`, `version`, and optional portable `basis` must exactly match an
    EnvironmentDef verifier reference. `observe` receives durable execution
-   facts (`:result :durable :room :world/room :run-id :environment :agent`
+   facts (`:result :durable :room :world/room :run-id :environment :agent`,
+   `:timed-out?` when the Run was cancelled at the environment's deadline,
    and the setup and execution evidence) and returns portable evidence; a
    `:spend` it returns (`dvergr.agent.spend`) is the Attempt's bill on the
    receipt, else the Run's own metrics are. Model calls `observe` makes (a
@@ -647,6 +648,8 @@
                      :run-id run-id
                      :result result
                      :durable durable
+                     ;; the Run was cancelled at the environment's deadline
+                     :timed-out? (boolean timeout?)
                      :default (default-evidence {:result result
                                                  :durable durable})}))
         _ (when-not (and (map? evidence) (roster/data-value? evidence))

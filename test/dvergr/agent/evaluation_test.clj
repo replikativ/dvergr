@@ -921,11 +921,11 @@
         timeout-evaluator
         (evaluation/make-evaluator
          {:id :test/exact :version 1 :basis "test:v1"
-          :observe (fn [{:keys [default durable]}]
-                     (assoc default :durable-status (:run/status durable)))
+          :observe (fn [{:keys [default durable timed-out?]}]
+                     (assoc default :durable-status (:run/status durable) :timed-out? timed-out?))
           :verify (fn [_ evidence]
                     (let [cancelled? (= :cancelled (:durable-status evidence))]
-                      {:checks {:cancelled? cancelled?}
+                      {:checks {:cancelled? cancelled? :observed-timeout? (true? (:timed-out? evidence))}
                        :reward (if cancelled? 1.0 0.0)}))})]
     (try
       (binding [ec/*execution-context* (:ctx room)]
@@ -933,7 +933,8 @@
               receipt (:attempt-receipt result)]
           (is (= :cancelled (:attempt/status receipt)))
           (is (true? (get-in receipt [:attempt/metrics :timed-out?])))
-          (is (= {:cancelled? true} (:attempt/checks receipt)))
+          (is (= {:cancelled? true :observed-timeout? true} (:attempt/checks receipt))
+              "the observer is told the Run timed out")
           (is (= :discarded (get-in result [:run/result :run/settlement-status])))
           (is (empty? (run/active-runs (:id room))))))
       (finally
