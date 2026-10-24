@@ -43,6 +43,10 @@
       (is (not (quirks/code-fragment? "The protocol wraps a call in `<tool_use>{\"name\": …}</tool_use>`.")))
       (is (not (quirks/code-fragment?
                 "A call looks like this:\n\n```xml\n<tool_use>\n{\"name\": \"read_file\"}\n</tool_use>\n```\n\nThat is all."))))
+    (testing "every Markdown code form is an example"
+      (is (not (quirks/code-fragment?
+                "A call looks like this:\n\n~~~\n<tool_use>\n{\"name\": \"read_file\"}\n</tool_use>\n~~~")))
+      (is (not (quirks/code-fragment? "Write ``<tool_use>{\"name\": \"x\"}</tool_use>`` around it."))))
     (testing "a call carried in a reply, after some text, is still a call"
       (is (quirks/code-fragment? "Reading the brief.\n<tool_use>\n{\"name\": \"read_file\", \"input\": {}}\n</tool_use>")))))
 
