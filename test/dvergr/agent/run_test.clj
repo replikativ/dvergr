@@ -357,3 +357,38 @@
       (is (= (:run/ended-at stored)
              (:run/ended-at (run/run room (:run/id r))))))
     (d/close-room! room)))
+
+(deftest the-first-cancellation-request-is-timed-by-the-lifecycle
+  ;; What tells a cancellation from a deadline: the time of the first request,
+  ;; recorded with the token, not when some hook happens to run.
+  (let [[room _] (run-room :cancel-time)
+        started (run/start! room :agent (d/message :alice :agent "work") nil)
+        run-id (:run/id started)
+        entered (promise) release (promise)
+        seen (atom nil) late (atom nil)]
+    (try
+      (is (nil? (run/cancel-requested-nanos run-id)))
+      ;; an earlier hook blocks hook delivery
+      (run/register-cancel-hook! run-id :a-slow-hook #(do (deliver entered true) @release))
+      (run/register-cancel-hook! run-id :z-probe #(reset! seen (run/cancel-requested-nanos run-id)))
+      (let [before (System/nanoTime)
+            cancelling (future (run/cancel-run! run-id))]
+        (is (deref entered 5000 false))
+        (Thread/sleep 200)
+        (let [recorded (run/cancel-requested-nanos run-id)]
+          (is (some? recorded))
+          (is (<= before recorded (+ before 150000000)) "recorded at the request, not after the slow hook")
+          (deliver release true)
+          @cancelling
+          (is (or (nil? @seen) (= recorded @seen)) "a delayed hook reads the request's time")
+          (testing "a hook registered after the request gets the request's time"
+            (Thread/sleep 100)
+            (run/register-cancel-hook! run-id :late #(reset! late (run/cancel-requested-nanos run-id)))
+            (is (= recorded @late)))
+          (testing "a repeated request keeps the first time"
+            (run/cancel-run! run-id)
+            (is (= recorded (run/cancel-requested-nanos run-id))))))
+      (finally
+        (deliver release true)
+        (run/finish! run-id :cancelled)
+        (d/close-room! room)))))

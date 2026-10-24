@@ -769,6 +769,12 @@
   [run-id]
   (boolean (some-> (get @active run-id) :cancelled? deref)))
 
+(defn cancel-requested-nanos
+  "When cancellation of this live Run was first requested (`System/nanoTime`),
+   or nil. Process-local, like the cancellation token."
+  [run-id]
+  (:cancel-requested-nanos (get @active run-id)))
+
 (defn- request-cancel!
   [run-id expected-room]
   (let [entry
@@ -785,7 +791,11 @@
                                  (get-in entry [:run :run/status])))
                 entry
                 (let [_ (reset! (:cancelled? entry) true)
-                      entry' (assoc-in entry [:run :run/status] :cancelling)]
+                      entry' (-> entry
+                                 (assoc-in [:run :run/status] :cancelling)
+                                 ;; when it was first asked, with the token, under
+                                 ;; the lock: what tells a cancellation from a deadline
+                                 (assoc :cancel-requested-nanos (System/nanoTime)))]
                   (swap! active assoc run-id entry')
                   (notify! {:type :run/cancel-requested :run (public-entry entry')})
                   entry')))))]

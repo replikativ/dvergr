@@ -877,11 +877,16 @@
                          (catch Throwable error
                            ((:cancel! admission))
                            (throw error)))
-                ;; when the Run was first asked to cancel: before the deadline,
-                ;; someone else cancelled it and it did not time out
+                ;; when the Run was first asked to cancel, as its lifecycle
+                ;; recorded it (the hook only reads it, while the Run is live):
+                ;; before the deadline, someone else cancelled it and it did not
+                ;; time out. A Run already retired here ended before any deadline.
                 cancel-requested-at (atom nil)
-                _ (run/register-cancel-hook! (program/run-id handle) ::cancel-provenance
-                                             #(compare-and-set! cancel-requested-at nil (System/nanoTime)))
+                live? (run/register-cancel-hook!
+                       (program/run-id handle) ::cancel-provenance
+                       #(compare-and-set! cancel-requested-at nil
+                                          (run/cancel-requested-nanos (program/run-id handle))))
+                _ (when-not live? (reset! cancel-requested-at Long/MIN_VALUE))
                 left (remaining-ms deadline-nanos)
                 initial (if (pos? left)
                           (sp/await (comb/timeout (program/owned-result-spin handle)

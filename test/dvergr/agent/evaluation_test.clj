@@ -977,10 +977,10 @@
                                       (if (instance? Throwable result)
                                         (str (ex-message result) " " (pr-str (ex-data result)))
                                         (pr-str (some-> result :attempt-receipt :attempt/status)))))
-          (when receipt
-            (is (not (true? (get-in receipt [:attempt/metrics :timed-out?]))))
-            (is (nil? (get-in receipt [:attempt/metrics :failure]))
-                "not a model-timeout verdict"))))
+          (is (some? receipt) "the cancelled Run is certified")
+          (is (false? (get-in receipt [:attempt/metrics :timed-out?])))
+          (is (nil? (get-in receipt [:attempt/metrics :failure]))
+              "not a model-timeout verdict")))
       (finally
         (d/close-room! room)))))
 
