@@ -6,7 +6,8 @@
    outcome, invokes a matching host-owned verifier, and produces an attempt
    receipt. Parallelism, races, quorums, and later inference policies compose
    these Spins with the existing Spindel combinators."
-  (:require [dvergr.agent.environment :as environment]
+  (:require [clojure.string :as str]
+            [dvergr.agent.environment :as environment]
             [dvergr.effects :as effects]
             [dvergr.sandbox.extensions :as extensions]
             [dvergr.artifact :as artifact]
@@ -520,7 +521,7 @@
         world (:environment/world definition)
         model-limits (select-keys limits [:max-model-steps :budget-dollars])]
     (when-let [unknown (seq (remove (into #{:timeout-ms :cancel-timeout-ms :on-timeout
-                                            :max-model-steps :budget-dollars}
+                                            :max-model-steps :budget-dollars :required-outputs}
                                           (:limit-keys protocol))
                                     (keys limits)))]
       (throw (ex-info "Evaluation environment contains unsupported limits"
@@ -551,13 +552,22 @@
         (when bad
           (throw (ex-info "Environment :world :effects is not a supported handler configuration"
                           {:type ::unsupported-world-effects :effects fx :invalid (vec bad)})))))
+    (when-let [paths (:required-outputs limits)]
+      (when-not (and (sequential? paths) (seq paths) (every? #(and (string? %) (str/starts-with? % "/")) paths))
+        (throw (ex-info "Environment :required-outputs must be absolute paths"
+                        {:type ::invalid-required-outputs :required-outputs paths}))))
     (when (and (seq model-limits)
                (not= :llm (get-in agent [:agent/program :kind])))
       (throw (ex-info "Environment model limits require an LLM AgentDef"
                       {:type ::model-limits-require-llm
                        :agent/id (:agent/id agent)
                        :limits model-limits})))
-    model-limits))
+    ;; the files the task is scored on: an LLM program is told when it ends its
+    ;; turn without them; other programs are not asked to stop, so it does not
+    ;; apply to them
+    (cond-> model-limits
+      (and (seq (:required-outputs limits)) (= :llm (get-in agent [:agent/program :kind])))
+      (assoc :required-outputs (vec (:required-outputs limits))))))
 
 (defn- settle-certified! [fork requested claim!]
   (when-not fork
@@ -721,7 +731,9 @@
    handlers: faults, record, read-only, admission, host lists, quota).
    `:limits` may specify `:timeout-ms`, `:cancel-timeout-ms`, `:on-timeout`
    (`:fault`, the default, or `:verdict`), for an `:llm` program
-   `:max-model-steps` and `:budget-dollars`, and the limit keys a protocol
+   `:max-model-steps`, `:budget-dollars` and `:required-outputs` (absolute
+   paths the task is scored on: a turn that ends without them is told once
+   and continues), and the limit keys a protocol
    declares. One monotonic timeout covers admission, setup, allocation and
    execution through physical quiescence. Admission expiry is a host fault,
    not a model-quality Attempt; a late Run remains owned until cancelled and

@@ -639,3 +639,57 @@
         (is (= "completed" (:status done)) (pr-str done))
         (is (= "escalated" (:decision record)))
         (is (some #(str/includes? % "left to a person") (:reasons record)))))))
+
+(defn- announcer
+  "A scripted model that first only announces what it will do, with no tool
+   call (as a model sometimes ends its turn), writes the answer once told it
+   is missing, then finishes."
+  [calls]
+  (fn [messages _]
+    (swap! calls inc)
+    (let [content #(str (or (:content %) (:message/content %)))
+          told? (some #(str/includes? (content %) "does not exist yet") messages)
+          wrote? (some #(= :tool-result (or (:role %) (:message/role %))) messages)]
+      (cond
+        wrote? {:content "Done." :tool-calls nil :usage {:input-tokens 600 :output-tokens 5} :stop-reason :end-turn}
+        told? {:content "" :tool-calls [{:id (str "w" @calls) :name "write_file"
+                                         :input {:path "/out/list.md" :content "Wato, Dust"}}]
+               :usage {:input-tokens 500 :output-tokens 20} :stop-reason :tool-use}
+        :else {:content "I'll write the list to /out/list.md next." :tool-calls nil
+               :usage {:input-tokens 400 :output-tokens 12} :stop-reason :end-turn}))))
+
+(deftest an-attempt-that-ends-without-its-outputs-is-told-once
+  (let [room (:id (ops/invoke *daemon* dvergr.principal/local-principal :room/create {:title "Outputs" :slug "outputs"}))
+        r (ops/resolve-room *daemon* room)
+        bundle (fn [wf definition]
+                 {(str "/workflows/" wf "/workflow.edn") (pr-str definition)
+                  (str "/workflows/" wf "/checker.clj")
+                  "(ns c (:require [clojure.string :as str]))
+                   (defn check [{:keys [files]}]
+                     (let [t (get files \"/out/list.md\" \"\")]
+                       {:checks {:listed? (str/includes? t \"Dust\")} :reward (if (str/includes? t \"Dust\") 1.0 0.0)}))"
+                  (str "/workflows/" wf "/fixtures/docs/brief.md") "Simmis vs Wato and Dust."})
+        run (fn [wf definition]
+              (catalog/seed! r (bundle wf definition))
+              (let [calls (atom 0)]
+                (with-redefs [providers/ensure-initialized! (constantly nil)
+                              chat-agent/messages->api-format (fn [messages _ _] messages)
+                              model-chat/chat (announcer calls)]
+                  (let [started (ops/invoke *daemon* dvergr.principal/local-principal :catalog/benchmark
+                                            {:workflow (str "outputs/" wf) :models ["claude-haiku-4-5"]})
+                        done (loop [n 0]
+                               (let [st (ops/invoke *daemon* dvergr.principal/local-principal :job/status
+                                                    {:job (:id started) :wait-ms 20000})]
+                                 (if (or (not= "running" (:status st)) (< 8 n)) st (recur (inc n)))))]
+                    {:done done :calls @calls}))))
+        base {:title "Rivals" :task "Write the competitors of Simmis to /out/list.md." :capture ["/out"]}]
+    (testing "without :outputs, announcing the next step ends the attempt with nothing written"
+      (let [{:keys [done calls]} (run "rivals" base)]
+        (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
+        (is (= 0.0 (get-in done [:result :summary 0 :reward-mean])))
+        (is (= 1 calls))))
+    (testing "with :outputs, it is told the file is missing, writes it and is scored on it"
+      (let [{:keys [done calls]} (run "rivals-out" (assoc base :outputs ["/out/list.md"]))]
+        (is (= "completed" (:status done)) (pr-str (dissoc done :result)))
+        (is (= 1.0 (get-in done [:result :summary 0 :reward-mean])))
+        (is (= 3 calls))))))
