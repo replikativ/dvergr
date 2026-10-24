@@ -1166,12 +1166,13 @@
    A fork room's context is never closed (it shares its root's executor and
    running flag), so nothing else cancels them: a pending timeout or sleep
    would keep the whole fork context, and everything it holds, reachable from
-   the timer queue until it fired. A forked context starts with no timer
-   handles, so these are the fork's own; a `:none` fork shares the root's exact
-   context and is left alone."
+   the timer queue until it fired. Only a room created as an isolated fork owns
+   its context (`:fork-handle` is its ForkHandle's atom, kept after settlement);
+   a forked context starts with no timer handles, so they are the fork's own. A
+   `:none` fork, nested or not, shares another room's context and is left alone."
   [room]
   (when-let [c (:ctx room)]
-    (when (and (fork-room? room) (:parent-ctx c))
+    (when (and (fork-room? room) (:fork-handle room))
       (delayed/cancel-all-timers! c))))
 
 (defn- room-home-ctx
