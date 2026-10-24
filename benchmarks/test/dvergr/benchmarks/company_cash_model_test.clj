@@ -31,6 +31,18 @@
     (is (= (:outcomes result)
            (:outcomes (model/execute conservative-model (:observations case) {} {:samples 8}))))))
 
+(deftest a-model-that-churns-short-lived-garbage-still-runs
+  ;; A Monte Carlo allocates far more than it keeps; the allocation backstop
+  ;; must not stop it (a live attempt's model failed at 128 MB in 0.5 s).
+  (let [case @case-data
+        churning (str/replace conservative-model
+                              "(defn fit [observations seed budget] (:company observations))"
+                              "(defn fit [observations seed budget]
+                                 (dotimes [_ 1500] (count (vec (range 20000))))
+                                 (:company observations))")
+        result (model/execute churning (:observations case) {} {:samples 8})]
+    (is (= 8 (count (:outcomes result))))))
+
 (deftest correct-answer-without-a-model-earns-zero
   (let [case @case-data
         answer (generate/reference-answer (:gold case))

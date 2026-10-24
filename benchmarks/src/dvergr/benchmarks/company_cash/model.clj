@@ -8,8 +8,13 @@
             [hasch.core :as hasch]
             [sci.core :as sci]))
 
+;; :max-allocated-bytes bounds CUMULATIVE allocation on the scoring thread,
+;; garbage and the scorer's own work included (dvergr.sandbox/make-resource-
+;; limits): a runaway backstop, not a memory gauge. An interpreted simulator
+;; churns that much in under a second, so it sits at the sandbox's default;
+;; the deadline, the call allowance and :max-data-nodes bound real work.
 (def policy
-  {:version 1 :timeout-ms 10000 :max-allocated-bytes (* 128 1024 1024)
+  {:version 2 :timeout-ms 10000 :max-allocated-bytes (* 4 1024 1024 1024)
    :max-calls 2000000 :max-data-nodes 100000 :max-source-chars 65536
    :samples 64 :max-samples 256 :fit-seed 1701 :simulation-seed 2701
    :scoring-seed 3701 :scoring-worlds 512 :probe-seed 4701 :probe-count 1})
