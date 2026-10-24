@@ -212,9 +212,10 @@
         org.replikativ/katzen      {:mvn/version "0.1.11"}}
 
  :aliases
- ;; Every alias that starts a JVM caps its heap, so no invocation can grow to
- ;; the JVM's default (a quarter of RAM) beside other JVMs on a shared machine.
- ;; An explicit -J-Xmx on the command line still wins.
+ ;; :dev, :test, :benchmarks, :repl and :cli cap the heap, so those JVMs
+ ;; cannot grow to the JVM's default (a quarter of RAM) beside other JVMs on a
+ ;; shared machine. Other aliases and plain invocations are not capped. An
+ ;; explicit -J-Xmx on the command line still wins.
  {:dev  {:extra-paths ["dev" "test" "src-clients"
                        "benchmarks/src" "benchmarks/resources" "benchmarks/test"]
          :jvm-opts    ["-Xmx3g"]
