@@ -32,7 +32,8 @@
    namespaces become callable host code, so nothing is approved by pattern.
    A `:local/root` source is refused outright — the agent could rewrite it
    after approval."
-  (:require [dvergr.substrate.load :as load]
+  (:require [dvergr.runtime.threads :as threads]
+            [dvergr.substrate.load :as load]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -135,7 +136,7 @@
    into the sandbox.deps dependency graph."
   [ctx d]
   (let [p (promise)]
-    (future
+    (threads/future
       (try
         (binding [ec/*execution-context* ctx]
           (sp/spawn!

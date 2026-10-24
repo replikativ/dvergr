@@ -1,6 +1,7 @@
 (ns dvergr.tools
   "Tool registry and execution for the agent harness."
-  (:require [babashka.fs :as fs]
+  (:require [dvergr.runtime.threads :as threads]
+            [babashka.fs :as fs]
             [clojure.string :as str]
             [clojure.java.io :as io]
             [clojure.edn :as edn]
@@ -776,7 +777,7 @@
   [tool-calls ctx]
   (let [futures (mapv (fn [{:keys [id name input]}]
                         {:id id
-                         :future (future (execute name input (assoc ctx :tool-use-id id)))})
+                         :future (threads/future (execute name input (assoc ctx :tool-use-id id)))})
                       tool-calls)]
     (mapv (fn [{:keys [id future]}]
             {:id id

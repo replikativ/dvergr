@@ -15,7 +15,8 @@
    daemon: after a restart its Run reads `:failed` (orphaned) or whatever it
    finished as. Only the handles to wait on and cancel the work live in this
    process."
-  (:require [dvergr.agent.run :as run]
+  (:require [dvergr.runtime.threads :as threads]
+            [dvergr.agent.run :as run]
             [dvergr.room.registry :as rreg]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.impl.simple :as simple]
@@ -98,7 +99,7 @@
         (run/register-cancel-hook! id ::spin
                                    #(binding [ec/*execution-context* ctx]
                                       (spin-core/cancel-spin! spin)))
-        (future
+        (threads/future
           ;; A future conveys its caller's bindings; a job started from
           ;; inside a Spin (a sub-experiment) must not look like a drain.
           (binding [simple/*in-drain?* false
