@@ -17,16 +17,24 @@
 
 (defn future-call
   "`clojure.core/future-call` whose pool thread drops the task's bindings when
-   the task ends. A task run on the calling thread itself (an executor that runs
-   work inline) leaves that thread's bindings as they are."
+   the task ends.
+
+   It submits with the caller's bindings set aside, so the pool thread is given
+   an empty frame, and installs the caller's bindings around the task itself,
+   restoring whatever frame the running thread had before: an idle pool thread
+   holds nothing, and a caller that runs the task itself (an inline executor,
+   a test) keeps its own bindings."
   [f]
-  (let [caller (Thread/currentThread)]
-    (clojure.core/future-call
-     (fn []
-       (try (f)
-            (finally
-              (when-not (identical? caller (Thread/currentThread))
-                (clojure.lang.Var/resetThreadBindingFrame top-frame))))))))
+  (let [conveyed (clojure.lang.Var/cloneThreadBindingFrame)
+        own (clojure.lang.Var/getThreadBindingFrame)
+        task (fn []
+               (let [before (clojure.lang.Var/getThreadBindingFrame)]
+                 (clojure.lang.Var/resetThreadBindingFrame conveyed)
+                 (try (f)
+                      (finally (clojure.lang.Var/resetThreadBindingFrame before)))))]
+    (clojure.lang.Var/resetThreadBindingFrame top-frame)
+    (try (clojure.core/future-call task)
+         (finally (clojure.lang.Var/resetThreadBindingFrame own)))))
 
 (defmacro future
   "`clojure.core/future` whose pool thread drops the task's bindings when the

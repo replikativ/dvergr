@@ -2208,12 +2208,18 @@
    affine authority and every partition node must list all children before the
    structural ancestry claim is released."
   [{:fork/keys [handle room-id] :as transfer}]
+  ;; Only the aggregate tree settles the whole world: a partition node's
+  ;; siblings may still be open, and they share this node's context.
+  (when (contains? (ygg/fork-descriptor handle) :fork/partition-of)
+    (throw (ex-info "Release the transferred fork's aggregate tree, not a partition of it"
+                    {:type ::partition-cannot-release
+                     :fork/id room-id})))
   (assert-transferred-node-settled! transfer #{} false)
   (binding [ec/*execution-context* (:parent-ctx handle)]
     (rreg/untrack-fork! room-id (:fork-id handle)))
-  ;; Every leaf has settled, and partition leaves share this context: its
-  ;; timers are released here, once, as `release-fork-timers!` does for a
-  ;; fork settled in place.
+  ;; Every leaf of the whole tree has settled (partition leaves share this
+  ;; context): its timers are released here, once, as `release-fork-timers!`
+  ;; does for a fork settled in place.
   (delayed/cancel-all-timers! (:child-ctx handle))
   nil)
 
