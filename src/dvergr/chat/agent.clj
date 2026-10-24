@@ -5,12 +5,14 @@
    maybe-compact, format messages per provider, call the model, run the
    on-reply hook, account tokens, persist the assistant message + sanitized
    tool-uses, execute tool calls, persist tool results, and return
-   :continue | :complete | :cancelled | :error. The LOOPING around this core
+   :continue | :complete | :cancelled | :error, or the closed controlled-stop
+   outcome in `dvergr.chat.outcome`. The LOOPING around this core
    is the driver's job — production rooms drive it from
    `dvergr.discourse.llm` (the participant on-message turn loop)."
   (:require [clojure.string :as str]
             [dvergr.chat.context :as chat-ctx]
             [dvergr.chat.compaction :as compaction]
+            [dvergr.chat.outcome :as outcome]
             [dvergr.model.chat :as model-chat]
             [dvergr.model.provider :as model-provider]
             [dvergr.model.providers :as model-providers]
@@ -490,7 +492,7 @@
                                               "room describing what you found and what is "
                                               "blocking you.")
                                          :important? true)
-              :complete)
+              outcome/repeated-tool-call)
             :continue))
 
         ;; No tool calls. Usually that means the agent is done — but a model can

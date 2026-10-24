@@ -63,7 +63,7 @@ Durable statuses currently are:
 | `:running` | The execution was admitted and may have a live handle. |
 | `:waiting` | It stopped at a resumable product boundary, currently budget exhaustion. |
 | `:completed` | It ended successfully, with or without a visible reply. |
-| `:failed` | The turn threw, its reply could not be posted, or its process stopped while it ran. |
+| `:failed` | The turn failed or stopped without progress, its reply could not be posted, or its process stopped while it ran. |
 | `:cancelled` | The executor acknowledged cancellation. |
 
 A terminal or waiting row may carry `:run/reason` (and `:run/error` for a
@@ -78,10 +78,19 @@ failure). The reasons an `:agent-turn` Run ends with (`dvergr.discourse.llm`,
 | `:completed` | another keyword | A wrapper dropped the reply and named its own reason (`withhold-reply!`). |
 | `:waiting` | `:budget-exhausted`, `:attention-suspended` | The turn stopped at a resumable boundary. |
 | `:failed` | `:error` | The turn or its handler threw. |
+| `:failed` | `:repeated-tool-call` | The turn repeated identical tool calls and results without progress. No placeholder is posted as an answer. |
 | `:failed` | `:reply-emission-failed` | Posting the reply failed. |
 | `:failed` | `:orphaned` | The process stopped while the Run was running (see below). |
 | `:cancelled` | `:cancel-requested` | The turn was cancelled (`cancel-run!`, `cancel-room-turn!`). |
 | `:cancelled` | `:participant-left` | The agent left the room mid-turn. |
+
+The repeated-tool guard returns an explicit stopped outcome from
+`dvergr.chat.agent/run-agent-turn!`. Both native programs and room participants
+retain its fixed reason and diagnostic as a failed Run. The model response that
+triggered the guard was measured and remains accounted; required-output nudging
+does not restart it. A genuine final answer with no output is different from a
+controlled stop. Completion is still an execution outcome; the verifier decides
+whether the task succeeded. Existing receipts are not reinterpreted.
 
 `:cancelling` exists only in the live snapshot between request and
 acknowledgement. A durable `:running` row after process loss means unfinished,

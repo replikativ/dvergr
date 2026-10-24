@@ -24,6 +24,7 @@
             [dvergr.agent.world :as world]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as chat-context]
+            [dvergr.chat.outcome :as turn-outcome]
             [dvergr.discourse :as d]
             [dvergr.model.providers :as providers]
             [dvergr.model.registry :as registry]
@@ -108,7 +109,9 @@
 
 (defn- program-result
   ([status value] {::status status ::value value})
-  ([status value reason] {::status status ::value value ::reason reason}))
+  ([status value reason] {::status status ::value value ::reason reason})
+  ([status value reason diagnostic]
+   {::status status ::value value ::reason reason ::diagnostic diagnostic}))
 
 (defn run-chat-id
   "The chat a Run's model turns are kept under, in its control room."
@@ -1218,6 +1221,7 @@
   (model-step-usage budget
                     (or cancelled?
                         (not (or (contains? #{:continue :complete} outcome)
+                                 (turn-outcome/stopped? outcome)
                                  (and (= :error outcome) (= :model (:kind failure))))))))
 
 (defn- execute-llm-program
@@ -1450,6 +1454,13 @@
                                   :agent/id (:agent/id agent)
                                   :model-step model-step
                                   :failure f})))
+
+               (turn-outcome/stopped? outcome)
+               (let [reason (:reason outcome)]
+                 (update-llm-metrics! supervisor assoc :failure
+                                      {:kind :model :cause turn-outcome/stop-diagnostic
+                                       :reason reason :model-step model-step})
+                 (program-result :failed nil reason turn-outcome/stop-diagnostic))
 
                (= :complete outcome)
                (if-let [value (if (:silent? @activity) "" (last-assistant-content chat-ctx))]
@@ -1979,7 +1990,7 @@
   (sp/spin
    (let [outcome
          (try
-           (let [{status ::status value ::value reason ::reason}
+           (let [{status ::status value ::value reason ::reason diagnostic ::diagnostic}
                  (sp/await
                   (execute-program control-room work-room id chat-id
                                    (cond-> agent
@@ -2015,6 +2026,12 @@
                                      :run/output output}
                               llm-metrics (assoc :run/metrics llm-metrics))
                     :finish-opts {}})
+
+                 :failed
+                 {:result (cond-> {:run/id id :run/status :failed
+                                   :run/reason reason :run/error diagnostic}
+                            llm-metrics (assoc :run/metrics llm-metrics))
+                  :finish-opts {:reason reason :error diagnostic}}
 
                  :waiting
                  {:result (cond-> {:run/id id :run/status :waiting :run/reason reason}

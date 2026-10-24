@@ -9,6 +9,7 @@
             [dvergr.agent.world :as world]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.chat.context :as chat-context]
+            [dvergr.chat.outcome :as turn-outcome]
             [dvergr.chat.schema :as chat-schema]
             [dvergr.discourse :as d]
             [dvergr.model.chat :as model-chat]
@@ -146,7 +147,7 @@
 
 (deftest measured-model-failure-is-not-an-unmeasured-provider-call
   (let [known {:used 10 :by-type {:input-tokens 500 :output-tokens 0}}]
-    (doseq [outcome [:continue :complete :error]]
+    (doseq [outcome [:continue :complete :error turn-outcome/repeated-tool-call]]
       (is (= known (#'program/completed-model-step-usage known outcome false {:kind :model}))))
     (doseq [outcome [:cancelled ::program/worker-cancelled {::program/worker-error (Exception.)}]]
       (is (= #{:input-tokens :output-tokens}
@@ -160,6 +161,43 @@
            (:unreported-types
             (#'program/completed-model-step-usage
              (assoc known :unreported-types #{:input-tokens :output-tokens}) :error false {:kind :model}))))))
+
+(deftest controlled-stop-persists-failure-and-accounted-usage-without-output-nudging
+  (let [room (test-room :controlled-tool-stop)
+        calls (atom 0)
+        model "codex-subscription-luna-6"
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :worker :tools #{} :model-policy {:provider :test :model model}
+               :program {:kind :llm :max-model-steps 4 :auto-compact? false}})]
+    (try
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/run-agent-turn!
+                    (fn [ctx _]
+                      (swap! calls inc)
+                      (chat-context/account-tokens! ctx :input-tokens 3 {:model model})
+                      (chat-context/account-tokens! ctx :output-tokens 1 {:model model})
+                      (chat-context/add-message! ctx {:role :assistant :content "Tool calls: [fixture]"})
+                      turn-outcome/repeated-tool-call)]
+        (let [handle (binding [ec/*execution-context* (:ctx room)]
+                       (program/hire! room team :worker
+                                      {:task "produce a file" :settlement :discard
+                                       :limits {:required-outputs ["/out/missing"]}}))
+              result (binding [ec/*execution-context* (:ctx room)] @handle)
+              durable (run/run room (program/run-id handle))]
+          (is (= :failed (:run/status result) (:run/status durable)))
+          (is (= :repeated-tool-call (:run/reason result) (:run/reason durable)))
+          (is (= turn-outcome/stop-diagnostic (:run/error result) (:run/error durable)))
+          (is (not (contains? result :run/value)))
+          (is (not (contains? result :run/output)))
+          (is (= 1 @calls) "Required-output correction cannot override a controlled stop")
+          (is (= 1 (get-in result [:run/metrics :model-steps])))
+          (is (= {:input-tokens 3 :output-tokens 1} (get-in result [:run/metrics :usage :by-type])))
+          (is (empty? (get-in result [:run/metrics :usage :unreported-types])))
+          (is (= :model (get-in result [:run/metrics :failure :kind])))
+          (is (= :discarded (:run/settlement-status durable)))
+          (is (empty? (run/active-runs (:id room))))))
+      (finally (d/close-room! room)))))
 
 (deftest expired-worker-entry-still-acknowledges-and-runs-cleanup
   (let [room (test-room :deadline-worker)

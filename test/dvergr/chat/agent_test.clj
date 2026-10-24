@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [dvergr.chat.agent :as agent]
             [dvergr.chat.context :as chat-ctx]
+            [dvergr.chat.outcome :as outcome]
             [dvergr.chat.accounting :as accounting]
             [datahike.api :as dh]
             [dvergr.tools :as tools]
@@ -212,6 +213,21 @@
     (testing "reloading a file between edits sees the edits: progress"
       (is (nil? (agent/detect-doom-loop
                  (concat (called "c1" load "=> 1") (called "c2" load "=> 2") (called "c3" load "=> 3"))))))))
+
+(deftest repeated-tools-stop-instead-of-completing-with-a-placeholder
+  (let [ctx (chat-ctx/create-chat-context {:title "controlled-stop" :with-sci? false})
+        call (assoc (response "") :tool-calls [{:id "same" :name "clojure_eval" :input {:code "(/ 1 0)"}}])]
+    (try
+      (chat-ctx/add-message! ctx {:role :user :content "compute"})
+      (is (= [:continue :continue outcome/repeated-tool-call]
+             (scripted-turns! ctx [call call call])))
+      (is (= 3 (count (filter #(= :tool-result (:message/role %)) (chat-ctx/get-messages ctx)))))
+      (is (= :repeated-tool-call (outcome/error-stop-reason (outcome/as-error outcome/repeated-tool-call))))
+      (doseq [invalid [:complete {:status :stopped} (assoc outcome/repeated-tool-call :extra true)
+                       {:status :stopped :reason :anything}]]
+        (is (not (outcome/stopped? invalid))))
+      (is (nil? (outcome/error-stop-reason (ex-info "arbitrary" {:reason :repeated-tool-call}))))
+      (finally (chat-ctx/close-chat! ctx)))))
 
 (deftest silent-after-acting-completes-a-run-without-a-reply
   ;; Codex answers its output schema with {content: "", tool_calls: []} when
