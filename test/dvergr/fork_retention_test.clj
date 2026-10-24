@@ -56,6 +56,23 @@
         (delayed/cancel-all-timers! (:ctx root))
         (d/close-room! root)))))
 
+(deftest a-transferred-fork-releases-its-timers-once-settled
+  (doseq [operation [:merge :discard]]
+    (testing (name operation)
+      (let [parent (d/room (keyword (str "fork-timers-transfer-" (name operation))))
+            fork (d/fork-room parent {:isolation :ctx})
+            fork-timer (arm! (:ctx fork))
+            transfer (d/transfer-fork! fork :owner {:prepare! (constantly :receipt) :abort! (fn [_])})]
+        (try
+          (is (not (cancelled? fork-timer)) "a transfer keeps the fork's timers")
+          (let [settled (d/settle-transferred-fork! transfer operation)]
+            (is (not (cancelled? fork-timer)) "settling a leaf alone keeps them")
+            (d/release-transferred-fork! settled))
+          (is (cancelled? fork-timer) "releasing the settled transfer cancels them")
+          (finally
+            (delayed/cancel-all-timers! (:ctx fork))
+            (d/close-room! parent)))))))
+
 (def ^:dynamic *held* nil)
 
 (defn- pool-thread-frame-after
@@ -80,3 +97,10 @@
       "the worker holds the empty frame again once the task ended")
   (is (not (identical? top-frame (pool-thread-frame-after #(future (assert (= :bound *held*))))))
       "clojure.core/future, by contrast, leaves the task's bindings on the worker"))
+
+(deftest a-future-run-inline-keeps-the-callers-bindings
+  ;; an executor (or a test) may run the task on the calling thread
+  (with-redefs [clojure.core/future-call (fn [f] (doto (promise) (deliver (f))))]
+    (binding [*held* :outer]
+      (is (= :outer @(threads/future *held*)))
+      (is (= :outer *held*) "the caller's frame is untouched"))))

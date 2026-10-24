@@ -2211,6 +2211,10 @@
   (assert-transferred-node-settled! transfer #{} false)
   (binding [ec/*execution-context* (:parent-ctx handle)]
     (rreg/untrack-fork! room-id (:fork-id handle)))
+  ;; Every leaf has settled, and partition leaves share this context: its
+  ;; timers are released here, once, as `release-fork-timers!` does for a
+  ;; fork settled in place.
+  (delayed/cancel-all-timers! (:child-ctx handle))
   nil)
 
 (defmacro with-fork-ctx
