@@ -360,35 +360,48 @@
 
 (deftest the-first-cancellation-request-is-timed-by-the-lifecycle
   ;; What tells a cancellation from a deadline: the time of the first request,
-  ;; recorded with the token, not when some hook happens to run.
+  ;; recorded with the token under the lifecycle lock, kept for a watcher past
+  ;; the Run's retirement, and independent of when hooks run.
   (let [[room _] (run-room :cancel-time)
-        started (run/start! room :agent (d/message :alice :agent "work") nil)
-        run-id (:run/id started)
-        entered (promise) release (promise)
-        seen (atom nil) late (atom nil)]
+        start #(:run/id (run/start! room :agent (d/message :alice :agent "work") nil))
+        run-id (start)
+        early (start)
+        unwatched (start)
+        entered (promise) release (promise)]
     (try
-      (is (nil? (run/cancel-requested-nanos run-id)))
-      ;; an earlier hook blocks hook delivery
-      (run/register-cancel-hook! run-id :a-slow-hook #(do (deliver entered true) @release))
-      (run/register-cancel-hook! run-id :z-probe #(reset! seen (run/cancel-requested-nanos run-id)))
+      (run/watch-cancel-time! run-id)
+      (is (nil? (run/watched-cancel-time run-id)) "watched, not yet asked")
+      (testing "a request made before the watch is kept"
+        (run/cancel-run! early)
+        (let [t (run/cancel-requested-nanos early)]
+          (run/watch-cancel-time! early)
+          (is (= t (run/watched-cancel-time early)))))
+      ;; a hook that blocks delivery does not delay the record
+      (run/register-cancel-hook! run-id :slow #(do (deliver entered true) @release))
       (let [before (System/nanoTime)
             cancelling (future (run/cancel-run! run-id))]
         (is (deref entered 5000 false))
-        (Thread/sleep 200)
-        (let [recorded (run/cancel-requested-nanos run-id)]
-          (is (some? recorded))
-          (is (<= before recorded (+ before 150000000)) "recorded at the request, not after the slow hook")
+        (let [recorded (run/watched-cancel-time run-id)]
+          (is (some? recorded) "recorded before the blocked hook returns")
+          (is (<= before recorded))
           (deliver release true)
           @cancelling
-          (is (or (nil? @seen) (= recorded @seen)) "a delayed hook reads the request's time")
-          (testing "a hook registered after the request gets the request's time"
-            (Thread/sleep 100)
-            (run/register-cancel-hook! run-id :late #(reset! late (run/cancel-requested-nanos run-id)))
-            (is (= recorded @late)))
           (testing "a repeated request keeps the first time"
             (run/cancel-run! run-id)
-            (is (= recorded (run/cancel-requested-nanos run-id))))))
+            (is (= recorded (run/watched-cancel-time run-id))))
+          (testing "the record outlives the Run"
+            (run/finish! run-id :cancelled)
+            (is (empty? (filter #(= run-id (:run/id %)) (run/active-runs :cancel-time))))
+            (is (= recorded (run/watched-cancel-time run-id))))))
+      (testing "an unwatched Run leaves no record"
+        (run/cancel-run! unwatched)
+        (is (nil? (run/watched-cancel-time unwatched))))
+      (testing "unwatching drops it"
+        (run/unwatch-cancel-time! run-id)
+        (is (nil? (run/watched-cancel-time run-id))))
       (finally
         (deliver release true)
-        (run/finish! run-id :cancelled)
+        (doseq [id [run-id early unwatched]]
+          (run/unwatch-cancel-time! id)
+          (run/finish! id :cancelled))
         (d/close-room! room)))))

@@ -878,33 +878,32 @@
                            ((:cancel! admission))
                            (throw error)))
                 ;; when the Run was first asked to cancel, as its lifecycle
-                ;; recorded it (the hook only reads it, while the Run is live):
-                ;; before the deadline, someone else cancelled it and it did not
-                ;; time out. A Run already retired here ended before any deadline.
-                cancel-requested-at (atom nil)
-                live? (run/register-cancel-hook!
-                       (program/run-id handle) ::cancel-provenance
-                       #(compare-and-set! cancel-requested-at nil
-                                          (run/cancel-requested-nanos (program/run-id handle))))
-                _ (when-not live? (reset! cancel-requested-at Long/MIN_VALUE))
+                ;; records it: before the deadline, someone else cancelled it
+                ;; and it did not time out
+                _ (run/watch-cancel-time! (program/run-id handle))
                 left (remaining-ms deadline-nanos)
-                initial (if (pos? left)
-                          (sp/await (comb/timeout (program/owned-result-spin handle)
-                                                  left timed-out))
-                          timed-out)
+                initial (try
+                          (if (pos? left)
+                            (sp/await (comb/timeout (program/owned-result-spin handle)
+                                                    left timed-out))
+                            timed-out)
+                          (catch Throwable error
+                            (run/unwatch-cancel-time! (program/run-id handle))
+                            (throw error)))
+                cancel-requested-at (run/watched-cancel-time (program/run-id handle))
+                _ (run/unwatch-cancel-time! (program/run-id handle))
             ;; A delayed timer must not make an overdue result successful. A
             ;; Run someone else had asked to cancel before the deadline was not
             ;; timed out, though its cleanup ran past the deadline.
                 deadline? (or (= timed-out initial) (zero? (remaining-ms deadline-nanos)))
                 timeout? (and deadline?
-                              (not (some-> @cancel-requested-at (< deadline-nanos))))
+                              (not (some-> cancel-requested-at (< deadline-nanos))))
                 _ (when timeout? (program/cancel! room handle))
                 result (if deadline?
                          (sp/await
                           (comb/timeout (program/result-spin handle)
                                         cancel-timeout-ms timed-out))
-                         initial)
-                _ (run/unregister-cancel-hook! (program/run-id handle) ::cancel-provenance)]
+                         initial)]
             (when (= timed-out result)
               (throw (ex-info "Environment Run did not quiesce after cancellation"
                               {:type ::cancellation-timeout

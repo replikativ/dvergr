@@ -775,6 +775,28 @@
   [run-id]
   (:cancel-requested-nanos (get @active run-id)))
 
+(defonce ^:private watched-cancel-times
+  ;; run-id -> nanoTime of the first cancellation request (nil: none yet), for
+  ;; Runs a host watches: kept after the Run retires, until unwatched
+  (atom {}))
+
+(defn watch-cancel-time!
+  "Keep when `run-id` is first asked to cancel, past its retirement, until
+   `unwatch-cancel-time!`. A request made before the watch is kept too."
+  [run-id]
+  (locking lifecycle-lock
+    (swap! watched-cancel-times assoc run-id (cancel-requested-nanos run-id)))
+  nil)
+
+(defn watched-cancel-time
+  "The watched Run's first cancellation request (`System/nanoTime`), or nil."
+  [run-id]
+  (get @watched-cancel-times run-id))
+
+(defn unwatch-cancel-time! [run-id]
+  (swap! watched-cancel-times dissoc run-id)
+  nil)
+
 (defn- request-cancel!
   [run-id expected-room]
   (let [entry
@@ -791,11 +813,14 @@
                                  (get-in entry [:run :run/status])))
                 entry
                 (let [_ (reset! (:cancelled? entry) true)
+                      ;; when it was first asked, with the token, under the
+                      ;; lock: what tells a cancellation from a deadline
+                      now (System/nanoTime)
+                      _ (when (contains? @watched-cancel-times run-id)
+                          (swap! watched-cancel-times assoc run-id now))
                       entry' (-> entry
                                  (assoc-in [:run :run/status] :cancelling)
-                                 ;; when it was first asked, with the token, under
-                                 ;; the lock: what tells a cancellation from a deadline
-                                 (assoc :cancel-requested-nanos (System/nanoTime)))]
+                                 (assoc :cancel-requested-nanos now))]
                   (swap! active assoc run-id entry')
                   (notify! {:type :run/cancel-requested :run (public-entry entry')})
                   entry')))))]
