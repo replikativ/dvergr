@@ -212,8 +212,12 @@
         org.replikativ/katzen      {:mvn/version "0.1.11"}}
 
  :aliases
+ ;; Every alias that starts a JVM caps its heap, so no invocation can grow to
+ ;; the JVM's default (a quarter of RAM) beside other JVMs on a shared machine.
+ ;; An explicit -J-Xmx on the command line still wins.
  {:dev  {:extra-paths ["dev" "test" "src-clients"
                        "benchmarks/src" "benchmarks/resources" "benchmarks/test"]
+         :jvm-opts    ["-Xmx3g"]
          :extra-deps  {nrepl/nrepl          {:mvn/version "1.3.0"}
                        cider/cider-nrepl    {:mvn/version "0.50.2"}
                        clj-kondo/clj-kondo  {:mvn/version "2026.04.15"}
@@ -247,7 +251,7 @@
          ;; fails the test instead of warning; see spindel's missing-state-mode.
          ;; Tests' temporary files go to target/test-tmp, emptied after the run
          ;; (dvergr.test-tmp), not to /tmp.
-         :jvm-opts    ["-Dspindel.missing-state=throw" "-Djava.io.tmpdir=target/test-tmp"]
+         :jvm-opts    ["-Xmx3200m" "-Dspindel.missing-state=throw" "-Djava.io.tmpdir=target/test-tmp"]
          :main-opts   ["-m" "kaocha.runner"]}
 
   ;; The benchmarks (`dvergr.benchmarks.*`: tau2, BFCL, the coding, discovery
@@ -256,13 +260,15 @@
   ;; org.replikativ/dvergr-benchmarks (`clj -T:build benchmarks-jar`), or as a
   ;; git dep with `:deps/root "benchmarks"`. See benchmarks/README.md.
   :benchmarks {:extra-paths ["benchmarks/src" "benchmarks/resources"]
+               :jvm-opts ["-Xmx3g"]
                ;; BIRD: SQLite (the gold) and SQL over Datahike
                :extra-deps {org.replikativ/pg-datahike {:mvn/version "0.1.319"}
                             org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
                        org.replikativ/rechentafel {:mvn/version "0.1.11"} ; SpreadsheetBench
                        org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}}}
 
-  :repl {:main-opts ["-m" "nrepl.cmdline"
+  :repl {:jvm-opts ["-Xmx3g"]
+         :main-opts ["-m" "nrepl.cmdline"
                      "--middleware" "[cider.nrepl/cider-middleware]"
                      "--interactive"]}
 
@@ -306,7 +312,7 @@
                       io.forward/clojure-mail    {:mvn/version "1.0.8"}    ; mail intake
                       org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
                       nrepl/nrepl                {:mvn/version "1.3.0"}}
-        :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]
+        :jvm-opts    ["-Xmx4g" "--enable-native-access=ALL-UNNAMED"]
         :main-opts   ["-m" "dvergr.cli.main"]}
 
   ;; Run a standalone example scenario (examples/ on the classpath).
