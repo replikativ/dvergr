@@ -857,15 +857,19 @@
             ;; before it can be requested (and the Run retire)
             run-id (random-uuid)
             _ (run/watch-cancel-time! run-id)
-            admission (tracked-admission
-                       room cleanup-group
-                       #(program/hire-prepared-in! room (or world-parent room) team agent-ref
-                                                   hire-opts prepare-world! hosted-protocol
-                                                   (assoc (select-keys opts [:experiment-capabilities :delegation-policy])
-                                                          :deadline-nanos deadline-nanos
-                                                          :id run-id))
-                       #(program/cancel! room %)
-                       #(abandon-completed-admission! room %1 %2))]
+            admission (try
+                        (tracked-admission
+                         room cleanup-group
+                         #(program/hire-prepared-in! room (or world-parent room) team agent-ref
+                                                     hire-opts prepare-world! hosted-protocol
+                                                     (assoc (select-keys opts [:experiment-capabilities :delegation-policy])
+                                                            :deadline-nanos deadline-nanos
+                                                            :id run-id))
+                         #(program/cancel! room %)
+                         #(abandon-completed-admission! room %1 %2))
+                        (catch Throwable error
+                          (run/take-cancel-time! run-id)
+                          (throw error)))]
         (try
           (let [timed-out ::timed-out
                 handle (try

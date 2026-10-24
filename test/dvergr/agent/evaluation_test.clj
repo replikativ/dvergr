@@ -984,6 +984,24 @@
       (finally
         (d/close-room! room)))))
 
+(deftest a-failed-admission-leaves-no-cancellation-watch
+  (let [room (test-room :admission-registration)
+        team (roster/make-agent (roster/make-roster) {:id :candidate :program {:kind :echo}})
+        env (definition :test/admission-registration {:limits {:timeout-ms 5000 :cancel-timeout-ms 2000}})
+        evaluator (evaluation/make-evaluator
+                   {:id :test/exact :version 1 :basis "test:v1"
+                    :observe (fn [_] {}) :verify (fn [_ _] {:checks {:ok? true} :reward 1.0})})
+        watched #(set (keys @@#'run/watched-cancel-times))
+        before (watched)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (with-redefs-fn {#'evaluation/tracked-admission
+                         (fn [& _] (throw (ex-info "executor rejected" {:type ::rejected})))}
+          #(is (thrown? Exception @(evaluation/evaluate room team :candidate env evaluator))))
+        (is (= before (watched)) "the watch is taken when admission cannot be registered"))
+      (finally
+        (d/close-room! room)))))
+
 (deftest overdue-completion-is-a-host-fault-and-discards-its-world
   (doseq [policy [:fault :verdict] mode [:timer-wins :observer-delayed]]
     (let [room (test-room (keyword (str "overdue-" (name policy) "-" (name mode))))

@@ -415,3 +415,19 @@
           (run/take-cancel-time! id)
           (run/finish! id :cancelled))
         (d/close-room! room)))))
+
+(deftest taking-a-cancellation-time-races-no-request-into-a-leak
+  (let [[room _] (run-room :cancel-take-race)]
+    (try
+      (dotimes [_ 200]
+        (let [id (random-uuid)
+              _ (run/watch-cancel-time! id)
+              _ (run/start! room :agent (d/message :alice :agent "work") nil {:id id})
+              go (promise)
+              cancelling (future @go (run/cancel-run! id))
+              taking (future @go (run/take-cancel-time! id))]
+          (deliver go true)
+          @cancelling @taking
+          (is (not (contains? @@#'run/watched-cancel-times id)) "taken, and not recreated by the request")
+          (run/finish! id :cancelled)))
+      (finally (d/close-room! room)))))
