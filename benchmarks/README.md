@@ -19,6 +19,9 @@ Benchmarks for dvergr's evaluation path.
 - **Bank booking** (`bankbooking`): writes the bank-booking case pack
   (`examples/workflows/bank-booking`, DATEV via Kontor), a room workflow run with
   `dvergr.catalog.room-run` (doc/room-workflows.md).
+- **Company cash** (`company-cash`): reproducible synthetic businesses, a
+  compatible forecast/decision workflow and a separate native evaluator for
+  reusable agent-built simulation models ([doc/company-cash.md](doc/company-cash.md)).
 - **Dvergr's own fixtures**: coding repair (`permutation`, `rss`, on
   `coding-workspace`): [doc/coding.md](doc/coding.md);
   frozen-web discovery, citation verification and market evidence
@@ -68,6 +71,7 @@ Task data is not vendored. Tests that need it report as pending without it.
 | BIRD | `BIRD_ROOT`, default `~/.cache/dvergr-bench/bird/dev_20240627`: BIRD's `dev.zip` (https://bird-bench.github.io) unpacked, with `dev_databases.zip` unpacked in it |
 | SpreadsheetBench | `SPREADSHEETBENCH_ROOT`, default `~/.cache/dvergr-bench/spreadsheetbench/data/spreadsheetbench_verified_400`; experiments also need the oracle's certification at `~/.cache/dvergr-bench/spreadsheetbench/oracle-verified-400.edn`, written once with `(spit (spreadsheetbench.experiment/oracle-file) (pr-str (spreadsheetbench.oracle/report)))` |
 | Bank booking | none: the bundle is in `examples/workflows/bank-booking/`; its DATEV export is not checked in, and `bankbooking/write-example!` writes it (that bundle's README) |
+| Company cash | none: four regression cases are in `examples/workflows/company-cash/`; the versioned generator creates more development/held-out businesses |
 
 How to run one (aliases, credentials, a dedicated JVM, reading the report):
 [doc/running-benchmarks.md](../doc/running-benchmarks.md). Licences of the
