@@ -34,6 +34,7 @@
             [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.context :as ctx]
+            [org.replikativ.spindel.engine.impl.delayed :as delayed]
             [org.replikativ.spindel.spin.core :as spin-core]
             [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.spin.combinators :as comb]
@@ -1159,6 +1160,20 @@
   [room]
   (boolean (some-> room :meta deref :forked-from)))
 
+(defn- release-fork-timers!
+  "Cancel the timers a fork scheduled in its own execution context.
+
+   A fork room's context is never closed (it shares its root's executor and
+   running flag), so nothing else cancels them: a pending timeout or sleep
+   would keep the whole fork context, and everything it holds, reachable from
+   the timer queue until it fired. A forked context starts with no timer
+   handles, so these are the fork's own; a `:none` fork shares the root's exact
+   context and is left alone."
+  [room]
+  (when-let [c (:ctx room)]
+    (when (and (fork-room? room) (:parent-ctx c))
+      (delayed/cancel-all-timers! c))))
+
 (defn- room-home-ctx
   "Context holding `room`'s registry entry. Isolated forks register in parent."
   [room]
@@ -1253,6 +1268,7 @@
          (when (and close-context? (not (fork-room? room)))
            (assert-context-unshared! room))
          (leave-all! room)
+         (release-fork-timers! room)
          (binding [ec/*execution-context* (room-home-ctx room)]
            (rreg/unregister! (:id room)))
         ;; A branchless fork carries the exact root ctx, so Spindel cannot infer from
@@ -2375,6 +2391,7 @@
                       (ygg/discard-fork! handle)
                       (srooms/drop-fork-grants! pending)))
                   (leave-all! fork)
+                  (release-fork-timers! fork)
                   (binding [ec/*execution-context* (fork-home-ctx fork)]
                     (rreg/untrack-fork! (:id fork) (some-> fork fork-handle :fork-id))
                     (rreg/unregister! (:id fork))
@@ -2544,6 +2561,7 @@
              (try ((requiring-resolve 'dvergr.rooms.messages/refresh!) parent)
                   (catch Throwable _ nil))
              (leave-all! fork)
+             (release-fork-timers! fork)
              (binding [ec/*execution-context* (fork-home-ctx fork)]
                (rreg/untrack-fork! (:id fork) (some-> fork fork-handle :fork-id))
                (rreg/unregister! (:id fork))

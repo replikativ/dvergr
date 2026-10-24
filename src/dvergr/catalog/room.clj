@@ -23,7 +23,8 @@
    left under the captured directories and returns a verdict. It cannot read
    the room, the network or its own workspace. An unpromoted bundle's
    verifier is `:ad-hoc` on every receipt."
-  (:require [clojure.edn :as edn]
+  (:require [dvergr.runtime.threads :as threads]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.agent.environment :as environment]
@@ -205,7 +206,7 @@
    in time; `::absent` when the checker does not define it."
   [source fname input]
   (let [ctx (checker-ctx)
-        run (future
+        run (threads/future
               (let [{:keys [ns]} (sci/eval-string+ ctx source)
                     f (sci/eval-string* ctx (str "(ns-resolve '" ns " '" fname ")"))]
                 (if f (@f input) ::absent)))

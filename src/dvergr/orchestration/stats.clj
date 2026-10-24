@@ -16,7 +16,8 @@
                                     ;      :last-active-str \"5m ago\"
                                     ;      :summary \"Sweep stored 1 signal...\"}
      (stats/refresh-all!)           ; force-refresh all agents"
-  (:require [datahike.api :as dh]
+  (:require [dvergr.runtime.threads :as threads]
+            [datahike.api :as dh]
             [dvergr.tools.llm-call :as llm]
             [dvergr.model.registry :as model-registry]
             [dvergr.actors :as actors]
@@ -180,7 +181,7 @@
    Captures the caller's ctx and re-binds it inside the future, since the
    future's pool thread doesn't inherit dynamic vars."
   [ctx agent-id]
-  (future
+  (threads/future
     (try
       (binding [ec/*execution-context* ctx]
         (when-let [content (query-recent-content agent-id)]
@@ -229,7 +230,7 @@
                            (> (- now (or (:summary-refreshed-at cached) 0))
                               summary-ttl-ms))]
     (when (and ctx cost-stale?)
-      (future (refresh-cost! ctx agent-id)))
+      (threads/future (refresh-cost! ctx agent-id)))
     (when (and ctx summary-stale?)
       (refresh-summary-async! ctx agent-id))
     (or cached {:cost-dollars nil :last-active nil :last-active-str nil :summary nil})))

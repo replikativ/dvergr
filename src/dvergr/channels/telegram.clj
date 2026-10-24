@@ -11,7 +11,8 @@
      (def bot (ch/connect!
                 (tg/make-telegram {:token (System/getenv \"TELEGRAM_BOT_TOKEN\")})
                 :on-message (fn [msg] (println \"Got:\" msg))))"
-  (:require [hato.client :as hc]
+  (:require [dvergr.runtime.threads :as threads]
+            [hato.client :as hc]
             [jsonista.core :as json]
             [dvergr.channels.core :as channels]
             [dvergr.adapters.core :as adapters]
@@ -219,7 +220,7 @@
 (defn- start-polling!
   "Start background long-polling thread. Returns the future."
   [channel]
-  (future
+  (threads/future
     ;; Register the spec-derived slash-command menu once, when polling starts.
     (set-my-commands! (get-in channel [:config :token]))
     (loop [offset 0]
@@ -237,7 +238,7 @@
                 ;; must not stall inbound delivery for every other chat.
                 ;; One future per message: messages of one chat are not
                 ;; ordered among themselves on the way into the room.
-                (future
+                (threads/future
                   (try
                     (on-msg msg)
                     (catch Throwable e
