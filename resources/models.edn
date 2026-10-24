@@ -47,6 +47,7 @@
   ;; Quirks carried from the K2 family until a probe says otherwise.
   "accounts/fireworks/models/kimi-k3"
   {:name "Kimi K3"
+   :reasoning-efforts ["none" "low" "high" "max"]
    :provider :fireworks
    :api-type :openai-chat
    :capabilities #{:tools :vision :streaming}
@@ -157,6 +158,7 @@
 
   "accounts/fireworks/models/deepseek-v4p1-flash"
   {:name "DeepSeek V4.1 Flash"
+   :reasoning-efforts ["none" "low" "high" "max"]
    :provider :fireworks
    :api-type :openai-chat
    :capabilities #{:tools :streaming}

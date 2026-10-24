@@ -295,6 +295,7 @@
      :system    - System prompt (overrides system message in messages)
      :tools     - Tool definitions
      :thinking  - {:budget-tokens N} for thinking models
+     :effort    - Declared provider effort level; also accepted as model@effort
      :on-text   - Callback for streaming text: (fn [text-chunk])
      :on-event  - Callback for raw events: (fn [event])
 
@@ -310,7 +311,7 @@
   (let [;; Resolve model
         model-id (or (:model opts)
                      (throw (ex-info "Model ID required" {:opts opts})))
-        model-id (registry/resolve-alias model-id)
+        model-id (registry/resolve-candidate model-id (:effort opts))
         model-def (registry/get-model! model-id)
 
         ;; Get provider
@@ -345,7 +346,10 @@
                (assoc :top-k       (registry/get-quirk model-id :default-top-k)))
 
         ;; Ensure model is in opts
-        opts (assoc opts :model model-id)]
+        ;; Only the base id goes over the wire. Attribution and returned
+        ;; responses retain the full candidate id, including effort.
+        opts (cond-> (assoc opts :model (or (:base-model model-def) model-id))
+               (:effort model-def) (assoc :effort (:effort model-def)))]
     ;; Response identity is the execution id used for pricing and attribution.
 
     ;; DirectChat providers bypass the HTTP+SSE path entirely

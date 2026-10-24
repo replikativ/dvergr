@@ -497,3 +497,15 @@
           (is (= :done (deref first-caller 5000 nil)))
           (is (true? (deref second-caller 5000 nil)) "and returns once it is complete")))
       (finally (reset! loaded? (or before @loaded?))))))
+
+(deftest program-effort-is-in-the-resolved-model-inputs
+  (with-redefs [providers/ensure-initialized! (constantly nil)]
+    (let [agent {:agent/id :effort-inputs
+                 :agent/model-policy {:provider :codex-subscription
+                                      :model "codex-subscription-sol-6.1"}
+                 :agent/program {:kind :llm :auto-compact? false :effort :medium}}
+          medium (program/run-inputs agent nil)
+          high (program/run-inputs (assoc-in agent [:agent/program :effort] :high) nil)]
+      (is (= "codex-subscription-sol-6.1@medium" (get-in medium [:model :model])))
+      (is (= "medium" (get-in medium [:model :effort])))
+      (is (not= (program/inputs-id medium) (program/inputs-id high))))))

@@ -48,6 +48,7 @@
   {;; ── Claude Opus 4.x ──────────────────────────────────────────────
    "claude-opus-4-7"
    {:id "claude-opus-4-7"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Claude Opus 4.7"
     :provider :anthropic
     :api-type :anthropic-messages
@@ -59,6 +60,7 @@
 
    "claude-opus-4-6"
    {:id "claude-opus-4-6"
+    :reasoning-efforts ["low" "medium" "high" "max"]
     :name "Claude Opus 4.6"
     :provider :anthropic
     :api-type :anthropic-messages
@@ -70,6 +72,7 @@
 
    "claude-opus-4-5"
    {:id "claude-opus-4-5"
+    :reasoning-efforts ["low" "medium" "high"]
     :name "Claude Opus 4.5"
     :provider :anthropic
     :api-type :anthropic-messages
@@ -82,6 +85,7 @@
    ;; ── Claude Sonnet 4.x ────────────────────────────────────────────
    "claude-sonnet-4-6"
    {:id "claude-sonnet-4-6"
+    :reasoning-efforts ["low" "medium" "high" "max"]
     :name "Claude Sonnet 4.6"
     :provider :anthropic
     :api-type :anthropic-messages
@@ -117,6 +121,7 @@
    ;; ── Claude 5.5 (list prices from platform.claude.com/docs/en/about-claude/pricing, 2026-10-08)
    "claude-haiku-5-5"
    {:id "claude-haiku-5-5"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Claude Haiku 5.5"
     :provider :anthropic
     :api-type :anthropic-messages
@@ -134,6 +139,7 @@
 
    "claude-sonnet-5-5"
    {:id "claude-sonnet-5-5"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Claude Sonnet 5.5"
     :provider :anthropic
     :api-type :anthropic-messages
@@ -145,6 +151,7 @@
 
    "claude-opus-5-5"
    {:id "claude-opus-5-5"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Claude Opus 5.5"
     :provider :anthropic
     :api-type :anthropic-messages
@@ -157,6 +164,7 @@
 ;; Claude Code CLI models (via subscription)
    "claude-code-sonnet"
    {:id "claude-code-sonnet"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Claude Sonnet 5.5 (Code CLI)"
     :provider :claude-code
     :api-type :claude-code-cli
@@ -169,6 +177,7 @@
 
    "claude-code-opus"
    {:id "claude-code-opus"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Claude Opus 5.5 (Code CLI)"
     :provider :claude-code
     :api-type :claude-code-cli
@@ -181,6 +190,7 @@
 
    "claude-code-haiku"
    {:id "claude-code-haiku"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Claude Haiku 5.5 (Code CLI)"
     :provider :claude-code
     :api-type :claude-code-cli
@@ -353,6 +363,7 @@
    ;; configured at once.
    "codex-subscription"
    {:id "codex-subscription"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Codex GPT-5.6 Sol (subscription default)"
     :provider :codex-subscription
     :api-type :openai-responses
@@ -365,6 +376,7 @@
 
    "codex-subscription-sol"
    {:id "codex-subscription-sol"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Codex GPT-5.6 Sol (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
@@ -377,6 +389,7 @@
 
    "codex-subscription-terra"
    {:id "codex-subscription-terra"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Codex GPT-5.6 Terra (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
@@ -389,6 +402,7 @@
 
    "codex-subscription-luna"
    {:id "codex-subscription-luna"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Codex GPT-5.6 Luna (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
@@ -401,6 +415,7 @@
 
    "codex-subscription-sol-6.1"
    {:id "codex-subscription-sol-6.1"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Codex GPT-6.1 Sol (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
@@ -413,6 +428,7 @@
 
    "codex-subscription-luna-6"
    {:id "codex-subscription-luna-6"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Codex GPT-6 Luna (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
@@ -425,6 +441,7 @@
 
    "codex-subscription-astra-6"
    {:id "codex-subscription-astra-6"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Codex GPT-6 Astra (subscription)"
     :provider :codex-subscription
     :api-type :openai-responses
@@ -437,6 +454,7 @@
 
    "codex-subscription-cli"
    {:id "codex-subscription-cli"
+    :reasoning-efforts ["low" "medium" "high" "xhigh" "max"]
     :name "Codex subscription (CLI fallback)"
     :provider :codex-subscription-cli
     :api-type :codex-cli
@@ -471,10 +489,25 @@
   [model-id]
   (swap! registry dissoc model-id))
 
+(defn- effort-parts [model-id]
+  (when (string? model-id)
+    (next (re-matches #"([^@]+)@([^@]+)" model-id))))
+
 (defn get-model
-  "Get model definition by ID. Returns nil if not found."
+  "Get a registered model or a derived `model@effort` candidate. Derived
+   candidates retain base pricing/capabilities and never enter registry state.
+   Returns nil for an unknown base; rejects undeclared reasoning levels."
   [model-id]
-  (get @registry model-id))
+  (or (get @registry model-id)
+      (when-let [[base effort] (effort-parts model-id)]
+        (when-let [model (get @registry base)]
+          (let [supported (:reasoning-efforts model)]
+            (when-not (some #{effort} supported)
+              (throw (ex-info "Unsupported model reasoning effort"
+                              {:model-id base :effort effort :supported (vec supported)})))
+            (assoc model :id model-id :base-model base :effort effort
+                   :reasoning-efforts (vec supported)
+                   :name (str (:name model) " (" effort " effort)")))))))
 
 (declare ensure-models-loaded!)
 
@@ -797,7 +830,7 @@
   [alias-name model-id]
   (swap! aliases assoc alias-name model-id))
 
-(defn resolve-alias
+(defn- resolve-base-alias
   "Resolve aliases and retired ids to a current model, warning once per resolution."
   [model-id-or-alias]
   (ensure-models-loaded!)
@@ -817,6 +850,31 @@
                  :data {:model id :successor resolved}}
                 (str "Retired model " id " resolves to " resolved)))
     resolved))
+
+(defn resolve-alias
+  "Resolve aliases and retired ids, preserving and validating @effort."
+  [model-id-or-alias]
+  (ensure-models-loaded!)
+  (let [id (get @aliases model-id-or-alias model-id-or-alias)]
+    (if-let [[base effort] (and (not (contains? @registry id)) (effort-parts id))]
+      (let [candidate (str (resolve-base-alias base) "@" effort)]
+        (get-model! candidate)
+        candidate)
+      (resolve-base-alias id))))
+
+(defn resolve-candidate
+  "Resolve an id and optional explicit effort into one candidate identity.
+   A fixed-effort id cannot be silently overridden by a different effort."
+  [model-id effort]
+  (let [id (resolve-alias model-id)]
+    (if (nil? effort)
+      id
+      (let [effort (name effort)
+            model (get-model! id)]
+        (when (and (:effort model) (not= effort (:effort model)))
+          (throw (ex-info "Conflicting model reasoning efforts"
+                          {:model-id id :effort effort :fixed-effort (:effort model)})))
+        (resolve-alias (str (or (:base-model model) id) "@" effort))))))
 
 (defn get-model-by-alias
   "Get model definition, resolving aliases first."

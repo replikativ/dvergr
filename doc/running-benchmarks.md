@@ -200,3 +200,30 @@ comparisons** table does this for you:
   the harness: every cell writes to the experiment's one store (datahike's
   single writer). A cell's admission (forking its world, the Run's durable
   start) runs off the experiment's drain (spindel `blocking`).
+
+## Reasoning effort
+
+A model id can fix its reasoning effort: `claude-code-sonnet@medium`,
+`codex-subscription-sol-6.1@medium`, or
+`accounts/fireworks/models/kimi-k3@low`. Aliases work too (`cc-sonnet@medium`).
+The registry validates the level against that model's declared `:reasoning-efforts`;
+an undeclared level or a model without that metadata is refused before dispatch.
+These ids remain distinct candidates in experiments, resolved inputs and usage
+attribution. The provider receives its base model id and its own effort parameter.
+The level names are provider-specific controls, not equal amounts of computation.
+
+An LLM program can set `:effort :medium`; a direct `model.chat/chat` call can do the
+same. Both resolve to the fixed-effort candidate. Specifying a conflicting effort
+alongside `model@effort` is an error. Omitting effort preserves provider defaults.
+Thinking token budgets retain their existing adapter-specific meaning.
+
+The Chat Completions workaround for GPT-5.6 function tools requires effort `none`.
+An explicit non-`none` effort with those tools is refused; use the Codex Responses
+provider for reasoning and tools together. Fireworks model entries declare only
+verified meaningful levels: Kimi K3 and DeepSeek V4.1 expose `none`, `low`, `high`,
+and `max`, avoiding provider aliases that promote `medium` or `xhigh` to other levels.
+New deployments can declare supported levels in models.edn.
+
+Wire contracts: [OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning),
+[Anthropic effort](https://platform.claude.com/docs/en/build-with-claude/effort), and
+[Fireworks reasoning effort](https://docs.fireworks.ai/api-reference/post-chatcompletions).

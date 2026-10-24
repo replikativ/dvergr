@@ -84,7 +84,11 @@
           ;; share this adapter.
           effort-none? (and (:native-openai? config)
                             (seq tools)
-                            (registry/get-quirk (:model opts) :chat-tools-need-effort-none?))]
+                            (registry/get-quirk (:model opts) :chat-tools-need-effort-none?))
+          effort (some-> (:effort opts) name)
+          checked-effort (when (and effort-none? effort (not= "none" effort))
+                           (throw (ex-info "This Chat Completions model requires effort none with tools; use a Responses provider for reasoning with tools"
+                                           {:model (:model opts) :effort effort})))]
       {:url (str (or (:base-url config) "https://api.openai.com/v1") "/chat/completions")
        :headers (merge {"Content-Type" "application/json"}
                        (:extra-headers config))
@@ -108,6 +112,7 @@
                ;; Top-k if specified — a Fireworks extension param (MiniMax M2: 40)
                (:top-k opts) (assoc :top_k (:top-k opts))
                (seq tools) (assoc :tools (p/format-tools _ tools))
+               effort (assoc :reasoning_effort effort)
                effort-none? (assoc :reasoning_effort "none"))}))
 
   (create-accumulator [_ model-def]

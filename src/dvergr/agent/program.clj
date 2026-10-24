@@ -818,11 +818,13 @@
 
 (defn- resolve-model-spec [agent]
   (providers/ensure-initialized!)
-  (or (:agent/model-policy agent)
-      (providers/default-spec)
-      (throw (ex-info "No LLM provider is available for AgentDef"
-                      {:type ::no-provider
-                       :agent/id (:agent/id agent)}))))
+  (let [spec (or (:agent/model-policy agent)
+                 (providers/default-spec)
+                 (throw (ex-info "No LLM provider is available for AgentDef"
+                                 {:type ::no-provider :agent/id (:agent/id agent)})))]
+    (cond-> spec
+      (:model spec) (update :model registry/resolve-candidate
+                            (get-in agent [:agent/program :effort])))))
 
 (def ^:private llm-base-prompt
   (str "You are a model inside the Dvergr harness. Dvergr owns "
