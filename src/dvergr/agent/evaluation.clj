@@ -12,6 +12,7 @@
             [dvergr.artifact :as artifact]
             [dvergr.agent.attempt :as attempt]
             [dvergr.agent.program :as program]
+            [dvergr.agent.run :as run]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.spend :as spend]
             [dvergr.resource :as resource]
@@ -876,19 +877,29 @@
                          (catch Throwable error
                            ((:cancel! admission))
                            (throw error)))
+                ;; when the Run was first asked to cancel: before the deadline,
+                ;; someone else cancelled it and it did not time out
+                cancel-requested-at (atom nil)
+                _ (run/register-cancel-hook! (program/run-id handle) ::cancel-provenance
+                                             #(compare-and-set! cancel-requested-at nil (System/nanoTime)))
                 left (remaining-ms deadline-nanos)
                 initial (if (pos? left)
                           (sp/await (comb/timeout (program/owned-result-spin handle)
                                                   left timed-out))
                           timed-out)
-            ;; A delayed timer must not make an overdue result successful.
-                timeout? (or (= timed-out initial) (zero? (remaining-ms deadline-nanos)))
+            ;; A delayed timer must not make an overdue result successful. A
+            ;; Run someone else had asked to cancel before the deadline was not
+            ;; timed out, though its cleanup ran past the deadline.
+                deadline? (or (= timed-out initial) (zero? (remaining-ms deadline-nanos)))
+                timeout? (and deadline?
+                              (not (some-> @cancel-requested-at (< deadline-nanos))))
                 _ (when timeout? (program/cancel! room handle))
-                result (if timeout?
+                result (if deadline?
                          (sp/await
                           (comb/timeout (program/result-spin handle)
                                         cancel-timeout-ms timed-out))
-                         initial)]
+                         initial)
+                _ (run/unregister-cancel-hook! (program/run-id handle) ::cancel-provenance)]
             (when (= timed-out result)
               (throw (ex-info "Environment Run did not quiesce after cancellation"
                               {:type ::cancellation-timeout

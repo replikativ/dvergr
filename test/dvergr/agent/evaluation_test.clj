@@ -940,6 +940,50 @@
       (finally
         (d/close-room! room)))))
 
+(deftest a-run-cancelled-before-its-deadline-is-not-timed-out
+  ;; Cancelled by someone else before the deadline, with cleanup (capture)
+  ;; running past it: an ordinary cancellation, not a timeout verdict.
+  (let [room (test-room :external-cancel)
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :slow
+               :program {:kind :scripted :delay-ms 10000 :reply :late}})
+        env (definition :test/external-cancel
+              {:task :late
+               :limits {:timeout-ms 8000 :cancel-timeout-ms 15000 :on-timeout :verdict}})
+        observed (atom ::unobserved)
+        evaluator
+        (evaluation/make-evaluator
+         {:id :test/exact :version 1 :basis "test:v1"
+          :capture (fn [_] (Thread/sleep 9000) {})
+          :observe (fn [{:keys [default timed-out?]}]
+                     (reset! observed timed-out?)
+                     default)
+          :verify (fn [_ _] {:checks {:ok? true} :reward 1.0})})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [spin (evaluation/evaluate room team :slow env evaluator)
+              ;; awaited at the host boundary, on its own thread
+              pending (future (try @spin (catch clojure.lang.ExceptionInfo e e)))
+              _ (wait-until #(seq (run/runs room)) 5000)
+              ;; past world setup: the candidate itself is running
+              _ (Thread/sleep 1000)
+              {:keys [run/id]} (first (run/runs room))
+              _ (is (some? id) "the Run started")
+              _ (run/cancel-run! id)
+              result (deref pending 40000 ::hung)
+              receipt (when (map? result) (:attempt-receipt result))]
+          (is (false? @observed) (str "the observer is not told it timed out: "
+                                      (if (instance? Throwable result)
+                                        (str (ex-message result) " " (pr-str (ex-data result)))
+                                        (pr-str (some-> result :attempt-receipt :attempt/status)))))
+          (when receipt
+            (is (not (true? (get-in receipt [:attempt/metrics :timed-out?]))))
+            (is (nil? (get-in receipt [:attempt/metrics :failure]))
+                "not a model-timeout verdict"))))
+      (finally
+        (d/close-room! room)))))
+
 (deftest overdue-completion-is-a-host-fault-and-discards-its-world
   (doseq [policy [:fault :verdict] mode [:timer-wins :observer-delayed]]
     (let [room (test-room (keyword (str "overdue-" (name policy) "-" (name mode))))
