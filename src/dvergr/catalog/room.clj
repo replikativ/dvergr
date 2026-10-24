@@ -12,6 +12,8 @@
      gold.edn       optional: the reference facts the checker scores against
      fixtures/…     the files each attempt's world starts with (at the root:
                     fixtures/docs/a.md → /docs/a.md)
+     fixture-pack.edn optional: inert versioned path→text fixture map; also
+                    supported at cases/<id>/fixture-pack.edn
      calibration.edn optional: {:reference {path text} :fetched {url body}
                     :damaged {name {:files {path text} :fetched {…} :loses
                     [check …]}}}, how the checker earns
@@ -28,6 +30,7 @@
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.workflow :as workflow]
+            [dvergr.catalog.fixture-pack :as fixture-pack]
             [dvergr.catalog.workspace :as ws]
             [dvergr.effects :as effects]
             [dvergr.io.frozen-web :as frozen-web]
@@ -86,14 +89,16 @@
   "Problems with a bundle's files (`{relative-path text}`), as strings; empty
    when it is well formed."
   [files]
-  (let [definition (try (read-edn files "workflow.edn") (catch Exception e {::error (ex-message e)}))]
+  (let [definition (try (read-edn files "workflow.edn") (catch Exception e {::error (ex-message e)}))
+        pack-error (try (fixture-pack/decode files) nil (catch Exception e (ex-message e)))]
     (cond-> []
+      pack-error (conj pack-error)
       (not (contains? files "workflow.edn")) (conj "workflow.edn is missing")
       (::error definition) (conj (::error definition))
       (and (map? definition) (not (::error definition)) (not (m/validate Definition definition)))
       (conj (str "workflow.edn: " (pr-str (me/humanize (m/explain Definition definition)))))
       (not (contains? files "checker.clj")) (conj "checker.clj is missing")
-      (not (some #(or (str/starts-with? % "fixtures/") (str/starts-with? % "cases/")) (keys files)))
+      (not (some #(or (= % "fixture-pack.edn") (str/starts-with? % "fixtures/") (str/starts-with? % "cases/")) (keys files)))
       (conj "fixtures/ is empty and there are no cases/: every attempt's world would start with nothing")
 
       (and (map? definition) (= :frozen (:web definition)) (not (contains? files "web.edn")))
@@ -107,7 +112,8 @@
   (when-let [problems (seq (check-files files))]
     (throw (ex-info (str "Workflow bundle " name " is not well formed: " (str/join "; " problems))
                     {:type ::invalid-bundle :problems (vec problems)})))
-  (let [definition (read-edn files "workflow.edn")]
+  (let [definition (read-edn files "workflow.edn")
+        packed (fixture-pack/decode files)]
     {:name name
      ;; what it was made of: what travels into a room (`room-run`)
      :files files
@@ -118,7 +124,7 @@
      ;; a case pack's: which rows became cases, which could not and why
      :certification (read-edn files "certification.edn")
      :web (when (= :frozen (:web definition)) (read-edn files "web.edn"))
-     :fixtures (into (sorted-map)
+     :fixtures (into (into (sorted-map) (:shared packed))
                      (keep (fn [[path text]]
                              (when (str/starts-with? path "fixtures/")
                                [(subs path (count "fixtures")) text])))
@@ -133,7 +139,7 @@
                           (assoc-in cases [id :fixtures (subs rest (count "fixtures"))] text)
                           :else cases)
                         cases))
-                    (sorted-map) files)
+                    (into (sorted-map) (for [[id fixtures] (:cases packed)] [id {:fixtures fixtures}])) files)
      :id (hasch/uuid [:dvergr/room-workflow files])}))
 
 (defn case-of

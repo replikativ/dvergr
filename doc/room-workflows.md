@@ -181,6 +181,31 @@ environment's metadata; `calibration.edn` names the case whose gold it scores ag
 (`:case`). `examples/workflows/contract-review/` is one: eight CUAD contracts
 (`dev/cuad_bundle.py` builds more).
 
+Fixtures can also be stored as inert data in `fixture-pack.edn`, or
+`cases/<id>/fixture-pack.edn`, outside the `fixtures/` directory:
+
+```clojure
+{:kind :dvergr/fixture-pack :version 1
+ :files {"/wiki/Company.md" "exact original Markdown, including its identities"}}
+```
+
+This keeps a copied document from becoming an authored page in the repository
+that holds the workflow. Packs contain exactly one EDN value with the three
+keys above. Paths must already be canonical absolute workspace file paths and
+pass the normal sensitive-path policy. Bodies are strict UTF-8 text, preserved
+without parsing or formatting. Pack syntax permits maps, short scalar tokens,
+strings and comments; reader dispatch, discard and metadata forms are refused.
+Nesting and unquoted token lengths are bounded before EDN parsing. Each pack
+and decoded file is at most 512 KiB,
+each pack has at most 100 files, and all packs together decode to at most 2 MiB.
+At most 100 packs are accepted. Inspection validates every case's pack before
+execution. Directory and packed fixtures may coexist but cannot name the same
+runtime path within a shared/case scope, even with identical content. Existing
+case-over-shared overrides remain unchanged. Only decoded selected fixtures
+enter the attempt; the pack wrappers and evaluator-held gold are not seeded.
+The bundle identity continues to cover the original source files, including
+the pack text. Existing directory-fixture bundles retain their behavior.
+
 Forked rooms retain schedule definitions as data but do not start real-time
 scheduler handles or fire inherited schedules, including direct calls to
 `dvergr.rooms.scheduler/fire-due!`. The canonical `:forked-from` marker is
