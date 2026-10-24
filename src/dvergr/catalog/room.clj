@@ -66,7 +66,10 @@
    [:allowed-sources {:optional true} [:vector :string]]
    ;; :frozen: the attempt's web is web.edn (`freeze`), not the internet
    [:web {:optional true} [:enum :live :frozen]]
-   [:timeout-ms {:optional true} [:int {:min 1000}]]])
+   [:timeout-ms {:optional true} [:int {:min 1000}]]
+   ;; a timed-out attempt is scored on the files it left, not given 0: for
+   ;; tasks whose answer is a file kept up to date while the attempt works
+   [:score-on-timeout {:optional true} :boolean]])
 
 (def Verdict
   "What a checker returns."
@@ -440,16 +443,17 @@
                           :denials (effects/denials (some-> (effects/world-sink (:ctx world)) deref))}
                    (:fetched definition)
                    (assoc :fetched (bounded-pages (effects/fetched-pages (effects/world-recording (:ctx world)))))))
-      :observe (fn [{:keys [default result environment] captured :execution/evidence}]
+      :observe (fn [{:keys [default result environment timed-out?] captured :execution/evidence}]
                  (let [input {:files (:files captured) :fetched (:fetched captured {})
                               :params params :gold (gold-of b environment)}
                        requests (when judge (judge-requests checker input max-requests))]
-                   (cond-> (assoc default :run-status (:run/status result) :files (:files captured)
+                   (cond-> (assoc default :run-status (:run/status result) :timed-out? (boolean timed-out?)
+                                  :files (:files captured)
                                   :fetched (:fetched captured {}) :denials (:denials captured {}))
                      requests (assoc :judgements (into {} (map (fn [{:keys [id prompt]}] [id (judge prompt)]))
                                                        requests)
                                      :judge-requests requests))))
-      :verify (fn [environment {:keys [run-status files fetched judgements denials]}]
+      :verify (fn [environment {:keys [run-status timed-out? files fetched judgements denials]}]
                 (let [{:keys [checks reward]} (run-checker checker {:files files :fetched fetched
                                                                     :judgements (or judgements {})
                                                                     :params params :gold (gold-of b environment)})]
@@ -457,7 +461,10 @@
                              ;; tried to read the answer where it is published
                              (seq (:blocked-sources definition))
                              (assoc :no-blocked-fetch? (zero? (get denials :blocked 0))))
-                   :reward (if (= :completed run-status) reward 0.0)}))})))
+                   :reward (if (or (= :completed run-status)
+                                   (and timed-out? (:score-on-timeout definition)))
+                             reward
+                             0.0)}))})))
 
 (defn plan
   "Options for workflow/start on a user's room, including the bundle's review spec."

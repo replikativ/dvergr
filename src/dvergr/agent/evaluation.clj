@@ -12,6 +12,7 @@
             [dvergr.artifact :as artifact]
             [dvergr.agent.attempt :as attempt]
             [dvergr.agent.program :as program]
+            [dvergr.agent.run :as run]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.spend :as spend]
             [dvergr.resource :as resource]
@@ -270,7 +271,8 @@
 
    `id`, `version`, and optional portable `basis` must exactly match an
    EnvironmentDef verifier reference. `observe` receives durable execution
-   facts (`:result :durable :room :world/room :run-id :environment :agent`
+   facts (`:result :durable :room :world/room :run-id :environment :agent`,
+   `:timed-out?` when the Run was cancelled at the environment's deadline,
    and the setup and execution evidence) and returns portable evidence; a
    `:spend` it returns (`dvergr.agent.spend`) is the Attempt's bill on the
    receipt, else the Run's own metrics are. Model calls `observe` makes (a
@@ -647,6 +649,8 @@
                      :run-id run-id
                      :result result
                      :durable durable
+                     ;; the Run was cancelled at the environment's deadline
+                     :timed-out? (boolean timeout?)
                      :default (default-evidence {:result result
                                                  :durable durable})}))
         _ (when-not (and (map? evidence) (roster/data-value? evidence))
@@ -849,14 +853,23 @@
             ;; the store, so it runs off the drain. (It once hung there at
             ;; :parallelism 8: spins built on several threads at once shared
             ;; ids, spindel#110.)
-            admission (tracked-admission
-                       room cleanup-group
-                       #(program/hire-prepared-in! room (or world-parent room) team agent-ref
-                                                   hire-opts prepare-world! hosted-protocol
-                                                   (assoc (select-keys opts [:experiment-capabilities :delegation-policy])
-                                                          :deadline-nanos deadline-nanos))
-                       #(program/cancel! room %)
-                       #(abandon-completed-admission! room %1 %2))]
+            ;; the Run's id, chosen here so its cancellation time is watched
+            ;; before it can be requested (and the Run retire)
+            run-id (random-uuid)
+            _ (run/watch-cancel-time! run-id)
+            admission (try
+                        (tracked-admission
+                         room cleanup-group
+                         #(program/hire-prepared-in! room (or world-parent room) team agent-ref
+                                                     hire-opts prepare-world! hosted-protocol
+                                                     (assoc (select-keys opts [:experiment-capabilities :delegation-policy])
+                                                            :deadline-nanos deadline-nanos
+                                                            :id run-id))
+                         #(program/cancel! room %)
+                         #(abandon-completed-admission! room %1 %2))
+                        (catch Throwable error
+                          (run/take-cancel-time! run-id)
+                          (throw error)))]
         (try
           (let [timed-out ::timed-out
                 handle (try
@@ -871,17 +884,30 @@
                                               :phase :admission :cleanup/group cleanup-group})))
                            admitted)
                          (catch Throwable error
+                           (run/take-cancel-time! run-id)
                            ((:cancel! admission))
                            (throw error)))
                 left (remaining-ms deadline-nanos)
-                initial (if (pos? left)
-                          (sp/await (comb/timeout (program/owned-result-spin handle)
-                                                  left timed-out))
-                          timed-out)
-            ;; A delayed timer must not make an overdue result successful.
-                timeout? (or (= timed-out initial) (zero? (remaining-ms deadline-nanos)))
+                initial (try
+                          (if (pos? left)
+                            (sp/await (comb/timeout (program/owned-result-spin handle)
+                                                    left timed-out))
+                            timed-out)
+                          (catch Throwable error
+                            (run/take-cancel-time! run-id)
+                            (throw error)))
+                ;; when the Run was first asked to cancel, as its lifecycle
+                ;; recorded it: before the deadline, someone else cancelled it
+                ;; and it did not time out
+                cancel-requested-at (run/take-cancel-time! run-id)
+            ;; A delayed timer must not make an overdue result successful. A
+            ;; Run someone else had asked to cancel before the deadline was not
+            ;; timed out, though its cleanup ran past the deadline.
+                deadline? (or (= timed-out initial) (zero? (remaining-ms deadline-nanos)))
+                timeout? (and deadline?
+                              (not (some-> cancel-requested-at (< deadline-nanos))))
                 _ (when timeout? (program/cancel! room handle))
-                result (if timeout?
+                result (if deadline?
                          (sp/await
                           (comb/timeout (program/result-spin handle)
                                         cancel-timeout-ms timed-out))

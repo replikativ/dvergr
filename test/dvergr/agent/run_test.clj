@@ -357,3 +357,77 @@
       (is (= (:run/ended-at stored)
              (:run/ended-at (run/run room (:run/id r))))))
     (d/close-room! room)))
+
+(deftest the-first-cancellation-request-is-timed-by-the-lifecycle
+  ;; What tells a cancellation from a deadline: the time of the first request,
+  ;; recorded with the token under the lifecycle lock, kept for a watcher past
+  ;; the Run's retirement, and independent of when hooks run.
+  (let [[room _] (run-room :cancel-time)
+        start #(:run/id (run/start! room :agent (d/message :alice :agent "work") nil))
+        run-id (start)
+        early (start)
+        unwatched (start)
+        entered (promise) release (promise)]
+    (try
+      (run/watch-cancel-time! run-id)
+      (is (nil? (run/watched-cancel-time run-id)) "watched, not yet asked")
+      (testing "a request made before the watch is kept"
+        (run/cancel-run! early)
+        (let [t (run/cancel-requested-nanos early)]
+          (run/watch-cancel-time! early)
+          (is (= t (run/watched-cancel-time early)))))
+      ;; a hook that blocks delivery does not delay the record
+      (run/register-cancel-hook! run-id :slow #(do (deliver entered true) @release))
+      (let [before (System/nanoTime)
+            cancelling (future (run/cancel-run! run-id))]
+        (is (deref entered 5000 false))
+        (let [recorded (run/watched-cancel-time run-id)]
+          (is (some? recorded) "recorded before the blocked hook returns")
+          (is (<= before recorded))
+          (deliver release true)
+          @cancelling
+          (testing "a repeated request keeps the first time"
+            (run/cancel-run! run-id)
+            (is (= recorded (run/watched-cancel-time run-id))))
+          (testing "the record outlives the Run"
+            (run/finish! run-id :cancelled)
+            (is (empty? (filter #(= run-id (:run/id %)) (run/active-runs :cancel-time))))
+            (is (= recorded (run/watched-cancel-time run-id))))))
+      (testing "an unwatched Run leaves no record"
+        (run/cancel-run! unwatched)
+        (is (nil? (run/watched-cancel-time unwatched))))
+      (testing "taking it returns and drops it; a later request records nothing"
+        (let [t (run/watched-cancel-time early)]
+          (is (= t (run/take-cancel-time! early)))
+          (is (nil? (run/watched-cancel-time early)))
+          (run/cancel-run! early)
+          (is (not (contains? @@#'run/watched-cancel-times early)) "no entry recreated")))
+      (testing "a Run watched before it starts has its first request recorded"
+        (let [id (random-uuid)]
+          (run/watch-cancel-time! id)
+          (run/start! room :agent (d/message :alice :agent "work") nil {:id id})
+          (run/cancel-run! id)
+          (is (some? (run/take-cancel-time! id)))
+          (run/finish! id :cancelled)))
+      (finally
+        (deliver release true)
+        (doseq [id [run-id early unwatched]]
+          (run/take-cancel-time! id)
+          (run/finish! id :cancelled))
+        (d/close-room! room)))))
+
+(deftest taking-a-cancellation-time-races-no-request-into-a-leak
+  (let [[room _] (run-room :cancel-take-race)]
+    (try
+      (dotimes [_ 200]
+        (let [id (random-uuid)
+              _ (run/watch-cancel-time! id)
+              _ (run/start! room :agent (d/message :alice :agent "work") nil {:id id})
+              go (promise)
+              cancelling (future @go (run/cancel-run! id))
+              taking (future @go (run/take-cancel-time! id))]
+          (deliver go true)
+          @cancelling @taking
+          (is (not (contains? @@#'run/watched-cancel-times id)) "taken, and not recreated by the request")
+          (run/finish! id :cancelled)))
+      (finally (d/close-room! room)))))

@@ -376,3 +376,22 @@
     (testing "and is scored against its case's gold"
       (is (= 1.0 (:reward ((:verify ev) (second envs) {:run-status :completed :files {"/out/a.txt" "4"}}))))
       (is (= 0.0 (:reward ((:verify ev) (first envs) {:run-status :completed :files {"/out/a.txt" "4"}})))))))
+
+(deftest a-timed-out-attempt-is-scored-only-when-the-workflow-says-so
+  (let [answer {:execution/evidence {:files {"/out/competitors.md" "Wato\nPromptQL\nDust\nBuzz"}}}
+        verdict (fn [fs observed]
+                  (let [ev (room-wf/evaluator (room-wf/bundle "competitors" fs) {})]
+                    ((:verify ev) nil ((:observe ev) (merge {:default {}} answer observed)))))
+        timed-out {:result {:run/status :cancelled} :timed-out? true}
+        scoring (assoc files "workflow.edn"
+                       (pr-str (assoc (read-string (get files "workflow.edn")) :score-on-timeout true)))]
+    (testing "by default a timed-out attempt scores 0, whatever it wrote"
+      (is (= 0.0 (:reward (verdict files timed-out))))
+      (is (true? (get-in (verdict files timed-out) [:checks :found-all?]))))
+    (testing ":score-on-timeout scores the files it left, and it did not complete"
+      (is (= 1.0 (:reward (verdict scoring timed-out))))
+      (is (false? (get-in (verdict scoring timed-out) [:checks :completed?]))))
+    (testing "only a timeout: a Run cancelled for another reason still scores 0"
+      (is (= 0.0 (:reward (verdict scoring {:result {:run/status :cancelled}})))))
+    (testing "a completed attempt scores as before"
+      (is (= 1.0 (:reward (verdict scoring {:result {:run/status :completed}})))))))

@@ -921,11 +921,11 @@
         timeout-evaluator
         (evaluation/make-evaluator
          {:id :test/exact :version 1 :basis "test:v1"
-          :observe (fn [{:keys [default durable]}]
-                     (assoc default :durable-status (:run/status durable)))
+          :observe (fn [{:keys [default durable timed-out?]}]
+                     (assoc default :durable-status (:run/status durable) :timed-out? timed-out?))
           :verify (fn [_ evidence]
                     (let [cancelled? (= :cancelled (:durable-status evidence))]
-                      {:checks {:cancelled? cancelled?}
+                      {:checks {:cancelled? cancelled? :observed-timeout? (true? (:timed-out? evidence))}
                        :reward (if cancelled? 1.0 0.0)}))})]
     (try
       (binding [ec/*execution-context* (:ctx room)]
@@ -933,9 +933,72 @@
               receipt (:attempt-receipt result)]
           (is (= :cancelled (:attempt/status receipt)))
           (is (true? (get-in receipt [:attempt/metrics :timed-out?])))
-          (is (= {:cancelled? true} (:attempt/checks receipt)))
+          (is (= {:cancelled? true :observed-timeout? true} (:attempt/checks receipt))
+              "the observer is told the Run timed out")
           (is (= :discarded (get-in result [:run/result :run/settlement-status])))
           (is (empty? (run/active-runs (:id room))))))
+      (finally
+        (d/close-room! room)))))
+
+(deftest a-run-cancelled-before-its-deadline-is-not-timed-out
+  ;; Cancelled by someone else before the deadline, with cleanup (capture)
+  ;; running past it: an ordinary cancellation, not a timeout verdict.
+  (let [room (test-room :external-cancel)
+        team (roster/make-agent
+              (roster/make-roster)
+              {:id :slow
+               :program {:kind :scripted :delay-ms 10000 :reply :late}})
+        env (definition :test/external-cancel
+              {:task :late
+               :limits {:timeout-ms 8000 :cancel-timeout-ms 15000 :on-timeout :verdict}})
+        observed (atom ::unobserved)
+        evaluator
+        (evaluation/make-evaluator
+         {:id :test/exact :version 1 :basis "test:v1"
+          :capture (fn [_] (Thread/sleep 9000) {})
+          :observe (fn [{:keys [default timed-out?]}]
+                     (reset! observed timed-out?)
+                     default)
+          :verify (fn [_ _] {:checks {:ok? true} :reward 1.0})})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (let [spin (evaluation/evaluate room team :slow env evaluator)
+              ;; awaited at the host boundary, on its own thread
+              pending (future (try @spin (catch clojure.lang.ExceptionInfo e e)))
+              _ (wait-until #(seq (run/runs room)) 5000)
+              ;; past world setup: the candidate itself is running
+              _ (Thread/sleep 1000)
+              {:keys [run/id]} (first (run/runs room))
+              _ (is (some? id) "the Run started")
+              _ (run/cancel-run! id)
+              result (deref pending 40000 ::hung)
+              receipt (when (map? result) (:attempt-receipt result))]
+          (is (false? @observed) (str "the observer is not told it timed out: "
+                                      (if (instance? Throwable result)
+                                        (str (ex-message result) " " (pr-str (ex-data result)))
+                                        (pr-str (some-> result :attempt-receipt :attempt/status)))))
+          (is (some? receipt) "the cancelled Run is certified")
+          (is (false? (get-in receipt [:attempt/metrics :timed-out?])))
+          (is (nil? (get-in receipt [:attempt/metrics :failure]))
+              "not a model-timeout verdict")))
+      (finally
+        (d/close-room! room)))))
+
+(deftest a-failed-admission-leaves-no-cancellation-watch
+  (let [room (test-room :admission-registration)
+        team (roster/make-agent (roster/make-roster) {:id :candidate :program {:kind :echo}})
+        env (definition :test/admission-registration {:limits {:timeout-ms 5000 :cancel-timeout-ms 2000}})
+        evaluator (evaluation/make-evaluator
+                   {:id :test/exact :version 1 :basis "test:v1"
+                    :observe (fn [_] {}) :verify (fn [_ _] {:checks {:ok? true} :reward 1.0})})
+        watched #(set (keys @@#'run/watched-cancel-times))
+        before (watched)]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (with-redefs-fn {#'evaluation/tracked-admission
+                         (fn [& _] (throw (ex-info "executor rejected" {:type ::rejected})))}
+          #(is (thrown? Exception @(evaluation/evaluate room team :candidate env evaluator))))
+        (is (= before (watched)) "the watch is taken when admission cannot be registered"))
       (finally
         (d/close-room! room)))))
 

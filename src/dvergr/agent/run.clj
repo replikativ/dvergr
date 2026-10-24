@@ -769,6 +769,41 @@
   [run-id]
   (boolean (some-> (get @active run-id) :cancelled? deref)))
 
+(defn cancel-requested-nanos
+  "When cancellation of this live Run was first requested (`System/nanoTime`),
+   or nil. Process-local, like the cancellation token."
+  [run-id]
+  (:cancel-requested-nanos (get @active run-id)))
+
+(defonce ^:private watched-cancel-times
+  ;; run-id -> nanoTime of the first cancellation request (nil: none yet), for
+  ;; Runs a host watches: kept after the Run retires, until unwatched
+  (atom {}))
+
+(defn watch-cancel-time!
+  "Keep when `run-id` is first asked to cancel, past its retirement, until
+   taken. Watch before the Run starts (its id chosen by the caller) so no
+   request can be missed; a request already made is kept too."
+  [run-id]
+  (locking lifecycle-lock
+    (swap! watched-cancel-times assoc run-id (cancel-requested-nanos run-id)))
+  nil)
+
+(defn watched-cancel-time
+  "The watched Run's first cancellation request (`System/nanoTime`), or nil."
+  [run-id]
+  (get @watched-cancel-times run-id))
+
+(defn take-cancel-time!
+  "Stop watching `run-id` and return its first cancellation request, or nil:
+   read and removed under the lifecycle lock, so a request in progress is
+   either seen or not recorded at all."
+  [run-id]
+  (locking lifecycle-lock
+    (let [t (get @watched-cancel-times run-id)]
+      (swap! watched-cancel-times dissoc run-id)
+      t)))
+
 (defn- request-cancel!
   [run-id expected-room]
   (let [entry
@@ -785,7 +820,14 @@
                                  (get-in entry [:run :run/status])))
                 entry
                 (let [_ (reset! (:cancelled? entry) true)
-                      entry' (assoc-in entry [:run :run/status] :cancelling)]
+                      ;; when it was first asked, with the token, under the
+                      ;; lock: what tells a cancellation from a deadline
+                      now (System/nanoTime)
+                      _ (when (contains? @watched-cancel-times run-id)
+                          (swap! watched-cancel-times assoc run-id now))
+                      entry' (-> entry
+                                 (assoc-in [:run :run/status] :cancelling)
+                                 (assoc :cancel-requested-nanos now))]
                   (swap! active assoc run-id entry')
                   (notify! {:type :run/cancel-requested :run (public-entry entry')})
                   entry')))))]
