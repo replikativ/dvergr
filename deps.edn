@@ -28,9 +28,9 @@
 
         ;; SCI — Small Clojure Interpreter for sandboxing. The replikativ build
         ;; carries forkable interpreter worlds while sci#1084 is upstreamed;
-        ;; replikativ.4 includes upstream's merge-opts permission fix
-        ;; (sci#1119) and keeps the standard runtime fast.
-        org.replikativ/sci         {:mvn/version "0.15.59-replikativ.4"}
+        ;; replikativ.5 preserves the :static-methods value-path fix
+        ;; (sci#1118) alongside the merge-opts permission fix (sci#1119).
+        org.replikativ/sci         {:mvn/version "0.15.59-replikativ.5"}
 
         ;; Dvergr uses the async sequence/CPS namespaces directly; keep this a
         ;; direct dependency instead of relying on Spindel's implementation deps.

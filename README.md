@@ -335,7 +335,7 @@ The standalone, runnable scenarios these import live in [`examples/`](examples/)
 > does not currently include forkable worlds. Maven and git consumers resolve
 > the same replikativ implementation:
 > ```clojure
-> org.replikativ/sci {:mvn/version "0.15.59-replikativ.4"}
+> org.replikativ/sci {:mvn/version "0.15.59-replikativ.5"}
 > ```
 
 ## License
