@@ -190,6 +190,24 @@ This does not certify rollback or arbitrary trusted-host handler I/O. Legacy
 `write!` and `write-to!` retain their prior contracts; no new executor or grant
 is introduced.
 
+Finalized host-owned binary files use
+`dvergr.rooms.file-source/with-finalized-file!` and
+`dvergr.rooms.files/write-file-to-completion!`. The first owns an opaque,
+single-use source on the calling worker; the second writes to the exact
+registered system through the same file effect, byte quota, transactional
+expected-content guard and sealed completion gate. Stream size and logical
+identity are verified again before metadata publication. File handles and host
+paths never enter effects, transaction data or receipts. The host guarantees
+exclusive immutable ownership of the finalized source during the call.
+
+This entry requires `:expected-worktree` and refuses validated-basis/subtree
+combinations. After native dispatch it performs no compensation: failed or
+unacknowledged publication stays pending for inspection, preserving concurrent
+index and mode edits. A pending result does not permit automatic retry.
+Successful native receipts contain the exact committed file entry. The public
+SCI/MCP file and batch byte limits are unchanged; this is not a new agent tool,
+file-path capability, executor or permission grant.
+
 Durable publication also accepts an optional trusted HOST `:validate-basis!`
 function. `dvergr.rooms.publication/prepare` captures one immutable DB, prepares
 the Geschichte commit from that exact value and passes the same value to this

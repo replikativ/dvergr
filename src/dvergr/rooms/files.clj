@@ -21,6 +21,7 @@
             [dvergr.rooms.forks :as forks]
             [dvergr.rooms.publication :as publication]
             [dvergr.rooms.file-tx :as file-tx]
+            [dvergr.rooms.file-source :as file-source]
             [dvergr.rooms.subtree :as subtree]
             [dvergr.sandbox.ns.io :as sio]
             [dvergr.substrate.geschichte :as gs]
@@ -535,267 +536,279 @@
 (defn- write-workspace!
   "Shared native batch writer. Every physical operation retains this exact
    descriptor; neither file effects nor commit re-resolve ambient selection."
-  [room workspace files {:keys [message boundary file-modes publication expected-subtree validated-basis] :as opts} completion]
-  (let [entries (plan files)
-        planned entries
-        _ (when (contains? opts :validated-basis)
-            (file-tx/validate-basis! validated-basis)
-            (when-not (and (= 1 (count entries))
-                           (bytes? (second (first entries)))
-                           (not (contains? opts :publication))
-                           (not (contains? opts :expected-subtree))
-                           (let [opened (opened-worktree! [(ffirst entries)] opts)
-                                 entry (get opened (ffirst entries))]
-                             (and entry (#{33188 33261} (:mode entry)))))
-              (refuse "validated-basis requires one existing regular-file replacement with expected-worktree, without publication/subtree" {})))
-        basis-write-state (when validated-basis (volatile! :not-dispatched))
-        _ (when (contains? opts :expected-subtree) (subtree/validate! expected-subtree))
+  ([room workspace files opts completion]
+   (write-workspace! room workspace files opts completion nil))
+  ([room workspace files {:keys [message boundary file-modes publication expected-subtree validated-basis] :as opts} completion source-plan]
+   (let [source-identity (when source-plan (file-source/identity-of (:source source-plan)))
+         _ (when (and source-plan
+                      (or (not (contains? opts :expected-worktree))
+                          (contains? opts :validated-basis) (contains? opts :expected-subtree)))
+             (refuse "Finalized files require expected-worktree without validated-basis or subtree" {}))
+         entries (if source-plan [[(workspace-path (:path source-plan)) ::stream]] (plan files))
+         planned entries
+         _ (when (contains? opts :validated-basis)
+             (file-tx/validate-basis! validated-basis)
+             (when-not (and (= 1 (count entries))
+                            (bytes? (second (first entries)))
+                            (not (contains? opts :publication))
+                            (not (contains? opts :expected-subtree))
+                            (let [opened (opened-worktree! [(ffirst entries)] opts)
+                                  entry (get opened (ffirst entries))]
+                              (and entry (#{33188 33261} (:mode entry)))))
+               (refuse "validated-basis requires one existing regular-file replacement with expected-worktree, without publication/subtree" {})))
+         basis-write-state (when validated-basis (volatile! :not-dispatched))
+         _ (when (contains? opts :expected-subtree) (subtree/validate! expected-subtree))
         ;; This option is fixed data, never a caller predicate. Validate native
         ;; accessible paths and derive AFTER without a raced repository reread.
-        _ (when expected-subtree
-            (when-not (= (subs (:prefix expected-subtree) 0 (dec (count (:prefix expected-subtree))))
-                         (workspace-path (:prefix expected-subtree)))
-              (refuse "Invalid subtree prefix" {}))
-            (doseq [[path _] (:entries expected-subtree)]
-              (when-not (= (str (:prefix expected-subtree) path)
-                           (workspace-path (str (:prefix expected-subtree) path)))
-                (refuse "Invalid subtree entry" {})))
-            (when-not (every? #(str/starts-with? (first %) (:prefix expected-subtree)) entries)
-              (refuse "The write batch escapes its expected subtree" {})))
+         _ (when expected-subtree
+             (when-not (= (subs (:prefix expected-subtree) 0 (dec (count (:prefix expected-subtree))))
+                          (workspace-path (:prefix expected-subtree)))
+               (refuse "Invalid subtree prefix" {}))
+             (doseq [[path _] (:entries expected-subtree)]
+               (when-not (= (str (:prefix expected-subtree) path)
+                            (workspace-path (str (:prefix expected-subtree) path)))
+                 (refuse "Invalid subtree entry" {})))
+             (when-not (every? #(str/starts-with? (first %) (:prefix expected-subtree)) entries)
+               (refuse "The write batch escapes its expected subtree" {})))
         ;; Preserve the original mode under this new contract; legacy options
         ;; and behavior remain unchanged when no subtree was supplied.
-        file-modes (if expected-subtree
-                     (reduce (fn [m [path value]]
-                               (if (= ::remove value) m
-                                   (if (contains? m path) m
-                                       (assoc m path (or (get-in expected-subtree
-                                                                 [:entries (subs path (count (:prefix expected-subtree))) :mode])
-                                                         33188)))))
-                             (or file-modes {}) entries)
-                     file-modes)
-        required-subtree
-        (when expected-subtree
-          (subtree/validate!
-           (update expected-subtree :entries
-                   (fn [original]
-                     (reduce (fn [tree [path value]]
-                               (let [relative (subs path (count (:prefix expected-subtree)))]
-                                 (if (= ::remove value) (dissoc tree relative)
-                                     (assoc tree relative {:content (blob/blob-id value) :size (long (alength ^bytes value))
-                                                           :mode (get file-modes path)})))) original entries)))))
-        subtree-basis (when expected-subtree (volatile! nil))
-        stage-witness (when expected-subtree (volatile! false))
-        {:keys [conn] :as ws} (gs/assert-workspace-current! workspace)
-        system-id (binding [ec/*execution-context* (:ctx room)]
-                    (srooms/connection-system-id conn))
-        _ (binding [ec/*execution-context* (:ctx room)]
-            (when-let [reason (srooms/room-effect-write-refusal
-                               room {:effect :room/write :resource {:system-id system-id}})]
-              (effects/deny! {:effect :room/write :resource {:system-id system-id}}
-                             :trunk-write-policy reason)))
-        fs (gs/filesystem ws)
-        boundary (or boundary (host-boundary room (effects/make-sink)))
-        outer-boundary (guarded-boundary boundary completion false)
-        inner-boundary (guarded-boundary boundary completion true)
+         file-modes (if expected-subtree
+                      (reduce (fn [m [path value]]
+                                (if (= ::remove value) m
+                                    (if (contains? m path) m
+                                        (assoc m path (or (get-in expected-subtree
+                                                                  [:entries (subs path (count (:prefix expected-subtree))) :mode])
+                                                          33188)))))
+                              (or file-modes {}) entries)
+                      file-modes)
+         required-subtree
+         (when expected-subtree
+           (subtree/validate!
+            (update expected-subtree :entries
+                    (fn [original]
+                      (reduce (fn [tree [path value]]
+                                (let [relative (subs path (count (:prefix expected-subtree)))]
+                                  (if (= ::remove value) (dissoc tree relative)
+                                      (assoc tree relative {:content (blob/blob-id value) :size (long (alength ^bytes value))
+                                                            :mode (get file-modes path)})))) original entries)))))
+         subtree-basis (when expected-subtree (volatile! nil))
+         stage-witness (when expected-subtree (volatile! false))
+         {:keys [conn] :as ws} (gs/assert-workspace-current! workspace)
+         system-id (binding [ec/*execution-context* (:ctx room)]
+                     (srooms/connection-system-id conn))
+         _ (binding [ec/*execution-context* (:ctx room)]
+             (when-let [reason (srooms/room-effect-write-refusal
+                                room {:effect :room/write :resource {:system-id system-id}})]
+               (effects/deny! {:effect :room/write :resource {:system-id system-id}}
+                              :trunk-write-policy reason)))
+         fs (gs/filesystem ws)
+         boundary (or boundary (host-boundary room (effects/make-sink)))
+         outer-boundary (guarded-boundary boundary completion false)
+         inner-boundary (guarded-boundary boundary completion true)
         ;; `:workspace`: the gate's compare-and-write needs the repository
-        ctx (cond-> {:filesystem fs :workspace ws :system-id system-id :cwd "/" :effect-boundary inner-boundary}
-              validated-basis (assoc :validated-basis validated-basis :basis-write-state basis-write-state))
-        commit-publication (if (and completion (fn? (:before-dispatch! publication)))
-                             (update publication :before-dispatch!
-                                     (fn [hook]
-                                       (fn [candidate]
+         ctx (cond-> {:filesystem fs :workspace ws :system-id system-id :cwd "/" :effect-boundary inner-boundary}
+               validated-basis (assoc :validated-basis validated-basis :basis-write-state basis-write-state))
+         commit-publication (if (and completion (fn? (:before-dispatch! publication)))
+                              (update publication :before-dispatch!
+                                      (fn [hook]
+                                        (fn [candidate]
                                          ;; The journal may commit applying and
                                          ;; then throw before publication starts.
-                                         (guarded-native! completion true #(hook candidate)))))
-                             publication)
-        paths (mapv first entries)
-        opened (opened-worktree! paths opts)
-        _ (when (and (contains? opts :file-modes)
-                     (not (and (map? file-modes)
-                               (every? (fn [[p mode]] (and (some #{p} paths) (#{33188 33261} mode))) file-modes))))
-            (refuse "file-modes names batch paths and regular file modes only" {}))
-        message (or (not-empty (some-> message str str/trim))
-                    (str "Write " (if (= 1 (count paths)) (rel (first paths)) (str (count paths) " files"))))
-        expected (into {} (for [[p c] entries] [p (when (bytes? c) (str (blob/blob-id c)))]))]
-    (when (and publication
-               (not (and (map? publication) (map? (:identity publication))
-                         (fn? (:authorize! publication)) (fn? (:before-dispatch! publication))
-                         (or (not (contains? publication :validate-basis!))
-                             (fn? (:validate-basis! publication))))))
-      (refuse "Durable publication requires host identity, authorization and journaling hooks" {}))
+                                          (guarded-native! completion true #(hook candidate)))))
+                              publication)
+         paths (mapv first entries)
+         opened (opened-worktree! paths opts)
+         _ (when (and (contains? opts :file-modes)
+                      (not (and (map? file-modes)
+                                (every? (fn [[p mode]] (and (some #{p} paths) (#{33188 33261} mode))) file-modes))))
+             (refuse "file-modes names batch paths and regular file modes only" {}))
+         message (or (not-empty (some-> message str str/trim))
+                     (str "Write " (if (= 1 (count paths)) (rel (first paths)) (str (count paths) " files"))))
+         expected (into {} (for [[p c] entries]
+                             [p (if source-plan (str (:content source-identity))
+                                    (when (bytes? c) (str (blob/blob-id c))))]))]
+     (when (and publication
+                (not (and (map? publication) (map? (:identity publication))
+                          (fn? (:authorize! publication)) (fn? (:before-dispatch! publication))
+                          (or (not (contains? publication :validate-basis!))
+                              (fn? (:validate-basis! publication))))))
+       (refuse "Durable publication requires host identity, authorization and journaling hooks" {}))
     ;; This monitor serializes participating Dvergr operations, not arbitrary
     ;; filesystem or external repository writers. Writer-side basis checks are
     ;; the atomic publication guard against those other writers.
-    (locking (gs/workspace-lock conn)
-      (gs/assert-workspace-current! ws)
-      (when publication
-        (publication/authorize! publication)
-        (if (or completion expected-subtree)
-          (publication/validate-identity! (:identity publication))
-          (publication/install! conn)))
-      (if-let [recovered (when (and publication
-                                    (or (and (nil? completion) (nil? expected-subtree))
-                                        (receipt-schema-present? @conn)))
-                           (publication/recover @conn (:identity publication)))]
-        (observe-positive! completion (publication-result recovered message))
-        (do
+     (locking (gs/workspace-lock conn)
+       (gs/assert-workspace-current! ws)
+       (when publication
+         (publication/authorize! publication)
+         (if (or completion expected-subtree)
+           (publication/validate-identity! (:identity publication))
+           (publication/install! conn)))
+       (if-let [recovered (when (and publication
+                                     (or (and (nil? completion) (nil? expected-subtree))
+                                         (receipt-schema-present? @conn)))
+                            (publication/recover @conn (:identity publication)))]
+         (observe-positive! completion (publication-result recovered message))
+         (do
           ;; Exact scoped dedup above precedes NEW source validation. A past
           ;; receipt is not a fresh inspection of a later changed workflow.
-          (when expected-subtree
+           (when expected-subtree
             ;; A clean HEAD/index proof and original rows from ONE immutable
             ;; snapshot, never a fresh index captured after a loose check.
-            (let [initial-db @conn
-                  _ (subtree/assert-before! initial-db expected-subtree)
-                  initial (repo/prepare-commit (atom initial-db) {:message message})
-                  index-prefix (subtree/prefix-tree! initial-db (:prefix expected-subtree) true)]
-              (when-not (:noop? initial)
-                (throw (ex-info "Conditional subtree requires a clean initial index" {:type ::staged-changes})))
-              (vreset! subtree-basis {:before expected-subtree :plan initial
-                                      :index-prefix index-prefix :stage-rows (subtree/stage-rows initial-db paths)})))
-          (check-shape! fs entries)
+             (let [initial-db @conn
+                   _ (subtree/assert-before! initial-db expected-subtree)
+                   initial (repo/prepare-commit (atom initial-db) {:message message})
+                   index-prefix (subtree/prefix-tree! initial-db (:prefix expected-subtree) true)]
+               (when-not (:noop? initial)
+                 (throw (ex-info "Conditional subtree requires a clean initial index" {:type ::staged-changes})))
+               (vreset! subtree-basis {:before expected-subtree :plan initial
+                                       :index-prefix index-prefix :stage-rows (subtree/stage-rows initial-db paths)})))
+           (check-shape! fs entries)
       ;; the undo restores the index to HEAD: so it must be at HEAD
-          (let [staged (when-not expected-subtree (:staged (repo/status conn)))]
-            (when (seq staged)
-              (throw (ex-info (str "The workspace has staged changes (" (str/join ", " (take 5 staged))
-                                   "); commit them before a room_write")
-                              {:type ::staged-changes :staged (vec staged)}))))
-          (let [worktree (if expected-subtree (:worktree (:plan @subtree-basis)) (repo/worktree conn))
-                before (into {} (keep (fn [p] (when-let [e (get worktree (rel p))] [p e]))) paths)
-                _ (when (and opened
-                             (not= opened (into {} (map (fn [p] [p (get before p)])) paths)))
-                    (throw (ex-info "Files changed since they were opened; reload before saving"
-                                    {:type ::stale-worktree :paths paths})))
-                created (into #{} (comp (mapcat (fn [[p c]] (when (not= ::remove c) (file-tx/ancestors-of p))))
-                                        (remove #(mfs/exists? fs %)))
-                              entries)
-                touched (atom [])
-                removed (atom [])
-                applied (volatile! nil)
-                execution-error (volatile! nil)
+           (let [staged (when-not expected-subtree (:staged (repo/status conn)))]
+             (when (seq staged)
+               (throw (ex-info (str "The workspace has staged changes (" (str/join ", " (take 5 staged))
+                                    "); commit them before a room_write")
+                               {:type ::staged-changes :staged (vec staged)}))))
+           (let [worktree (if expected-subtree (:worktree (:plan @subtree-basis)) (repo/worktree conn))
+                 before (into {} (keep (fn [p] (when-let [e (get worktree (rel p))] [p e]))) paths)
+                 _ (when (and opened
+                              (not= opened (into {} (map (fn [p] [p (get before p)])) paths)))
+                     (throw (ex-info "Files changed since they were opened; reload before saving"
+                                     {:type ::stale-worktree :paths paths})))
+                 created (into #{} (comp (mapcat (fn [[p c]] (when (not= ::remove c) (file-tx/ancestors-of p))))
+                                         (remove #(mfs/exists? fs %)))
+                               entries)
+                 touched (atom [])
+                 removed (atom [])
+                 applied (volatile! nil)
+                 execution-error (volatile! nil)
                 ;; A handler may forward more than once. This one invocation
                 ;; owns exactly one physical batch, including its exception.
-                execute (delay
+                 execute (delay
                           ;; An outer effect handler can change registration
                           ;; before forwarding. Refuse before the first write,
                           ;; without even issuing a compensating index mutation.
-                          (try (gs/assert-workspace-current! ws)
-                               (when expected-subtree (subtree/assert-before! @conn expected-subtree))
-                               (catch Throwable error
-                                 (vreset! execution-error error)
-                                 (throw error)))
+                           (try (gs/assert-workspace-current! ws)
+                                (when expected-subtree (subtree/assert-before! @conn expected-subtree))
+                                (catch Throwable error
+                                  (vreset! execution-error error)
+                                  (throw error)))
                           ;; The new completion API keeps schema installation
                           ;; after pure preflight and actual outer forwarding.
                           ;; Legacy callers retain their original ordering.
-                          (when (and (or completion expected-subtree) publication)
-                            (try (guarded-native! completion true #(publication/install! conn))
-                                 (catch Throwable error
-                                   (vreset! execution-error error)
-                                   (throw error))))
-                          (try
-                            (doseq [[p c] entries
+                           (when (and (or completion expected-subtree) publication)
+                             (try (guarded-native! completion true #(publication/install! conn))
+                                  (catch Throwable error
+                                    (vreset! execution-error error)
+                                    (throw error))))
+                           (try
+                             (doseq [[p c] entries
                                 ;; compare-and-write: what the snapshot saw, or fail
-                                    :let [opts (cond-> {:expect (some-> (get before p) :content str)}
-                                                 (contains? file-modes p) (assoc :mode (get file-modes p)))]]
-                              (if (= ::remove c)
-                                (when (tools/workspace-delete! ctx p opts)
-                                  (swap! touched conj p)
-                                  (swap! removed conj p))
-                                (do (tools/workspace-write! ctx p c opts)
-                                    (when (and basis-write-state (not= :written @basis-write-state))
-                                      (throw (ex-info "Validated file write was not forwarded"
-                                                      {:type ::not-applied})))
-                                    (swap! touched conj p))))
-                            (let [{:keys [commit tree publication]}
-                                  (guarded-native! completion true
-                                                   #(forks/commit-paths-in-workspace!
-                                                     room ws expected message
-                                                     (cond-> {:receipt? true :expected-modes file-modes
-                                                              :publication commit-publication}
-                                                       required-subtree
-                                                       (assoc :required-subtree required-subtree :removed-paths @removed
-                                                              :subtree-basis @subtree-basis :stage-witness stage-witness))))
-                                  entries (into {} (map (fn [p] [p (get tree (rel p))])) paths)]
+                                     :let [opts (cond-> {:expect (some-> (get before p) :content str)}
+                                                  (contains? file-modes p) (assoc :mode (get file-modes p)))]]
+                               (if (= ::remove c)
+                                 (when (tools/workspace-delete! ctx p opts)
+                                   (swap! touched conj p)
+                                   (swap! removed conj p))
+                                 (do (if source-plan
+                                       (tools/workspace-write-file! ctx p (:source source-plan) opts)
+                                       (tools/workspace-write! ctx p c opts))
+                                     (when (and basis-write-state (not= :written @basis-write-state))
+                                       (throw (ex-info "Validated file write was not forwarded"
+                                                       {:type ::not-applied})))
+                                     (swap! touched conj p))))
+                             (let [{:keys [commit tree publication]}
+                                   (guarded-native! completion true
+                                                    #(forks/commit-paths-in-workspace!
+                                                      room ws expected message
+                                                      (cond-> {:receipt? true :expected-modes file-modes
+                                                               :publication commit-publication}
+                                                        required-subtree
+                                                        (assoc :required-subtree required-subtree :removed-paths @removed
+                                                               :subtree-basis @subtree-basis :stage-witness stage-witness))))
+                                   entries (into {} (map (fn [p] [p (get tree (rel p))])) paths)]
                           ;; Only the forwarded physical write path can produce
                           ;; this receipt. A handler may answer without forwarding.
-                              (vreset! applied (cond-> {:commit commit :entries entries :publication publication}
-                                                 required-subtree (assoc :subtree required-subtree)))
+                               (vreset! applied (cond-> {:commit commit :entries entries :publication publication}
+                                                  required-subtree (assoc :subtree required-subtree)))
                                ;; Durable publication already includes directory
                                ;; cleanup in its one joined transaction. Never
                                ;; enqueue another mutation after restoring an
                                ;; interrupted publication caller's interrupt flag.
-                              (when (and (nil? publication) (nil? required-subtree) (seq @removed))
-                                (guarded-native! completion true
-                                                 #(d/transact conn [[:db.fn/call file-tx/remove-empty-dirs-tx
-                                                                     (vec (distinct (mapcat file-tx/ancestors-of @removed)))]])))
+                               (when (and (nil? publication) (nil? required-subtree) (seq @removed))
+                                 (guarded-native! completion true
+                                                  #(d/transact conn [[:db.fn/call file-tx/remove-empty-dirs-tx
+                                                                      (vec (distinct (mapcat file-tx/ancestors-of @removed)))]])))
                               ;; Ordinary cleanup must finish before a positive
                               ;; completion can escape. Durable publication has
                               ;; its directory cleanup in the joined transaction.
-                              (observe-positive! completion (applied-result planned @applied message @removed))
-                              commit)
-                            (catch Throwable failure
+                               (observe-positive! completion (applied-result planned @applied message @removed))
+                               commit)
+                             (catch Throwable failure
                               ;; This contract never compensates: before native
                               ;; dispatch there is no owned mutation; afterward
                               ;; neither another writer's index nor a lost ACK
                               ;; can be safely undone by the legacy restore.
-                              (let [e (if (and basis-write-state
-                                               (#{:dispatched :written} @basis-write-state))
-                                        (ex-info "Validated file transaction dispatched; inspect before retry"
-                                                 {::publication/uncertain? true} failure)
-                                        failure)]
-                                (vreset! execution-error e)
+                               (let [e (if (or source-plan
+                                               (and basis-write-state
+                                                    (#{:dispatched :written} @basis-write-state)))
+                                         (ex-info "File transaction dispatched; inspect before retry"
+                                                  {::publication/uncertain? true} failure)
+                                         failure)]
+                                 (vreset! execution-error e)
                            ;; Native publication may have committed despite a lost
                            ;; acknowledgement. Never undo it or infer failure
                            ;; from an absent receipt; retain the host journal.
-                                (if (or @applied (publication/uncertain? e)
-                                        basis-write-state)
-                                  (throw e)
-                                  (try
-                                    (let [_ (when (and expected-subtree
-                                                       (or (.isInterrupted (Thread/currentThread)) (interrupted-failure? e)))
-                                              (.interrupt (Thread/currentThread))
-                                              (throw (ex-info "Conditional write interrupted; no cleanup was submitted"
-                                                              {::publication/uncertain? true} e)))
-                                          conflicted (guarded-native! completion true
-                                                                      #(if expected-subtree
-                                                                         (do (try (gs/assert-workspace-current! ws)
-                                                                                  (catch Throwable changed
-                                                                                    (throw (ex-info "Conditional cleanup target changed; no cleanup submitted"
-                                                                                                    {::publication/uncertain? true} changed))))
-                                                                             (publication/undo-subtree! conn @subtree-basis required-subtree
-                                                                                                        (vec @touched) @stage-witness paths (vec created)))
-                                                                         (restore! conn before expected @touched created)))]
-                                      (throw (if (seq conflicted)
-                                               (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
-                                                             (str/join ", " conflicted))
-                                                        (assoc (ex-data e) :conflicted conflicted) e)
-                                               e)))
-                                    (catch Throwable final-error
+                                 (if (or @applied (publication/uncertain? e)
+                                         basis-write-state)
+                                   (throw e)
+                                   (try
+                                     (let [_ (when (and expected-subtree
+                                                        (or (.isInterrupted (Thread/currentThread)) (interrupted-failure? e)))
+                                               (.interrupt (Thread/currentThread))
+                                               (throw (ex-info "Conditional write interrupted; no cleanup was submitted"
+                                                               {::publication/uncertain? true} e)))
+                                           conflicted (guarded-native! completion true
+                                                                       #(if expected-subtree
+                                                                          (do (try (gs/assert-workspace-current! ws)
+                                                                                   (catch Throwable changed
+                                                                                     (throw (ex-info "Conditional cleanup target changed; no cleanup submitted"
+                                                                                                     {::publication/uncertain? true} changed))))
+                                                                              (publication/undo-subtree! conn @subtree-basis required-subtree
+                                                                                                         (vec @touched) @stage-witness paths (vec created)))
+                                                                          (restore! conn before expected @touched created)))]
+                                       (throw (if (seq conflicted)
+                                                (ex-info (str (ex-message e) "; not undone, changed meanwhile: "
+                                                              (str/join ", " conflicted))
+                                                         (assoc (ex-data e) :conflicted conflicted) e)
+                                                e)))
+                                     (catch Throwable final-error
                                    ;; Cleanup itself can have dispatched before
                                    ;; losing its ACK. An outer handler must not
                                    ;; hide that uncertainty by swallowing it.
-                                      (when expected-subtree (vreset! execution-error final-error))
-                                      (throw final-error))))))))
-                _answer (try
-                          (effects/perform!
-                           outer-boundary {:effect :git/commit :resource {:message message :system-id system-id}}
-                           #(force execute))
-                          (catch Throwable error
-                            (cond
-                              (publication/uncertain? @execution-error) (throw @execution-error)
-                              (and basis-write-state (#{:dispatched :written} @basis-write-state))
-                              (throw (ex-info "Validated file dispatch completed before handler failure; inspect before retry"
-                                              (cond-> {::publication/uncertain? true}
-                                                @applied (assoc :applied @applied)) error))
-                              (and publication @applied)
-                              (throw (ex-info "Publication committed before completion failed"
-                                              {::publication/uncertain? true
-                                               :publication (:publication @applied)} error))
-                              :else (throw error))))
+                                       (when expected-subtree (vreset! execution-error final-error))
+                                       (throw final-error))))))))
+                 _answer (try
+                           (effects/perform!
+                            outer-boundary {:effect :git/commit :resource {:message message :system-id system-id}}
+                            #(force execute))
+                           (catch Throwable error
+                             (cond
+                               (publication/uncertain? @execution-error) (throw @execution-error)
+                               (and basis-write-state (#{:dispatched :written} @basis-write-state))
+                               (throw (ex-info "Validated file dispatch completed before handler failure; inspect before retry"
+                                               (cond-> {::publication/uncertain? true}
+                                                 @applied (assoc :applied @applied)) error))
+                               (and publication @applied)
+                               (throw (ex-info "Publication committed before completion failed"
+                                               {::publication/uncertain? true
+                                                :publication (:publication @applied)} error))
+                               :else (throw error))))
                 ;; An answering handler cannot turn an uncertain forwarded
                 ;; write into an ordinary skipped operation by swallowing it.
-                _ (when (publication/uncertain? @execution-error) (throw @execution-error))
-                receipt @applied]
-            (applied-result entries receipt message @removed)))))))
+                 _ (when (publication/uncertain? @execution-error) (throw @execution-error))
+                 receipt @applied]
+             (applied-result entries receipt message @removed))))))))
 
 (defn write!
   "Write `files` (`{path content}`; content `{:text …}`, `{:base64 …}`, or nil
@@ -877,6 +890,25 @@
       (contains? seen cause) false
       :else (recur (.getCause ^Throwable cause) (conj seen cause)))))
 
+(defn- complete-write!
+  [room system files opts source-plan]
+  (let [gate (completion-gate)
+        result (volatile! nil)
+        error (volatile! nil)
+        closed (volatile! nil)]
+    (try
+      (when (simple/on-drain-thread?)
+        (throw (ex-info "Native file completion requires a host worker"
+                        {:type ::blocking-completion})))
+      (binding [ec/*execution-context* (:ctx room)]
+        (vreset! result (write-workspace! room (gs/workspace-for-system! system) files opts gate source-plan)))
+      (catch Throwable failure (vreset! error failure))
+      (finally (vreset! closed (seal-completion! gate))))
+    (when (interrupted-failure? @error) (.interrupt (Thread/currentThread)))
+    (let [{:keys [active entered? positive]} @closed]
+      {:completion (cond (pos? active) :pending positive :returned (not entered?) :not-started :else :pending)
+       :result (or positive @result) :error @error})))
+
 (defn write-to-completion!
   "HOST API: a closed native completion for this exact registered target.
    Returns {:completion :not-started|:returned|:pending :result … :error …}.
@@ -894,27 +926,15 @@
    Interruption remains set on this worker
    after closure. No new permission or executor is supplied."
   [room system files opts]
-  (let [gate (completion-gate)
-        result (volatile! nil)
-        error (volatile! nil)
-        closed (volatile! nil)]
-    (try
-      (when (simple/on-drain-thread?)
-        (throw (ex-info "Native file completion requires a host worker"
-                        {:type ::blocking-completion})))
-      (binding [ec/*execution-context* (:ctx room)]
-        (vreset! result (write-workspace! room (gs/workspace-for-system! system) files opts gate)))
-      (catch Throwable failure (vreset! error failure))
-      (finally (vreset! closed (seal-completion! gate))))
-    ;; Normalize only AFTER permanent closure. Neither a forged response nor
-    ;; Throwable metadata can supply the private positive/native-entry evidence.
-    (when (interrupted-failure? @error)
-      (.interrupt (Thread/currentThread)))
-    (let [{:keys [active entered? positive]} @closed]
-      {:completion (cond
-                     (pos? active) :pending
-                     positive :returned
-                     (not entered?) :not-started
-                     :else :pending)
-       :result (or positive @result)
-       :error @error})))
+  (complete-write! room system files opts nil))
+
+(defn write-file-to-completion!
+  "HOST-only finalized file publication with the ordinary sealed completion,
+   effect/quota, compare-and-write and commit contract. No compensation is
+   attempted after native dispatch: failure is pending and must be inspected,
+   preserving concurrent worktree/index edits and uncertain acknowledgements. The
+   source must be live inside file-source/with-finalized-file! on this thread.
+   Mandatory expected-worktree; validated-basis/subtree combinations refused.
+   Public SCI/MCP byte limits are unchanged; no source path or handle escapes."
+  [room system path source opts]
+  (complete-write! room system nil opts {:path path :source source}))
