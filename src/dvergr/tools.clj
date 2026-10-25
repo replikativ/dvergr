@@ -9,6 +9,7 @@
             [dvergr.sandbox :as sandbox]
             [dvergr.effects :as effects]
             [dvergr.rooms.file-tx :as file-tx]
+            [dvergr.rooms.file-source :as file-source]
             [dvergr.system.rooms :as srooms]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.io.acquisition :as acquisition]
@@ -464,6 +465,52 @@
                                 (force once))
                            write))
        (finally (when open? (vreset! open? false)))))))
+
+(defn- absent-file-guard
+  "Creation-only source transaction: even an incomplete path row is present."
+  [db rel]
+  (when (seq (d/datoms db :avet :geschichte.work/path rel))
+    (throw (ex-info "Finalized file destination already exists"
+                    {:type ::changed-underneath :path (str "/" rel) :expected nil :found :present})))
+  [])
+
+(defn workspace-write-file!
+  "HOST-only counterpart of workspace-write! for an owned finalized source.
+   Same virtual path, fs/write quota and atomic expected-content guard. Source
+   handles never enter effect data; the identity, not all bytes, is the digest.
+   Only new regular files are supported; existing path rows always refuse."
+  [ctx path source {:keys [expect mode] :as opts}]
+  (when-not (and (contains? opts :expect) (nil? expect) (every? #{:expect :mode} (keys opts))
+                 (or (nil? mode) (#{33188 33261} mode))
+                 (not (:validated-basis ctx)))
+    (throw (ex-info "A finalized source requires a guarded regular-file write" {:type ::invalid-source-write})))
+  (let [{:keys [content size]} (file-source/identity-of source)
+        owner (Thread/currentThread) open? (volatile! true)
+        write (delay
+                (let [resolved (tool-path ctx path) rel (subs resolved 1)
+                      conn (guarded-connection ctx) old (get (geschichte.repo/worktree conn) rel)]
+                  (make-parents! (:filesystem ctx) resolved)
+                  (rethrow-changed
+                   #(file-source/with-input!
+                      source
+                      (fn [in]
+                        (geschichte.content/transact-stream!
+                         conn in size
+                         (fn [id]
+                           [[:db.fn/call absent-file-guard rel]
+                            [:db.fn/call expect-guard rel nil true]
+                            {:geschichte.work/path rel :geschichte.work/content [:geschichte.content/id id]
+                             :geschichte.work/size (long size) :geschichte.work/mode (long (or mode (:mode old) 33188))}])
+                         {:expected-content content}))))
+                  resolved))]
+    (try
+      (effects/perform! (effect-boundary ctx)
+                        {:effect :fs/write :resource {:path (str path) :system-id (:system-id ctx)}
+                         :bytes size :result-of (constantly (pr-str [:file-content content size]))}
+                        #(do (when-not (and (identical? owner (Thread/currentThread)) @open?)
+                               (throw (ex-info "Finalized file forwarding is closed" {:type ::closed-source-forwarding})))
+                             (force write)))
+      (finally (vreset! open? false)))))
 
 (defn workspace-delete!
   "Delete the file at `path` in the workspace of the tool context `ctx`,
