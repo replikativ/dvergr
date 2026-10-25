@@ -200,8 +200,11 @@ identity are verified again before metadata publication. File handles and host
 paths never enter effects, transaction data or receipts. The host guarantees
 exclusive immutable ownership of the finalized source during the call.
 
-This entry requires `:expected-worktree` and refuses validated-basis/subtree
-combinations. After native dispatch it performs no compensation: failed or
+This creation-only entry requires `:expected-worktree` to name the destination
+with nil. Existing destinations, even identical ones, refuse; a transactional
+absence guard also rejects incomplete path rows. Replacements and
+validated-basis/subtree combinations are unsupported.
+After native dispatch it performs no compensation: failed or
 unacknowledged publication stays pending for inspection, preserving concurrent
 index and mode edits. A pending result does not permit automatic retry.
 Successful native receipts contain the exact committed file entry. The public

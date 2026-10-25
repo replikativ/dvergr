@@ -466,13 +466,21 @@
                            write))
        (finally (when open? (vreset! open? false)))))))
 
+(defn- absent-file-guard
+  "Creation-only source transaction: even an incomplete path row is present."
+  [db rel]
+  (when (seq (d/datoms db :avet :geschichte.work/path rel))
+    (throw (ex-info "Finalized file destination already exists"
+                    {:type ::changed-underneath :path (str "/" rel) :expected nil :found :present})))
+  [])
+
 (defn workspace-write-file!
   "HOST-only counterpart of workspace-write! for an owned finalized source.
    Same virtual path, fs/write quota and atomic expected-content guard. Source
    handles never enter effect data; the identity, not all bytes, is the digest.
-   Only guarded regular-file writes are supported."
+   Only new regular files are supported; existing path rows always refuse."
   [ctx path source {:keys [expect mode] :as opts}]
-  (when-not (and (contains? opts :expect) (every? #{:expect :mode} (keys opts))
+  (when-not (and (contains? opts :expect) (nil? expect) (every? #{:expect :mode} (keys opts))
                  (or (nil? mode) (#{33188 33261} mode))
                  (not (:validated-basis ctx)))
     (throw (ex-info "A finalized source requires a guarded regular-file write" {:type ::invalid-source-write})))
@@ -489,7 +497,8 @@
                         (geschichte.content/transact-stream!
                          conn in size
                          (fn [id]
-                           [[:db.fn/call expect-guard rel expect true]
+                           [[:db.fn/call absent-file-guard rel]
+                            [:db.fn/call expect-guard rel nil true]
                             {:geschichte.work/path rel :geschichte.work/content [:geschichte.content/id id]
                              :geschichte.work/size (long size) :geschichte.work/mode (long (or mode (:mode old) 33188))}])
                          {:expected-content content}))))

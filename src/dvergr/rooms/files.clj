@@ -61,7 +61,7 @@
 (def write-capabilities
   "Host embedding contracts supported by the canonical batch writer."
   #{:expected-worktree :applied-receipt :file-modes :durable-publication :explicit-workspace :expected-subtree :validated-basis
-    :validated-publication-basis})
+    :validated-publication-basis :finalized-file-create})
 
 ;; ---------------------------------------------------------------------------
 ;; Paths and the workspace
@@ -618,6 +618,8 @@
                               publication)
          paths (mapv first entries)
          opened (opened-worktree! paths opts)
+         _ (when (and source-plan (some? (get opened (ffirst entries))))
+             (refuse "Finalized file publication requires an absent destination" {}))
          _ (when (and (contains? opts :file-modes)
                       (not (and (map? file-modes)
                                 (every? (fn [[p mode]] (and (some #{p} paths) (#{33188 33261} mode))) file-modes))))
@@ -934,7 +936,8 @@
    attempted after native dispatch: failure is pending and must be inspected,
    preserving concurrent worktree/index edits and uncertain acknowledgements. The
    source must be live inside file-source/with-finalized-file! on this thread.
-   Mandatory expected-worktree; validated-basis/subtree combinations refused.
+   Creation only: expected-worktree must name the destination with nil.
+   Existing destinations and validated-basis/subtree combinations refuse.
    Public SCI/MCP byte limits are unchanged; no source path or handle escapes."
   [room system path source opts]
   (complete-write! room system nil opts {:path path :source source}))

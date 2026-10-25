@@ -210,3 +210,50 @@
                 (is (not= :returned (:completion result)))
                 (is (nil? (get (repo/worktree conn) "denied.bin")))
                 (is (= 0 (source/with-input! owned #(.read %))))))))))))
+
+(deftest existing-identical-files-cannot-be-replaced-through-source-publication
+  (with-target
+    (fn [room {:keys [system conn]} _]
+      (with-file
+        3
+        (fn [file]
+          (source/with-finalized-file!
+            file #(is (= :returned (:completion (files/write-file-to-completion! room system "existing.bin" %
+                                                                                 {:expected-worktree {"/existing.bin" nil}})))))
+          (let [entry (get (repo/worktree conn) "existing.bin")]
+            (doseq [expected [nil entry]]
+              (source/with-finalized-file!
+                file
+                (fn [owned]
+                  (let [result (files/write-file-to-completion! room system "existing.bin" owned
+                                                                {:expected-worktree {"/existing.bin" expected}})]
+                    (is (= :not-started (:completion result)))
+                    (is (some? (:error result)))
+                    (is (= 0 (source/with-input! owned #(.read %))))
+                    (is (= entry (get (repo/worktree conn) "existing.bin")))))))))))))
+
+(deftest concurrent-and-incomplete-destination-rows-refuse-atomically
+  (doseq [incomplete? [false true]]
+    (with-target
+      (fn [room {:keys [system conn]} _]
+        (with-file
+          3
+          (fn [file]
+            (source/with-finalized-file!
+              file
+              (fn [owned]
+                (let [foreign (atom nil)
+                      result (files/write-file-to-completion!
+                              room system "raced.bin" owned
+                              {:expected-worktree {"/raced.bin" nil}
+                               :boundary (constantly
+                                          {:handlers [(fn [effect next]
+                                                        (when (= :fs/write (:effect effect))
+                                                          (if incomplete?
+                                                            (d/transact conn [{:geschichte.work/path "raced.bin"}])
+                                                            (repo/write! conn "raced.bin" (.getBytes "foreign" "UTF-8")))
+                                                          (reset! foreign (d/pull @conn '[*] [:geschichte.work/path "raced.bin"])))
+                                                        (next effect))]})})]
+                  (is (= :pending (:completion result)))
+                  (is (some? (:error result)))
+                  (is (= @foreign (d/pull @conn '[*] [:geschichte.work/path "raced.bin"]))))))))))))
