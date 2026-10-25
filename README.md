@@ -335,7 +335,7 @@ The standalone, runnable scenarios these import live in [`examples/`](examples/)
 > corresponding changes are reviewed upstream. Maven and git consumers resolve
 > the same implementation:
 > ```clojure
-> org.replikativ/sci {:mvn/version "0.15.59-replikativ.1"}
+> org.replikativ/sci {:mvn/version "0.15.59-replikativ.4"}
 > ```
 > This returns to `org.babashka/sci` once the fork lands upstream.
 
