@@ -331,13 +331,12 @@ The standalone, runnable scenarios these import live in [`examples/`](examples/)
 | [Telemere](https://github.com/taoensso/telemere) | Structured logging + observability |
 
 > **SCI fork note.** dvergr directly depends on the published replikativ SCI
-> build for resource interruption and forkable interpreter worlds while the
-> corresponding changes are reviewed upstream. Maven and git consumers resolve
-> the same implementation:
+> build for resource interruption and forkable interpreter worlds. Upstream SCI
+> does not currently include forkable worlds. Maven and git consumers resolve
+> the same replikativ implementation:
 > ```clojure
-> org.replikativ/sci {:mvn/version "0.15.59-replikativ.1"}
+> org.replikativ/sci {:mvn/version "0.15.59-replikativ.5"}
 > ```
-> This returns to `org.babashka/sci` once the fork lands upstream.
 
 ## License
 
