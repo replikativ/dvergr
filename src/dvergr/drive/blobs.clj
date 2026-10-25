@@ -83,3 +83,31 @@
               (.readAllBytes ^java.io.InputStream input-stream))
             {:sync? true})
     (catch Exception _ nil)))
+
+(defn get-bytes-bounded
+  "Fetch and verify a SHA-256 blob, nil when absent. Read at most limit+1
+   bytes from the store's streaming view. Oversize, corrupt content and I/O
+   failures throw; none is reported as absence. This is a host storage API,
+   not an authorization boundary. The borrowed stream stays inside bget."
+  [id limit]
+  (when-not (and (string? id) (re-matches #"[0-9a-f]{64}" id)
+                 (integer? limit) (<= 0 limit (dec Integer/MAX_VALUE)))
+    (throw (ex-info "Invalid bounded blob read" {:type ::invalid-read})))
+  (k/bget (the-store) id
+          (fn [{:keys [input-stream blob]}]
+            (when (or input-stream blob)
+              (let [bytes (cond
+                            (bytes? blob) blob
+                            (bytes? input-stream) input-stream
+                            (instance? java.io.InputStream input-stream)
+                            (.readNBytes ^java.io.InputStream input-stream (int (inc limit)))
+                            :else (throw (ex-info "Blob backend has no streaming view" {:type ::unsupported-stream})))]
+                (when (> (alength bytes) limit)
+                  (throw (ex-info "Blob exceeds read limit" {:type ::too-large :limit limit})))
+                ;; A memory backend can lend its own array. Return detached bytes
+                ;; so a caller cannot mutate stored content through this reader.
+                (let [bytes (if (or (bytes? blob) (bytes? input-stream)) (aclone ^bytes bytes) bytes)]
+                  (when-not (= id (sha256-hex bytes))
+                    (throw (ex-info "Blob digest mismatch" {:type ::corrupt})))
+                  bytes))))
+          {:sync? true :streaming? true}))
