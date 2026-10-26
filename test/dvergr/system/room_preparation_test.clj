@@ -5,6 +5,7 @@
             [dvergr.room.registry :as registry]
             [dvergr.system.room-preparation :as preparation]
             [org.replikativ.spindel.yggdrasil :as ygg]
+            [org.replikativ.spindel.engine.core :as ec]
             [yggdrasil.protocols :as p]))
 
 (defn- fixture [f]
@@ -94,3 +95,79 @@
               (attempt #(preparation/with-prepared! ctx [(spec "a")] (fn [] (reset! published true)))))))
        (is (false? @published))
        (is (not-any? #{[:release]} @events))))))
+
+(deftest published-retirement-releases-acquisitions-not-distinct-connections
+  (fixture
+   (fn [{:keys [ctx spec events systems]}]
+     (let [owner (preparation/with-prepared-owner! ctx [(spec "a") (spec "b")] identity)]
+       (is (= :published (preparation/published-phase owner)))
+       (binding [ec/*execution-context* ctx]
+         (is (true? (preparation/retire-published! owner (constantly true))))
+         (is (true? (preparation/retire-published! owner (constantly true)))))
+       (is (empty? @systems))
+       (is (= 2 (count (filter #{[:release]} @events))))
+       (is (= :retired (preparation/published-phase owner)))))))
+
+(deftest retirement-preserves-acknowledged-progress-across-a-fence-failure
+  (fixture
+   (fn [{:keys [ctx spec events]}]
+     (let [owner (preparation/with-prepared-owner! ctx [(spec "a") (spec "b")] identity)
+           hold? (atom true)
+           current! #(when (and @hold? (= 1 (count (filter #{[:release]} @events))))
+                       (throw (ex-info "Native owner temporarily unavailable" {})))]
+       (binding [ec/*execution-context* ctx]
+         (is (some? (attempt #(preparation/retire-published! owner current!))))
+         (is (= :retiring (preparation/published-phase owner)))
+         (reset! hold? false)
+         (is (true? (preparation/retire-published! owner current!))))
+       (is (= 2 (count (filter #{[:release]} @events))))))))
+
+(deftest uncertain-release-is-never-blindly-repeated
+  (fixture
+   (fn [{:keys [ctx spec conn]}]
+     (let [owner (preparation/with-prepared-owner! ctx [(spec "a") (spec "b")] identity)
+           calls (atom 0)]
+       (with-redefs [d/release (fn [actual]
+                                 (is (identical? conn actual))
+                                 (swap! calls inc)
+                                 (throw (ex-info "Release acknowledgement lost" {})))]
+         (binding [ec/*execution-context* ctx]
+           (is (some? (attempt #(preparation/retire-published! owner (constantly true)))))
+           (is (= :native-release-needs-reconciliation
+                  (:reason (ex-data (attempt #(preparation/retire-published! owner (constantly true)))))))))
+       (is (= 1 @calls))))))
+
+(deftest lost-unregister-ack-is-observed-without-repeating-native-removal
+  (fixture
+   (fn [{:keys [ctx spec events systems]}]
+     (let [owner (preparation/with-prepared-owner! ctx [(spec "a") (spec "b")] identity)
+           unregister ygg/unregister! calls (atom 0)]
+       (with-redefs [ygg/unregister! (fn [id]
+                                       (unregister id)
+                                       (when (= 1 (swap! calls inc))
+                                         (throw (ex-info "Unregister ACK lost" {}))))]
+         (binding [ec/*execution-context* ctx]
+           (is (some? (attempt #(preparation/retire-published! owner (constantly true)))))
+           (is (true? (preparation/retire-published! owner (constantly true))))))
+       (is (= 2 @calls))
+       (is (empty? @systems))
+       (is (= 2 (count (filter #{[:release]} @events))))))))
+
+(deftest foreign-registration-refuses-before-any-owned-release
+  (fixture
+   (fn [{:keys [ctx spec events systems]}]
+     (let [owner (preparation/with-prepared-owner! ctx [(spec "a")] identity)]
+       (swap! systems assoc "foreign" {:id "foreign" :conn (Object.)})
+       (binding [ec/*execution-context* ctx]
+         (is (= :registration-owner-changed
+                (:reason (ex-data (attempt #(preparation/retire-published! owner (constantly true))))))))
+       (is (not-any? #{[:release] [:unregister "a"]} @events))))))
+
+(deftest invalid-publication-callback-refuses-before-any-acquisition
+  (fixture
+   (fn [{:keys [ctx spec events systems]}]
+     (doseq [invalid [nil {} "not a function"]]
+       (is (= :invalid-host-specs
+              (:reason (ex-data (attempt #(preparation/with-prepared! ctx [(spec "a")] invalid)))))))
+     (is (empty? @events))
+     (is (empty? @systems)))))

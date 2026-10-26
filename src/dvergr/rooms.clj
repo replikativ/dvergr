@@ -118,7 +118,7 @@
                        (instance? clojure.lang.IDeref (:meta room))
                        (= (srooms/msgs-chat-id slug) (:chat-id @(:meta room)))))]
       (if-let [existing (rreg/lookup id)]
-        (if (same? existing) existing
+        (if (same? existing) (srooms/bind-runtime-room! room-id existing)
             (throw (ex-info "Another Room incarnation is already registered" {:type ::foreign-registration :room/id room-id})))
         (try
           (let [room (register-live-room!
@@ -128,7 +128,7 @@
             (when-not (and (same? room) (identical? room (rreg/lookup id))
                            (identical? ctx (srooms/room-ctx-for room-id)))
               (throw (ex-info "Room registration did not preserve its canonical owner" {:type ::registration-mismatch})))
-            room)
+            (srooms/bind-runtime-room! room-id room))
           (catch Throwable error
             (let [held (srooms/retain-room-registration-failure! room-id ctx error)]
               (try (agent-run/close-room-admission! {:id id :ctx ctx})

@@ -27,6 +27,7 @@
             [dvergr.kb.schema :as kbs]
             [dvergr.chat.schema :as cschema]
             [dvergr.resource :as resource]
+            [dvergr.room.registry :as room-registry]
             [dvergr.room.store :as room-store]
             [dvergr.search.secondary :as search-secondary]
             [dvergr.scheduler.schema :as sched-schema]
@@ -58,6 +59,18 @@
 ;; child callers are refused before acquiring this process-local monitor.
 (defonce ^:private profiled-creation-lock (Object.))
 
+(defn- cache-context! [id ctx owner]
+  (let [row (d/entity @(sdb/get-conn) [:room/id id])]
+    (swap! room-ctxs assoc id {:ctx ctx :owner owner
+                               :slug (:room/slug row)
+                               :profile (:system/repository-profile (:room/default-repository row))})))
+
+(defn- assert-readable-entry! [id entry]
+  (when (and (:owner entry) (not= :published (preparation/published-phase (:owner entry))))
+    (throw (ex-info "Room native ownership is not available for hydration or reads"
+                    {:type ::room-runtime-held :room/id id})))
+  entry)
+
 (defn room-ctx-for
   "The room's own execution context (created by provision/hydrate), or nil.
    A known hydration failure is not allowed to fall back to the daemon root."
@@ -66,7 +79,97 @@
     (throw (ex-info "Room is unavailable because hydration failed"
                     {:type ::room-hydration-failed :room/id room-id}
                     error))
-    (get @room-ctxs room-id)))
+    (:ctx (assert-readable-entry! room-id (get @room-ctxs room-id)))))
+
+(defn- replace-entry! [id expected replacement]
+  (loop []
+    (let [before @room-ctxs]
+      (when-not (identical? expected (get before id))
+        (throw (ex-info "Room context owner changed" {:type ::room-runtime-held :room/id id})))
+      (if (compare-and-set! room-ctxs before
+                            (if replacement (assoc before id replacement) (dissoc before id)))
+        replacement
+        (recur)))))
+
+(defn bind-runtime-room!
+  "INTERNAL HOST registration acknowledgement. Bind this cache acquisition to
+   the exact registered Room once; never attach a later replacement to it."
+  [id room]
+  (let [entry (assert-readable-entry! id (get @room-ctxs id))]
+    (when-not (and (uuid? id) entry (not (simple/on-drain-thread?))
+                   (identical? (ec/current-execution-context) (rctx/current-root))
+                   (identical? (rctx/current-root) (rctx/root-ctx (:ctx entry)))
+                   (identical? (:ctx entry) (:ctx room))
+                   (= (:slug entry) (:slug room))
+                   (identical? room (room-registry/lookup (:id room)))
+                   (or (nil? (:room entry)) (identical? room (:room entry))))
+      (throw (ex-info "Room registration cannot acquire this native cache owner"
+                      {:type ::room-runtime-held :room/id id})))
+    (when-not (:room entry)
+      (replace-entry! id entry (assoc entry :room room)))
+    (when-not (identical? room (:room (get @room-ctxs id)))
+      (throw (ex-info "Room binding has no positive acknowledgement" {:type ::room-runtime-held :room/id id})))
+    room))
+
+(def ^:private retirement-token (Object.))
+(def ^:private retirement-key ::runtime-retirement)
+
+(defn retire-room-runtime!
+  "HOST ONLY: release and evict one exact closed, archived profiled Room's
+   native acquisition owner. Owns its empty registry-slot extent. Repository
+   files, commits, control rows and permanent checkpoint pins are preserved.
+   Missing ownership or uncertain release is a hold, never guessed success."
+  [id room]
+  (when-not (and (uuid? id) room (not (simple/on-drain-thread?))
+                 (ec/execution-context-bound?)
+                 (identical? (ec/current-execution-context) (rctx/current-root))
+                 (:ctx room) (identical? (rctx/current-root) (rctx/root-ctx (:ctx room))))
+    (throw (ex-info "Room retirement requires its actual host root" {:type ::requires-host-root})))
+  (room-registry/with-close-reservation!
+    room :removed
+    (fn [_]
+      (let [entry (get @room-ctxs id)
+            identity! (fn []
+                        (let [row (d/entity @(sdb/get-conn) [:room/id id])]
+                          (when-not (and (= id (:room/id row))
+                                         (= (:slug room) (:room/slug row))
+                                         (inst? (:room/archived-at row))
+                                         (:system/repository-profile (:room/default-repository row))
+                                         ((requiring-resolve 'dvergr.discourse/room-closed?) room)
+                                         (nil? (room-registry/lookup (:id room))))
+                            (throw (ex-info "Room retirement lacks closed archived identity"
+                                            {:type ::room-runtime-held :room/id id})))
+                          row))
+            current! (fn []
+                       (let [row (identity!)]
+                         (when-not (and (identical? entry (get @room-ctxs id))
+                                        (:owner entry) (identical? room (:room entry))
+                                        (identical? (:ctx room) (:ctx entry))
+                                        (= (:slug entry) (:room/slug row))
+                                        (= (:profile entry)
+                                           (:system/repository-profile (:room/default-repository row))))
+                           (throw (ex-info "Room retirement lost its exact native owner"
+                                           {:type ::room-runtime-held :room/id id})))))]
+        (identity!)
+        (if entry
+          (do
+            (when (get @room-hydration-errors id)
+              (throw (ex-info "Room preparation still requires reconciliation"
+                              {:type ::pending-room-preparation :room/id id})))
+            (binding [ec/*execution-context* (:ctx entry)]
+              (preparation/retire-published! (:owner entry) current!))
+            (current!)
+            ;; Record a native acknowledgement before eviction; a lost eviction
+            ;; ACK can then be observed without replaying any lease release.
+            (swap! (:meta room) assoc retirement-key
+                   {:token retirement-token :room/id id :incarnation (:incarnation room)})
+            (replace-entry! id entry nil))
+          (let [receipt (get @(:meta room) retirement-key)]
+            (when-not (and (identical? retirement-token (:token receipt))
+                           (= id (:room/id receipt)) (= (:incarnation room) (:incarnation receipt)))
+              (throw (ex-info "Missing Room acquisition owner is not a retirement acknowledgement"
+                              {:type ::room-runtime-held :room/id id})))))
+        true))))
 
 (declare clear-room-ctxs!)
 
@@ -87,6 +190,7 @@
     held))
 
 (defn- assert-no-retained-preparation! []
+  (doseq [[id entry] @room-ctxs] (assert-readable-entry! id entry))
   (when (some retained-preparation? (vals @room-hydration-errors))
     (throw (ex-info "Room bootstrap ownership must be reconciled before reset or release"
                     {:type ::pending-room-preparation}))))
@@ -111,7 +215,7 @@
    Best-effort per store; call once everything that writes has stopped."
   []
   (assert-no-retained-preparation!)
-  (doseq [[_ ctx] @room-ctxs]
+  (doseq [[_ {:keys [ctx]}] @room-ctxs]
     (binding [ec/*execution-context* ctx]
       (doseq [[_ system] (try (ygg/registered-systems) (catch Throwable _ {}))
               :let [conn (:conn system)]
@@ -336,13 +440,14 @@
     (when (retained-preparation? error)
       (throw (ex-info "Reconcile retained room bootstrap ownership before retrying hydration"
                       {:type ::pending-room-preparation :room/id room-id} error))))
-  (if-let [existing (get @room-ctxs room-id)]
+  (if-let [entry (get @room-ctxs room-id)]
     (do
+      (assert-readable-entry! room-id entry)
       ;; A transport-only restart keeps the room runtime alive. Replacing its
       ;; context would strand the existing registry Room/bus on the old fork.
       ;; A different daemon root, however, must explicitly stop/release its
       ;; predecessor; silently reusing or replacing those handles is unsafe.
-      (when-not (identical? (rctx/current-root) (rctx/root-ctx existing))
+      (when-not (identical? (rctx/current-root) (rctx/root-ctx (:ctx entry)))
         (throw (ex-info "Release the previous daemon's room stores before hydration"
                         {:type ::stale-room-context :room/id room-id})))
       (boolean (get @room-hydration-errors room-id)))
@@ -372,6 +477,14 @@
                                            {:type ::missing-message-identity :scope scope}))))
                        (ensure-msgs-resources! conn)
                        (dh-adapter/create conn {:system-name (msgs-system-name scope)}))}
+    :kb (let [cfg (kb-cfg scope)]
+          {:id (kb-system-name scope)
+           :acquire! (fn []
+                       (when-not (d/database-exists? cfg)
+                         (throw (ex-info "Owned profiled knowledge store is missing"
+                                         {:type ::missing-profiled-kb :scope scope})))
+                       (sdh/connect cfg))
+           :prepare! #(dh-adapter/create % {:system-name (kb-system-name scope)})})
     :repo (let [cfg (geschichte/repository-config scope)]
             {:id (repo-system-name scope)
              :acquire! (fn []
@@ -383,7 +496,7 @@
                                                        :repository-profile repository-profile
                                                        :repository-profiles repository-profiles})})))
 
-(defn- hydrate-profiled-room! [id room-ctx systems repository-profiles slug]
+(defn- hydrate-profiled-room! [id room-ctx systems repository-profiles slug owned-system-ids]
   (let [;; Attachment permissions produce several rows for one registry system.
         ;; Collapse registry identity, NOT acquired connection identity/leases.
         systems (vals (reduce (fn [by-id system]
@@ -392,16 +505,17 @@
                                     (throw (ex-info "Conflicting registry rows for one system"
                                                     {:type ::conflicting-system-rows :system/id id})))
                                   (assoc by-id id system))) {} systems))
-        mandatory? #(or (= :msgs (:system/type %)) (contains? % :system/repository-profile))
+        mandatory? #(or (= :msgs (:system/type %)) (contains? % :system/repository-profile)
+                        (and (= :kb (:system/type %)) (contains? owned-system-ids (:system/id %))))
         mandatory (vec (sort-by #(if (= :msgs (:system/type %)) 0 1) (filter mandatory? systems)))
         optional (remove mandatory? systems)]
     (when-not (= 1 (count (filter #(= :msgs (:system/type %)) mandatory)))
       (throw (ex-info "A profiled Room requires exactly one mandatory messages system"
                       {:type ::missing-mandatory-messages :room/id id})))
-    (preparation/with-prepared!
+    (preparation/with-prepared-owner!
       room-ctx (mapv #(mandatory-system-spec % repository-profiles slug) mandatory)
-      (fn []
-        (swap! room-ctxs assoc id room-ctx)
+      (fn [owner]
+        (cache-context! id room-ctx owner)
         (swap! room-hydration-errors dissoc id)))
     ;; Existing optional best-effort adapters are not part of mandatory
     ;; readiness. Keep their native I/O outside the publication callback.
@@ -435,13 +549,16 @@
           ;; cannot be governed, the fresh fork has not registered any Room
           ;; systems and can be safely withheld without a separate fork-close
           ;; lifecycle (Spindel forks share their root lifecycle).
-           (let [systems (mapv :system (sdb/systems-for-room id))]
+           (let [attachments (sdb/systems-for-room id)
+                 systems (mapv :system attachments)
+                 owned-system-ids (into #{} (comp (filter #(= :owner (:permission %)))
+                                                  (map #(get-in % [:system :system/id]))) attachments)]
              (if (some #(contains? % :system/repository-profile) systems)
-               (hydrate-profiled-room! id room-ctx systems repository-profiles slug)
+               (hydrate-profiled-room! id room-ctx systems repository-profiles slug owned-system-ids)
                (do
                  (doseq [system (sort-by #(if (= :msgs (:system/type %)) 0 1) systems)]
                    (register-system-into-current! system))
-                 (swap! room-ctxs assoc id room-ctx)
+                 (cache-context! id room-ctx nil)
                  (swap! room-hydration-errors dissoc id)))))
          (catch Throwable e
            (swap! room-hydration-errors assoc id e)
@@ -509,11 +626,11 @@
                                   (sdh/provision! {:conn conn :register? false :schema? false
                                                    :extra-schema (kbs/knowledge-datahike-schema)})
                                   (dh-adapter/create conn {:system-name (kb-system-name kb-path)}))}]]
-          (preparation/with-prepared!
+          (preparation/with-prepared-owner!
             ctx specs
-            (fn []
+            (fn [owner]
               (room-intent/mark-ready! basis)
-              (swap! room-ctxs assoc id ctx)
+              (cache-context! id ctx owner)
               (swap! room-hydration-errors dissoc id)
               {:room-id id :room-ctx ctx
                :repo-id (get-in by-type [:repo :system/id]) :repo-path repo-path
@@ -579,7 +696,7 @@
             room-ctx  (fork-room-ctx)]
         (binding [ec/*execution-context* room-ctx]
           (register-room-systems! msgs-path kb-path repo-path))
-        (swap! room-ctxs assoc room-id room-ctx)
+        (cache-context! room-id room-ctx nil)
         (swap! room-hydration-errors dissoc room-id)
         (sdb/attach! room-id repo-id :owner)
         (sdb/attach! room-id kb-id   :owner)

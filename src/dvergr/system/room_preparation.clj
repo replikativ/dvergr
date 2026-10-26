@@ -13,6 +13,16 @@
 
 (def ^:private owner-token (Object.))
 
+;; Native publication ownership, never interpreter/fork state or EDN. Keep
+;; acquisition positions: identical connections can still represent two leases.
+(deftype ^:private PublishedOwner [ctx state])
+
+(defn published-phase
+  "INTERNAL inert lifecycle observation; never an ownership receipt."
+  [owner]
+  (when (instance? PublishedOwner owner)
+    (:phase @(.-state ^PublishedOwner owner))))
+
 (defn- refuse! [reason]
   (throw (ex-info "Room bootstrap preparation refused" {:type ::refused :reason reason})))
 
@@ -123,7 +133,7 @@
                   (throw error))
               (throw (retained-error state recover-owner! error nil)))))))))
 
-(defn with-prepared!
+(defn- prepare-owned!
   "INTERNAL bootstrap only. ctx must be a fresh unpublished non-root context.
    Each bounded, closed host spec acquires ONE connection lease, then prepares
    its adapter without hidden acquisition/registration/asynchronous work. All
@@ -217,7 +227,7 @@
             (swap! state assoc-in [:registrations index :state] :registered)
             (audit-ownership!))
           (swap! state assoc :phase :publishing)
-          (let [result (publish!)]
+          (let [result (publish! (PublishedOwner. ctx state))]
             (swap! state assoc :phase :published)
             result)
           (catch Throwable error
@@ -228,3 +238,72 @@
                      (catch Throwable cleanup-error
                        (throw (retained-error state recover-owner! error cleanup-error))))
                 (throw error)))))))))
+
+(defn with-prepared!
+  "Prepare private adapters and transfer their leases on publication. Existing
+   zero-argument publication API; use with-prepared-owner! for tracked retirement."
+  [ctx specs publish!]
+  (when-not (fn? publish!) (refuse! :invalid-host-specs))
+  (prepare-owned! ctx specs (fn [_] (publish!))))
+
+(defn with-prepared-owner!
+  "INTERNAL HOST publication receives the opaque acquisition owner. The
+   receiving native cache must retain it before publishing its context."
+  [ctx specs publish!]
+  (prepare-owned! ctx specs publish!))
+
+(defn retire-published!
+  "INTERNAL HOST: release the exact published acquisition journal after its
+   owning Room has quiesced. CURRENT! is the fixed native cache owner's fence,
+   not a caller's permission predicate. Uncertain releases remain held."
+  [owner current!]
+  (when-not (and (instance? PublishedOwner owner) (fn? current!)
+                 (not (simple/on-drain-thread?)))
+    (refuse! :invalid-retirement-owner))
+  (let [ctx (.-ctx ^PublishedOwner owner)
+        state (.-state ^PublishedOwner owner)]
+    (when-not (identical? ctx ec/*execution-context*) (refuse! :foreign-retirement-context))
+    (locking state
+      (current!)
+      (when-not (#{:published :retiring :retired} (:phase @state))
+        (refuse! :publication-needs-reconciliation))
+      (when (some #(= :releasing (:state %)) (:leases @state))
+        (refuse! :native-release-needs-reconciliation))
+      (when-not (= :retired (:phase @state))
+        (letfn [(audit! []
+                  (current!)
+                  (let [actual (ygg/registered-systems)
+                        expected (into {} (keep (fn [{:keys [id system state]}]
+                                                  (when-not (= :unregistered state) [id system])))
+                                       (:registrations @state))]
+                    (when (or (some (fn [[id system]] (not (identical? system (get expected id)))) actual)
+                              (some (fn [{:keys [id system state]}]
+                                      (and (= :registered state)
+                                           (not (identical? system (get actual id)))))
+                                    (:registrations @state)))
+                      (refuse! :registration-owner-changed))))]
+          (audit!)
+          (swap! state assoc :phase :retiring)
+          (doseq [index (reverse (range (count (:registrations @state))))
+                  :let [{:keys [id system] registration-state :state} (get-in @state [:registrations index])]
+                  :when (not= :unregistered registration-state)]
+            (current!)
+            (let [actual (ygg/system id)]
+              (when (and actual (not (identical? actual system))) (refuse! :registration-owner-changed))
+              ;; A prior lost unregister ACK is observed through native absence;
+              ;; a still-present identical registration has not been removed.
+              (swap! state assoc-in [:registrations index :state] :unregistering)
+              (when actual (ygg/unregister! id))
+              (when (ygg/system id) (refuse! :unregister-unconfirmed))
+              (swap! state assoc-in [:registrations index :state] :unregistered))
+            (audit!))
+          (doseq [index (reverse (range (count (:leases @state))))
+                  :let [lease (get-in @state [:leases index])]
+                  :when (not= :released (:state lease))]
+            (current!)
+            (swap! state assoc-in [:leases index :state] :releasing)
+            (d/release (:conn lease))
+            (swap! state assoc-in [:leases index :state] :released))
+          (current!)
+          (swap! state assoc :phase :retired :leases [] :registrations [])))
+      true)))
