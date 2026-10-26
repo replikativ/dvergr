@@ -162,7 +162,6 @@
                 (is (every? :passed? (:entries full)))
                 (is (= {"alpha" {"exact?" 1.0}} (:check-rates full)) "each check's pass rate"))))))
       (finally
-        (try (rreg/unregister! (:id room)) (catch Throwable _ nil))
         (d/close-room! room)))))
 
 (deftest a-cheaper-model-against-the-baseline

@@ -123,7 +123,6 @@
             (is (empty? (run/active-runs (:id room)))))))
       (finally
         (deliver release true)
-        (binding [ec/*execution-context* (:ctx room)] (registry/unregister! (:id room)))
         (#'fixtures/close-resource-test-room! room conn)))))
 
 (deftest ignored-child-experiment-is-owned-until-physical-cleanup
@@ -217,5 +216,4 @@
             (is (= 1 (count (run/active-runs (:id room))))))))
       (finally
         (run/finish! parent :completed)
-        (binding [ec/*execution-context* (:ctx room)] (registry/unregister! (:id room)))
         (#'fixtures/close-resource-test-room! room conn)))))

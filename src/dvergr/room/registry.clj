@@ -165,6 +165,42 @@
       (finally
         (release-transition! key token)))))
 
+(defn- reservation-current! [room key token]
+  (when-not (and (= key (transition-key (:id room)))
+                 (= token (get-in @transitions [key :token])))
+    (throw (ex-info "Room registry reservation is no longer current"
+                    {:type ::lifecycle-reservation-lost :room-id (:id room)}))))
+
+(defn- unregister-reserved! [room key token on-removed!]
+  (let [room-id (:id room)
+        exact! #(do (reservation-current! room key token)
+                    (when-not (identical? room (get (rctx/shared-get-state registry-path) room-id))
+                      (throw (ex-info "Room unregister no longer owns its incarnation"
+                                      {:type ::stale-incarnation :room-id room-id}))))]
+    (locking lifecycle-lock (exact!))
+    ;; All native teardown runs outside the global monitor, under this token.
+    (doseq [f (vals @pre-unregister-hooks)] (f room))
+    (let [failure (try
+                    (locking lifecycle-lock
+                      (exact!)
+                      (rctx/shared-swap-state! registry-path #(dissoc (or % {}) room-id)))
+                    nil
+                    (catch Throwable error error))
+          removed? (locking lifecycle-lock
+                     (reservation-current! room key token)
+                     (nil? (get (rctx/shared-get-state registry-path) room-id)))]
+      ;; A state watch can throw AFTER removal committed. Complete the same
+      ;; post-removal hooks and publish its witness before propagating the ACK
+      ;; failure; otherwise old lifecycle caches would retain the removed id.
+      (when removed?
+        (when on-removed! (on-removed!))
+        (doseq [f (vals @unregister-hooks)] (try (f room-id) (catch Throwable _ nil))))
+      (when failure (throw failure))
+      (when-not removed?
+        (throw (ex-info "Room registry removal has no positive acknowledgement"
+                        {:type ::removal-unconfirmed :room-id room-id})))))
+  nil)
+
 (defn unregister!
   "Remove a Room from the registry by id, then run unregister hooks."
   [room-id]
@@ -174,28 +210,49 @@
             (let [[key token] (reserve-transition! room-id :unregister)]
               {:room room :key key :token token})))]
     (when room
-      (try
-        ;; Draining user/runtime work must never hold the daemon-global monitor.
-        ;; Same-Room lifecycle contenders fail on the reservation; unrelated
-        ;; registries continue normally.
-        (doseq [f (vals @pre-unregister-hooks)]
-          (f room))
-        (locking lifecycle-lock
-          (when-not (and (= token (get-in @transitions [key :token]))
-                         (= (:incarnation room)
-                            (:incarnation (get (rctx/shared-get-state registry-path)
-                                               room-id))))
-            (throw (ex-info "Room unregister reservation no longer owns the incarnation"
-                            {:type ::lifecycle-reservation-lost
-                             :room-id room-id})))
-          (rctx/shared-swap-state! registry-path (fn [m] (dissoc (or m {}) room-id))))
-        ;; Keep the reservation through cleanup so a new incarnation cannot be
-        ;; registered before old process-local handles have been forgotten.
-        (doseq [f (vals @unregister-hooks)]
-          (try (f room-id) (catch Throwable _ nil)))
-        (finally
-          (release-transition! key token)))))
+      (try (unregister-reserved! room key token nil)
+           (finally (release-transition! key token)))))
   nil)
+
+(defn with-close-reservation!
+  "HOST-only synchronous close extent using the existing registry reservation.
+   :registered requires the EXACT current Room. :removed is only for a recorded
+   post-unregister close retry and requires the slot to remain EMPTY. Hold the
+   reservation through native IO without holding the registry monitor.
+
+   F receives expiring, thread/root-bound :unregister! and :removed? functions.
+   Unregister is one-use and never acquires a nested reservation; its witness
+   remains observable after a committed removal whose ACK threw. These native
+   functions must never enter interpreter/fork state or outlive this call."
+  [room mode f]
+  (when-not (and room (#{:registered :removed} mode) (fn? f))
+    (throw (ex-info "Invalid Room close extent" {:type ::invalid-close-extent})))
+  (let [[key token]
+        (locking lifecycle-lock
+          (let [current (get (rctx/shared-get-state registry-path) (:id room))]
+            (when-not (if (= :registered mode) (identical? room current) (nil? current))
+              (throw (ex-info "Room close no longer owns its registered incarnation"
+                              {:type ::stale-incarnation :room-id (:id room)})))
+            (reserve-transition! (:id room) :close)))
+        extent (volatile! {:room room :key key :token token :thread (Thread/currentThread)
+                           :started? false :removed? (= :removed mode)})
+        current! (fn []
+                   (let [{:keys [room key token thread] :as state} @extent]
+                     (when-not (and state (identical? thread (Thread/currentThread)))
+                       (throw (ex-info "Room close extent expired" {:type ::invalid-close-extent})))
+                     (locking lifecycle-lock (reservation-current! room key token))
+                     state))]
+    (try
+      (f {:unregister! (fn []
+                         (let [{:keys [room key token started? removed?]} (current!)]
+                           (when (or started? removed?)
+                             (throw (ex-info "Room removal is already consumed" {:type ::invalid-close-extent})))
+                           (vswap! extent assoc :started? true)
+                           (unregister-reserved! room key token #(vswap! extent assoc :removed? true))))
+          :removed? (fn [] (:removed? (current!)))})
+      (finally
+        (vreset! extent nil)
+        (release-transition! key token)))))
 
 (defn lookup
   "Find a Room by id (keyword) or slug (string). nil if not present."

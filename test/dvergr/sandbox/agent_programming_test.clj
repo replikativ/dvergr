@@ -906,8 +906,6 @@
               (is (re-find #"ceiling" (str (:error r))))))))
       (finally
         (run/finish! parent-id :completed)
-        (try (binding [ec/*execution-context* (:ctx room)] (room-registry/unregister! (:id room)))
-             (catch Throwable _ nil))
         (d/close-room! room)))))
 
 (deftest sci-splits-a-grant-and-hires-children-by-role

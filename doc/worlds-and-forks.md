@@ -90,6 +90,16 @@ The body must physically join any resource work it starts before returning or
 throwing; detached asynchronous access is outside this contract. Applications
 also own their outer installation and root lifetime separately.
 
+Room close reserves the exact registered Room before cancelling or draining
+anything. A stale handle cannot close admission or interrupt work belonging to
+a replacement with the same id. The existing registry reservation spans native
+cleanup without holding its global monitor, so unrelated Rooms can proceed.
+If registry removal commits but its acknowledgement or context cleanup fails,
+the Room records the remaining context-close obligation. Retrying reserves the
+empty slot and finishes only that obligation; it refuses a replacement and
+never repeats teardown by id. Unregistering a handle manually does not grant
+this retry authority.
+
 Cancellation requests interruption, not completion. The lexical finalizer
 retires its interrupt target before releasing ownership, so an old drain
 snapshot cannot interrupt a later job reusing the thread. Agent-specific drains

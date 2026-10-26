@@ -247,7 +247,6 @@
                    (jsonista.core/read-value (-> result :content first :text)))
                 "text and structuredContent carry the same value"))))
       (finally
-        (try (rreg/unregister! (:id room)) (catch Throwable _ nil))
         (d/close-room! room)))))
 
 (deftest a-subscribed-room-resource-is-notified-on-every-kind-of-change
@@ -278,8 +277,6 @@
             (Thread/sleep 400)
             (is (= n (count (updates))) "nothing after the last unsubscribe"))))
       (finally
-        (try (binding [ec/*execution-context* (:ctx room)] (rreg/unregister! (:id room)))
-             (catch Throwable _ nil))
         (d/close-room! room)))))
 
 (deftest the-code-profile-is-the-repl-and-its-description
