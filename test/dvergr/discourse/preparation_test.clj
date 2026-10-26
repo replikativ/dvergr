@@ -234,7 +234,7 @@
           (reset! retrying (future (d/close-room! room)))
           (is (= true (deref retry-entered 3000 ::timeout)))
           (is (= token (get-in @(:meta room) [:dvergr/fork-transfer-state :token])))
-          (is (= ::d/room-lifecycle-in-progress
+          (is (= ::registry/lifecycle-in-progress
                  (try (d/close-room! room) nil
                       (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
           (is (= :tearing-down (get-in @(:meta room) [:dvergr/fork-transfer-state :state])))

@@ -370,8 +370,9 @@
                 (d/close-room! room)
                 nil
                 (catch clojure.lang.ExceptionInfo error error))]
-          (is (= ::d/room-lifecycle-in-progress
-                 (:type (ex-data contender-error))))
+          (is (= ::rreg/lifecycle-in-progress
+                 (:type (ex-data contender-error)))
+              "the exact registry slot refuses the contender before teardown")
           (is (= owner-fence
                  (:dvergr/fork-transfer-state @(:meta room)))
               "a losing close preserves the owner's token and causal allowlist"))

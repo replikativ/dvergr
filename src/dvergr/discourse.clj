@@ -1230,6 +1230,30 @@
                       {:type ::context-still-owned :room-id (:id room)
                        :other-room-ids (mapv :id others)})))))
 
+(defn- finish-room-context-close! [room required?]
+  (when required?
+    (assert-context-unshared! room)
+    (when-let [room-ctx (:ctx room)] (ctx/close-context! room-ctx)))
+  (swap! (:meta room) assoc fork-transfer-state-key {:state :closed :operation :close})
+  nil)
+
+(defn- resume-removed-room-close! [room]
+  ;; The empty registry slot is reserved by the caller. This is ONLY the
+  ;; already-owned local context phase, never another Room-id teardown.
+  (let [plan (locking (:meta room)
+               (let [state (get @(:meta room) fork-transfer-state-key)]
+                 (when-not (and (= :close (:operation state)) (:registry-removed? state)
+                                (= :recovery-required (:state state)))
+                   (throw (ex-info "Room context cleanup is already active or unavailable"
+                                   {:type ::room-lifecycle-in-progress :room-id (:id room)})))
+                 (swap! (:meta room) assoc-in [fork-transfer-state-key :state] :tearing-down)
+                 state))]
+    (try
+      (finish-room-context-close! room (:context-close-required? plan))
+      (catch Throwable error
+        (mark-room-recovery-if-owned! room (:token plan) :close error)
+        (throw error)))))
+
 (defn close-room!
   "Tear down a room: leave every participant, unregister the Room, and close
    its execution context. Any in-flight drain completes before this returns.
@@ -1249,40 +1273,50 @@
    original settlement claim/outcome is preserved; transferred or partitioned
    handles and active settlement attempts cannot be reclaimed this way.
 
-   No-op on already-closed rooms."
+   Reserves the exact registered incarnation BEFORE any cancellation or drain.
+   A stale handle cannot fence work belonging to its replacement. If registry
+   removal committed but context close failed, retry reserves an empty slot and
+   finishes only that recorded context phase; it never repeats Room-id teardown
+   or adopts a replacement. No-op on already-closed rooms."
   ([room] (close-room! room {}))
   ([room {:keys [close-context?] :or {close-context? true}}]
    (when (and room (not= :closed (get-in @(:meta room)
                                          [fork-transfer-state-key :state])))
      (preparation/assert-not-host-owner! room)
-     (let [fence-token* (volatile! nil)]
-       (try
-         (drain-room-listeners! room :close #(vreset! fence-token* %))
-         (preparation/drain-room! room)
-         (sandbox-work/close-room-work! room)
-         (drain-room-runs! room)
-         (seal-room-quiescence! room :close)
-         ;; A :none fork shares this exact context; :ctx forks share its root's
-         ;; running flag/executor. Failed fork cleanup keeps
-        ;; its canonical Room registered, even after its caller's native Run
-        ;; has physically exited; that owner must prevent premature root close.
-         (when (and close-context? (not (fork-room? room)))
-           (assert-context-unshared! room))
-         (leave-all! room)
-         (release-fork-timers! room)
-         (binding [ec/*execution-context* (room-home-ctx room)]
-           (rreg/unregister! (:id room)))
-        ;; A branchless fork carries the exact root ctx, so Spindel cannot infer from
-        ;; the context alone that closing it here would kill the parent. The durable
-        ;; room marker is the ownership boundary.
-         (when (and close-context? (not (fork-room? room)))
-           (when-let [room-ctx (:ctx room)]
-             (ctx/close-context! room-ctx)))
-         (swap! (:meta room) assoc fork-transfer-state-key
-                {:state :closed :operation :close})
-         (catch Throwable error
-           (mark-room-recovery-if-owned! room @fence-token* :close error)
-           (throw error)))))
+     (let [removed? (true? (get-in @(:meta room) [fork-transfer-state-key :registry-removed?]))
+           caller-context ec/*execution-context*]
+       (binding [ec/*execution-context* (room-home-ctx room)]
+         (rreg/with-close-reservation!
+           room (if removed? :removed :registered)
+           (fn [{unregister! :unregister! removal-committed? :removed?}]
+            ;; Preserve the caller's execution bindings for existing teardown
+            ;; bodies; registry capability calls use their original root.
+             (binding [ec/*execution-context* caller-context]
+               (if removed?
+                 (resume-removed-room-close! room)
+                 (let [fence-token* (volatile! nil)
+                       context-required? (and close-context? (not (fork-room? room)))]
+                   (try
+                     (drain-room-listeners! room :close #(vreset! fence-token* %))
+                     (preparation/drain-room! room)
+                     (sandbox-work/close-room-work! room)
+                     (drain-room-runs! room)
+                     (seal-room-quiescence! room :close)
+                     (when context-required? (assert-context-unshared! room))
+                     (leave-all! room)
+                     (release-fork-timers! room)
+                     (binding [ec/*execution-context* (room-home-ctx room)]
+                       (try (unregister!)
+                            (finally
+                              (when (removal-committed?)
+                                (swap! (:meta room) update fork-transfer-state-key assoc
+                                       :registry-removed? true :context-close-required? context-required?)))))
+                    ;; A branchless fork shares its parent's context. The
+                    ;; recorded original obligation controls any later retry.
+                     (finish-room-context-close! room context-required?)
+                     (catch Throwable error
+                       (mark-room-recovery-if-owned! room @fence-token* :close error)
+                       (throw error)))))))))))
    nil))
 
 (defn close-registered-rooms!
