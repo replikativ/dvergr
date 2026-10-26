@@ -2195,12 +2195,15 @@
    The preparer runs against the isolated work Room after durable admission and
    before resource allocation or candidate-visible work. The private trigger
    is already durable at that point so a setup failure remains causally valid.
+   The optional HOST :checkpoints map selects only this admission's initial
+   repository state. It is not a delegation capability and is not installed in
+   the supervisor; the caller owns retention and any manual Run origin record.
    This entry point is deliberately absent from the SCI surface."
   [control-room world-parent roster agent-ref
    {:keys [task from parent-run settlement resources limits role]
     :or {from :repl settlement :automatic}
     :as raw-opts}
-   prepare-world! & [protocol {resume-from :resume snapshots :snapshots preset-id :id
+   prepare-world! & [protocol {resume-from :resume preset-id :id
                                on-world :on-world resources-from :resources-from
                                deadline-nanos :deadline-nanos :as host-options}]]
   (when-not (or (nil? deadline-nanos) (integer? deadline-nanos))
@@ -2222,7 +2225,8 @@
         ;; leaves once it ran returns to its parent, as for any Run.
         grantor   (or resources-from parent-run)
         run-world (world/open! world-parent id settlement control-room
-                               (when snapshots {:snapshots snapshots}))
+                               (not-empty (into {} (remove (comp nil? val))
+                                                (select-keys host-options [:snapshots :checkpoints]))))
         work-room (:work run-world)
         supervisor (cond-> (assoc (make-supervisor (:ctx world-parent) (:ctx work-room)) :run-id id)
                      deadline-nanos (assoc :deadline-nanos deadline-nanos)
@@ -2584,7 +2588,7 @@
   ([control-room world-parent roster agent-ref opts]
    (hire-in! control-room world-parent roster agent-ref opts {}))
   ([control-room world-parent roster agent-ref opts host-options]
-   (when-let [unknown (seq (remove (set delegation/host-option-keys) (keys host-options)))]
+   (when-let [unknown (seq (remove (conj (set delegation/host-option-keys) :checkpoints) (keys host-options)))]
      (throw (ex-info "Unknown host hiring capabilities" {:unknown (set unknown)})))
    (hire-prepared-in! control-room world-parent roster agent-ref opts nil nil host-options)))
 

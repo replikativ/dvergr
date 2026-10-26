@@ -24,6 +24,8 @@
             [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.effects.savepoint :as savepoint]
+            [org.replikativ.spindel.world.scope :as world-scope]
             [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.spin.core :as spin-core]
@@ -39,7 +41,7 @@
    ones are unvetted. The tier is recorded on every receipt
    (`:verifier-trust` in its metrics), so a reward is never read without it."
   [:trusted :room :ad-hoc])
-(defrecord WorldSetup [ref prepare])
+(defrecord WorldSetup [ref prepare checkpoints])
 (defrecord Protocol [ref run limit-keys inputs])
 
 (defn- remaining-ms [deadline-nanos]
@@ -198,6 +200,28 @@
     (start-task! room group
                  #(deref (sp/spin (sp/await completion))))))
 
+(defn- native-resources-held? [entry]
+  (when-let [scope (:native-scope entry)]
+    (let [state @scope]
+      (or (seq (world-scope/handles state)) (seq (:recovery state))
+          (pos? (:pending-forks state)) (:recovering? state)
+          (= :discarding (:status state))))))
+
+(defn- native-task-held? [entry]
+  (when (:native-scope entry)
+    (or (not= :settled @(:native-phase entry)) (native-resources-held? entry))))
+
+(defn- native-error-summary [error]
+  (when error
+    (try
+      (let [message (or (ex-message error) "Native operation failed")]
+        (cond-> {:class (.getName (class error))
+                 :message (subs message 0 (min 512 (count message)))}
+          (keyword? (:type (ex-data error))) (assoc :type (:type (ex-data error)))))
+      (catch Throwable _
+        ;; Diagnostics must not strand ownership before phase/gate publication.
+        {:class "java.lang.Throwable" :message "Native error details unavailable"}))))
+
 (defn- await-cleanups* [room group timeout-ms]
   (positive-timeout! "Cleanup timeout" timeout-ms)
   (let [scope (cleanup-scope room)
@@ -227,7 +251,9 @@
 
                                 (:error outcome)
                                 {:token token :type ::cleanup-failed
-                                 :error (:error outcome)}
+                                 :error (if (:native-scope (get-in @pending-tasks [scope token]))
+                                          (native-error-summary (:error outcome))
+                                          (:error outcome))}
 
                                 :else nil)))
                       outcomes)]
@@ -235,7 +261,8 @@
             ;; out task remains registered so a later join or Room teardown can
             ;; still recover it.
             (doseq [[token outcome] outcomes
-                    :when (not= ::timeout outcome)]
+                    :when (and (not= ::timeout outcome)
+                               (not (native-task-held? (get-in @pending-tasks [scope token]))))]
               (remove-task! scope token))
             (recur (into observed (map first outcomes)) failures'))
           (if (seq failures)
@@ -267,6 +294,163 @@
   ([room group] (await-cleanups-for! room group 30000))
   ([room group timeout-ms]
    (await-cleanups* room (require-cleanup-group! group) timeout-ms)))
+
+(def ^:private native-cleanup-timeout-ms 30000)
+
+(defn- start-native-op [operation]
+  (let [result (promise)]
+    (try (operation #(deliver result {:ok %}) #(deliver result {:error %}))
+         (catch Throwable error (deliver result {:error error})))
+    result))
+
+(defn- native-outcome [outcome]
+  (if-let [error (:error outcome)] (throw error) (:ok outcome)))
+
+(defn- join-native-op! [operation deadline interrupted?]
+  ;; Invoke once. An interrupt while joining never replays native mutation.
+  (let [result (start-native-op operation)]
+    (loop []
+      (let [outcome (try (deref result (remaining-ms deadline) ::timeout)
+                         (catch InterruptedException _
+                           (vreset! interrupted? true)
+                           ::interrupted))]
+        (case outcome
+          ::interrupted (recur)
+          ::timeout (throw (ex-info "Native prediction cleanup is still in flight"
+                                    {:type ::native-cleanup-timeout}))
+          (native-outcome outcome))))))
+
+(defn- dispose-native-scope! [scope interrupted?]
+  (when-not (= :discarded (:status @scope))
+    (let [deadline (+ (System/nanoTime) (* 1000000 native-cleanup-timeout-ms))]
+      (join-native-op! (world-scope/await-quiescence scope) deadline interrupted?)
+      (when (seq (:recovery @scope))
+        (join-native-op! (world-scope/recover! scope) deadline interrupted?))
+      (join-native-op! (world-scope/discard! scope) deadline interrupted?)))
+  (when (or (not= :discarded (:status @scope))
+            (native-resources-held? {:native-scope scope}))
+    (throw (ex-info "Native prediction ownership has not settled"
+                    {:type ::native-cleanup-incomplete}))))
+
+(defn recover-native-cleanup!
+  "HOST-only retry of a retained prediction's cleanup token. Never exposed to
+   SCI. Refuses while the original computation or native cleanup is active;
+   adapter uncertainty still requires its existing explicit reconciliation."
+  [room token]
+  (when (simple/on-drain-thread?)
+    (throw (ex-info "Native cleanup must run off the engine drain" {:type ::native-on-drain})))
+  (let [scope-key (cleanup-scope room)
+        {:keys [native-scope native-phase] :as entry} (get-in @pending-tasks [scope-key token])]
+    (when-not (and entry native-scope)
+      (throw (ex-info "Unknown native cleanup token" {:type ::unknown-native-cleanup :cleanup/token token})))
+    (when-not (compare-and-set! native-phase :held :recovering)
+      (throw (ex-info "Native prediction operation is still active" {:type ::native-operation-active :cleanup/token token})))
+    (let [interrupted? (volatile! (Thread/interrupted))]
+      (try
+        (when (or (pos? (:pending-forks @native-scope)) (:recovering? @native-scope)
+                  (= :discarding (:status @native-scope)))
+          (throw (ex-info "Native cleanup is still physically active" {:type ::native-operation-active :cleanup/token token})))
+        (dispose-native-scope! native-scope interrupted?)
+        (reset! native-phase :settled)
+        (remove-task! scope-key token)
+        true
+        (catch Throwable error
+          (when (instance? InterruptedException error) (vreset! interrupted? true))
+          (swap! pending-tasks assoc-in [scope-key token :native-errors :recovery] error)
+          (reset! native-phase :held)
+          (if (= ::native-operation-active (:type (ex-data error)))
+            (throw error)
+            (throw (ex-info "Native prediction cleanup still requires recovery"
+                            {:type ::native-cleanup-recovery-required :cleanup/token token
+                             :cleanup-error (native-error-summary error)}))))
+        (finally (when @interrupted? (.interrupt (Thread/currentThread))))))))
+
+(defn- with-owned-checkpoint-world!
+  [purpose room world-parent group checkpoints f]
+  (when (simple/on-drain-thread?)
+    (throw (ex-info "Checkpoint computation must run off the engine drain" {:type ::native-on-drain})))
+  (when (some? group) (require-cleanup-group! group))
+  (when-not (fn? f) (throw (ex-info "Checkpoint computation requires a host function" {:type ::invalid-native-computation})))
+  (let [prediction? (= purpose :input-prediction)
+        label (if prediction? "Checkpoint prediction" "Checkpoint fixture construction")
+        checkpoints (environment/validate-checkpoints checkpoints)
+        source (:ctx world-parent)
+        scope (world-scope/create {:purpose purpose :retain-released? false})
+        activity (world-scope/begin-activity! scope (if prediction? :prediction :fixture-construction))
+        scope-key (cleanup-scope room) token (random-uuid) gate (promise)
+        phase (atom :running)
+        entry {:gate gate :group group :native-scope scope :native-phase phase}
+        _ (swap! pending-tasks update scope-key (fnil assoc {}) token entry)
+        outcome
+        (try
+          (binding [ec/*execution-context* source]
+            (let [state (savepoint/independent-fork-state
+                         (savepoint/derive-seed (savepoint/seed source)
+                                                (if prediction? :dvergr/prediction :dvergr/checkpoint-fixture) token))
+                  world (native-outcome
+                         @(start-native-op
+                           #(world-scope/fork! scope source
+                                               {:fork-opts {:checkpoints checkpoints
+                                                            :forkable-components #{}
+                                                            :state-updates state}} %1 %2)))]
+              {:ok (binding [ec/*execution-context* (:child-ctx world)]
+                     (let [value (f)]
+                       (when-not (roster/data-value? value)
+                         (throw (ex-info (str label " must return portable metadata")
+                                         {:type (if prediction? ::non-portable-prediction ::non-portable-fixture)})))
+                       value))}))
+          (catch Throwable error {:error error}))
+        interrupted? (volatile! (or (Thread/interrupted)
+                                    (instance? InterruptedException (:error outcome))))
+        cleanup-error
+        (try
+          (world-scope/end-activity! scope activity)
+          (dispose-native-scope! scope interrupted?)
+          nil
+          (catch Throwable error error))
+        _ (when (instance? InterruptedException cleanup-error) (vreset! interrupted? true))
+        failure (when (or cleanup-error (:error outcome))
+                  (ex-info (str label (if cleanup-error " cleanup remains owned" " failed"))
+                           (cond-> {:type (if prediction?
+                                            (if cleanup-error ::checkpoint-prediction-cleanup-required ::checkpoint-prediction-failed)
+                                            (if cleanup-error ::checkpoint-fixture-cleanup-required ::checkpoint-fixture-failed))
+                                    :cleanup/token token
+                                    :room/id (:id room) :room/incarnation (:incarnation room)
+                                    :cleanup/group group}
+                             cleanup-error (assoc :cleanup-error (native-error-summary cleanup-error))
+                             (:error outcome) (assoc (if prediction? :prediction-error :fixture-error)
+                                                     (native-error-summary (:error outcome))))))]
+    ;; Full native errors never cross the SCI boundary or the cleanup observer.
+    (when failure
+      (swap! pending-tasks assoc-in [scope-key token :native-errors]
+             {:computation (:error outcome) :cleanup cleanup-error}))
+    ;; The computation has physically exited. Async native cleanup may still
+    ;; be active after a bounded join; its scope stays privately registered.
+    (reset! phase (if cleanup-error :held :settled))
+    (deliver gate (if failure {:error failure} {:ok true}))
+    (when-not failure (remove-task! scope-key token))
+    (when @interrupted? (.interrupt (Thread/currentThread)))
+    (if failure (throw failure) (:ok outcome))))
+
+(defn with-checkpoint-world!
+  "HOST-only blocking metadata computation in an owned checkpoint world.
+   No Run, Room, wallet, preparer or provider dispatch is created. Register
+   cleanup before allocation; unresolved native ownership stays in the existing
+   room/group cleanup manager until explicit HOST recovery. Never call on drain."
+  [room world-parent group checkpoints f]
+  (with-owned-checkpoint-world! :input-prediction room world-parent group checkpoints f))
+
+(defn with-checkpoint-fixture!
+  "HOST-only bounded fixture construction in an owned temporary checkpoint
+   world. Runs f with that world's context bound and returns portable metadata
+   only. No Room, Run, wallet or provider dispatch is created by this helper.
+   Caller retains original authorization and source lifetime through the call,
+   preflights byte/count bounds and bounds callback execution; this helper does
+   not impose those limits itself. Only the temporary fork belongs to this scope: persist any external durable
+   pin intent before pin IO, and retain uncertain outcomes separately. Never
+   call on the engine drain. Cleanup uses the existing Room/group manager."
+  [room world-parent group checkpoints f]
+  (with-owned-checkpoint-world! :fixture-construction room world-parent group checkpoints f))
 
 (defn make-evaluator
   "Create a process-local trusted evaluator capability.
@@ -336,8 +520,13 @@
    `{:room isolated-work-room :run/id uuid :environment EnvironmentDef}` and may
    transact only against that fork-local world. Its optional return value must
    be portable data and is supplied to the trusted Evaluator observer as
-   `:setup/evidence`. The capability itself is never portable or exposed to SCI."
-  [{:keys [id version basis prepare]
+   `:setup/evidence`. Optional HOST :checkpoints select the initial repository
+   state before prepare runs and become a distinct :setup/checkpoints reference
+   field. The admitting host must retain those origins before admission and
+   through cleanup/evidence obligations. Wrappers must explicitly forward the
+   checkpoint map as well as compose their basis. The capability itself is
+   never portable or exposed to SCI."
+  [{:keys [id version basis prepare checkpoints]
     :or {version 1}}]
   (when-not (keyword? id)
     (throw (ex-info "World setup :id must be a keyword"
@@ -351,9 +540,11 @@
   (when-not (fn? prepare)
     (throw (ex-info "World setup :prepare must be a function"
                     {:type ::invalid-setup-preparer})))
-  (->WorldSetup (cond-> {:setup/id id :setup/version version}
-                  (some? basis) (assoc :setup/basis basis))
-                prepare))
+  (let [checkpoints (environment/validate-checkpoints checkpoints)]
+    (->WorldSetup (cond-> {:setup/id id :setup/version version}
+                    (some? basis) (assoc :setup/basis basis)
+                    (seq checkpoints) (assoc :setup/checkpoints checkpoints))
+                  prepare checkpoints)))
 
 (defn validate-world-setup
   "Validate a HOST WorldSetup capability without executing its preparer.
@@ -371,6 +562,10 @@
     (when (and (seq (:checkpoints setup)) (not (contains? rebuilt :checkpoints)))
       (throw (ex-info "Installed WorldSetup does not support checkpoint admission"
                       {:type ::unsupported-setup-checkpoints})))
+    (when (not= (:checkpoints rebuilt)
+                (environment/validate-checkpoints (:setup/checkpoints ref)))
+      (throw (ex-info "WorldSetup checkpoint admission does not match its exact reference"
+                      {:type ::setup-checkpoint-mismatch})))
     (when-not (= ref (:ref rebuilt))
       (throw (ex-info "WorldSetup does not match its canonical reference"
                       {:type ::invalid-world-setup-reference}))))
@@ -897,9 +1092,11 @@
                          room cleanup-group
                          #(program/hire-prepared-in! room (or world-parent room) team agent-ref
                                                      hire-opts prepare-world! hosted-protocol
-                                                     (assoc (select-keys opts [:experiment-capabilities :delegation-policy])
-                                                            :deadline-nanos deadline-nanos
-                                                            :id run-id))
+                                                     (cond-> (assoc (select-keys opts [:experiment-capabilities :delegation-policy])
+                                                                    :deadline-nanos deadline-nanos
+                                                                    :id run-id)
+                                                       (seq (:checkpoints world-setup))
+                                                       (assoc :checkpoints (:checkpoints world-setup))))
                          #(program/cancel! room %)
                          #(abandon-completed-admission! room %1 %2))
                         (catch Throwable error

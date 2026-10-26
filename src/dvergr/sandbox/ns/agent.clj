@@ -123,7 +123,9 @@
   [:map {:closed true}
    [:setup/id :keyword]
    [:setup/version PosInt]
-   [:setup/basis {:optional true} :any]])
+   [:setup/basis {:optional true} :any]
+   [:setup/checkpoints {:optional true}
+    [:map-of [:or :string :keyword :uuid] [:not :nil]]]])
 
 (def ^:private EnvironmentSpec
   [:map {:closed true}

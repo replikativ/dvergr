@@ -352,10 +352,13 @@
         (let [source (when copy?
                        (:child-ctx (cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2))))]
           (reset! armed? true)
-          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires cleanup"
-                                (if copy?
-                                  (cps #(world-scope/copy! scope source 2 {:split? true} %1 %2))
-                                  (cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2)))))
+          (is (= ::world-scope/recovery-required
+                 (try
+                   (if copy?
+                     (cps #(world-scope/copy! scope source 2 {:split? true} %1 %2))
+                     (cps #(world-scope/fork! scope root {:grant {resource/microdollars 4M}} %1 %2)))
+                   nil
+                   (catch clojure.lang.ExceptionInfo error (:type (ex-data error))))))
           (is @blocked?)
           (is (zero? (:pending-forks @scope)))
           (is (= (if copy? 2 1) (count (:recovery @scope))))
