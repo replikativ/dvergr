@@ -229,6 +229,13 @@
      :dataset-content-id, :candidate-id, and :candidate-content-id; :limit is
      applied after filtering."))
 
+(defprotocol PBoundedScorecardStore
+  "Optional managed Scorecard read with explicit payload and computation caps.
+   Unsupported stores must refuse; callers must not fall back to an unbounded read."
+  (-load-scorecard-bounded [this room-id scorecard-id limits]
+    "Return an exact certified Scorecard in one Room, or nil. Validate limits at
+     this boundary too, and bound relations before child or payload reads."))
+
 ;; =============================================================================
 ;; Helpers
 ;; =============================================================================

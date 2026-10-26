@@ -17,6 +17,7 @@
             [dvergr.chat.schema :as schema]
             [dvergr.chat.persist :as persist]
             [dvergr.room.store :as store]
+            [dvergr.scorecard.bounds :as read-bounds]
             [dvergr.resource.ledger :as resource-ledger]
             [kontor.gate :as kontor-gate]
             [kontor.resource :as resource]
@@ -444,18 +445,24 @@
 ;; Cardinality-many references are pulled with (limit attr nil): Datahike's
 ;; pull takes the first 1000 values by default, and a Scorecard over more
 ;; than 1000 Attempts then fails its own projection check.
-(def ^:private scorecard-pull-pattern
+(def ^:private scorecard-header-pull-pattern
   '[:scorecard/id :scorecard/payload-ref :scorecard/payload-blob :scorecard/payload-codec
     :scorecard/experiment-id :scorecard/experiment-version
     :scorecard/experiment-content-id :scorecard/dataset-id
-    :scorecard/dataset-version :scorecard/dataset-content-id
-    :scorecard/stored-at
-    {(limit :scorecard/attempts nil) [:attempt/id :attempt/content-id]}
-    {(limit :scorecard/summaries nil)
-     [:scorecard.summary/id :scorecard.summary/candidate-id
-      :scorecard.summary/candidate-content-id
-      :scorecard.summary/attempt-count :scorecard.summary/passed-count
-      :scorecard.summary/reward-sum :scorecard.summary/reward-mean]}])
+    :scorecard/dataset-version :scorecard/dataset-content-id :scorecard/stored-at])
+
+(def ^:private scorecard-attempt-pull-pattern [:attempt/id :attempt/content-id])
+
+(def ^:private scorecard-summary-pull-pattern
+  '[:scorecard.summary/id :scorecard.summary/candidate-id
+    :scorecard.summary/candidate-content-id
+    :scorecard.summary/attempt-count :scorecard.summary/passed-count
+    :scorecard.summary/reward-sum :scorecard.summary/reward-mean])
+
+(def ^:private scorecard-pull-pattern
+  (into scorecard-header-pull-pattern
+        [{(list 'limit :scorecard/attempts nil) scorecard-attempt-pull-pattern}
+         {(list 'limit :scorecard/summaries nil) scorecard-summary-pull-pattern}]))
 
 (def ^:private attention-pull-pattern
   '[:attention/id :attention/participant :attention/message-id
@@ -686,6 +693,56 @@
            :scorecard.summary/reward-mean (double (:reward-mean summary))}))
       (:scorecard/summary value))}))
 
+(defn- validate-scorecard-projection [entity value]
+  (validate-scorecard value)
+  (let [definition (:scorecard/experiment value)
+        dataset (:experiment/dataset definition)
+        candidates (into {} (map (juxt :candidate/id identity)
+                                 (:experiment/candidates definition)))
+        expected-summaries
+        (set
+         (map
+          (fn [summary]
+            (let [candidate (get candidates (:candidate/id summary))]
+              {:scorecard.summary/id
+               (scorecard-summary-id (:scorecard/content-id value)
+                                     (:candidate/id summary))
+               :scorecard.summary/candidate-id (:candidate/id summary)
+               :scorecard.summary/candidate-content-id
+               (:candidate/agent-content-id candidate)
+               :scorecard.summary/attempt-count (:attempt-count summary)
+               :scorecard.summary/passed-count (:passed-count summary)
+               :scorecard.summary/reward-sum (double (:reward-sum summary))
+               :scorecard.summary/reward-mean
+               (double (:reward-mean summary))}))
+          (:scorecard/summary value)))
+        expected {:scorecard/id (:scorecard/content-id value)
+                  :scorecard/experiment-id (:experiment/id definition)
+                  :scorecard/experiment-version (:experiment/version definition)
+                  :scorecard/experiment-content-id
+                  (:experiment/content-id definition)
+                  :scorecard/dataset-id (:dataset/id dataset)
+                  :scorecard/dataset-version (:dataset/version dataset)
+                  :scorecard/dataset-content-id (:dataset/content-id dataset)
+                  :scorecard/attempts
+                  (set (map (juxt :attempt/id :attempt/content-id)
+                            (:scorecard/entries value)))
+                  :scorecard/summaries expected-summaries}
+        actual (assoc entity
+                      :scorecard/attempts
+                      (set (map (juxt :attempt/id :attempt/content-id)
+                                (:scorecard/attempts entity)))
+                      :scorecard/summaries
+                      (set (:scorecard/summaries entity)))]
+    (doseq [[k expected-value] expected]
+      (when-not (= expected-value (get actual k))
+        (throw
+         (ex-info "Scorecard typed projection differs from exact payload"
+                  {:type :room-store/corrupt-scorecard-projection
+                   :scorecard/id (:scorecard/content-id value)
+                   :key k :expected expected-value :actual (get actual k)}))))
+    value))
+
 (defn- entity->scorecard [entity artifacts]
   (when entity
     (when-not (= :edn-v1 (:scorecard/payload-codec entity))
@@ -698,54 +755,55 @@
                         {:type :room-store/missing-scorecard-payload
                          :scorecard/id (:scorecard/id entity)
                          :artifact/ref (or (:scorecard/payload-ref entity) (:scorecard/payload-blob entity))})))
-      (validate-scorecard value)
-      (let [definition (:scorecard/experiment value)
-            dataset (:experiment/dataset definition)
-            candidates (into {} (map (juxt :candidate/id identity)
-                                     (:experiment/candidates definition)))
-            expected-summaries
-            (set
-             (map
-              (fn [summary]
-                (let [candidate (get candidates (:candidate/id summary))]
-                  {:scorecard.summary/id
-                   (scorecard-summary-id (:scorecard/content-id value)
-                                         (:candidate/id summary))
-                   :scorecard.summary/candidate-id (:candidate/id summary)
-                   :scorecard.summary/candidate-content-id
-                   (:candidate/agent-content-id candidate)
-                   :scorecard.summary/attempt-count (:attempt-count summary)
-                   :scorecard.summary/passed-count (:passed-count summary)
-                   :scorecard.summary/reward-sum (double (:reward-sum summary))
-                   :scorecard.summary/reward-mean
-                   (double (:reward-mean summary))}))
-              (:scorecard/summary value)))
-            expected {:scorecard/id (:scorecard/content-id value)
-                      :scorecard/experiment-id (:experiment/id definition)
-                      :scorecard/experiment-version (:experiment/version definition)
-                      :scorecard/experiment-content-id
-                      (:experiment/content-id definition)
-                      :scorecard/dataset-id (:dataset/id dataset)
-                      :scorecard/dataset-version (:dataset/version dataset)
-                      :scorecard/dataset-content-id (:dataset/content-id dataset)
-                      :scorecard/attempts
-                      (set (map (juxt :attempt/id :attempt/content-id)
-                                (:scorecard/entries value)))
-                      :scorecard/summaries expected-summaries}
-            actual (assoc entity
-                          :scorecard/attempts
-                          (set (map (juxt :attempt/id :attempt/content-id)
-                                    (:scorecard/attempts entity)))
-                          :scorecard/summaries
-                          (set (:scorecard/summaries entity)))]
-        (doseq [[k expected-value] expected]
-          (when-not (= expected-value (get actual k))
-            (throw
-             (ex-info "Scorecard typed projection differs from exact payload"
-                      {:type :room-store/corrupt-scorecard-projection
-                       :scorecard/id (:scorecard/content-id value)
-                       :key k :expected expected-value :actual (get actual k)}))))
-        value))))
+      (validate-scorecard-projection entity value))))
+
+(defn- bounded-scorecard-relations [db entity attribute maximum]
+  (let [references (into [] (take (inc maximum)) (dh/datoms db :eavt entity attribute))]
+    (when (> (count references) maximum)
+      (throw (ex-info "Scorecard relation exceeds read limit"
+                      {:type :room-store/scorecard-read-limit :relation attribute})))
+    references))
+
+(defn- load-bounded-scorecard [conn artifacts room-id scorecard-id options]
+  (let [budget (read-bounds/limits options)]
+    (when-not (uuid? scorecard-id)
+      (throw (ex-info "A Scorecard content UUID is required" {:type :room-store/invalid-scorecard-id})))
+    (let [db @conn slug (store/room-id->slug room-id)]
+      (when-let [[entity chat-id]
+                 (dh/q '[:find [?s ?chat-id]
+                         :in $ ?slug ?id
+                         :where [?c :room/slug ?slug] [?c :chat/id ?chat-id]
+                         [?s :scorecard/chat ?c] [?s :scorecard/id ?id]]
+                       db slug scorecard-id)]
+        (let [header (dh/pull db scorecard-header-pull-pattern entity)
+              ;; Check BOTH relation budgets before expanding either relation
+              ;; or reading bytes. Each prefix stops at its own cap + 1.
+              attempts (bounded-scorecard-relations db entity :scorecard/attempts (:max-cells budget))
+              summaries (bounded-scorecard-relations db entity :scorecard/summaries (:max-candidates budget))
+              ref (:scorecard/payload-ref header)]
+          (when-not (= :edn-v1 (:scorecard/payload-codec header))
+            (throw (ex-info "Unsupported Scorecard payload codec"
+                            {:type :room-store/unsupported-scorecard-payload})))
+          (when-not (uuid? ref)
+            (throw (ex-info "Bounded Scorecards require managed UUID payloads"
+                            {:type :room-store/unsupported-bounded-scorecard-payload})))
+          (let [loaded (artifact/get-bounded-value artifacts ref (:max-bytes budget))]
+            (when-not loaded
+              (throw (ex-info "Scorecard payload artifact is unavailable"
+                              {:type :room-store/missing-scorecard-payload :scorecard/id scorecard-id})))
+            (let [value (read-bounds/check-value! (:value loaded) budget)
+                  children (mapv (fn [reference]
+                                   (let [child (dh/pull db (conj scorecard-attempt-pull-pattern
+                                                                 {:attempt/chat [:chat/id]}) (:v reference))]
+                                     (when-not (= chat-id (get-in child [:attempt/chat :chat/id]))
+                                       (throw (ex-info "Scorecard Attempt is outside its Room"
+                                                       {:type :room-store/foreign-scorecard-attempt})))
+                                     child)) attempts)
+                  projection (assoc header
+                                    :scorecard/attempts children
+                                    :scorecard/summaries
+                                    (mapv #(dh/pull db scorecard-summary-pull-pattern (:v %)) summaries))]
+              (validate-scorecard-projection projection value))))))))
 
 (defn- attention->entity [chat-id fact]
   (cond-> (-> fact
@@ -1565,6 +1623,11 @@
                (take (or limit 100))
                (mapv #(entity->scorecard % artifacts))))
         [])))
+
+  store/PBoundedScorecardStore
+
+  (-load-scorecard-bounded [_ room-id scorecard-id limits]
+    (load-bounded-scorecard conn artifacts room-id scorecard-id limits))
 
   store/PAttentionStore
 

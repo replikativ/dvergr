@@ -599,6 +599,13 @@
                                        :spend (spend-data (:spend e))})
                                     (:scorecard/entries sc)))))))
 
+(defn scorecard-summary
+  "Pure fixed presentation of a validated Scorecard, using the same candidate,
+   interval and spend calculations as scorecard/detail. No Attempt loader,
+   cell expansion or pairwise comparisons. Bound the input before calling."
+  [scorecard]
+  (scorecard-data scorecard))
+
 (defn- msg-data [m]
   {:id             (some-> (:id m) str)
    :from           (some-> (:from m) name)
