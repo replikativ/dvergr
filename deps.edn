@@ -158,9 +158,10 @@
         ;; whose parent gained a commit meanwhile merges instead of fencing.
         ;; Independent owned cleanup leases (#30) let copied sibling overlays
         ;; settle after their temporary source branch has already been disposed.
+        ;; 0.3.53 also keeps generated overlay provenance EDN-readable.
         ;; 0.3.52 delegates exact checkpoint allocation to Geschichte and
         ;; validates portable checkpoint origins before native allocation.
-        org.replikativ/yggdrasil   {:mvn/version "0.3.52"
+        org.replikativ/yggdrasil   {:mvn/version "0.3.53"
                                     :exclusions  [org.babashka/sci]}
 
         ;; Scriptum — CoW Lucene indices for fulltext search

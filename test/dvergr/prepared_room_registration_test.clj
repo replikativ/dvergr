@@ -34,7 +34,8 @@
                                    [{:chat/id chat-id :chat/title "Prepared fixture" :room/slug slug :room/type :internal}]))
         room-store (assoc (memory/make) :conn messages)
         root (context/create-execution-context) ctx (context/fork-context root)
-        contexts (atom {id ctx}) errors (atom {}) makes (atom 0) make! discourse/make-room]
+        contexts (atom {id {:ctx ctx :slug slug :profile :fixture/knowledge}})
+        errors (atom {}) makes (atom 0) make! discourse/make-room]
     (with-redefs-fn
       {#'db/get-conn (constantly control)
        #'systems/room-ctxs contexts #'systems/room-hydration-errors errors
@@ -133,13 +134,13 @@
    (fn [{:keys [id root ctx contexts errors makes]}]
      (let [foreign-root (context/create-execution-context)]
        (try
-         (swap! contexts assoc id foreign-root)
+         (swap! contexts assoc-in [id :ctx] foreign-root)
          (is (= ::rooms/not-prepared
                 (:type (ex-data (attempt #(rooms/register-prepared-room! id))))))
          (is (zero? @makes))
          (is (empty? @errors))
          (finally
-           (swap! contexts assoc id ctx)
+           (swap! contexts assoc-in [id :ctx] ctx)
            (try (context/close-context! foreign-root)
                 (catch Throwable error
                   (swap! held-root assoc :foreign-root foreign-root :foreign-close-error error

@@ -1230,6 +1230,12 @@
                       {:type ::context-still-owned :room-id (:id room)
                        :other-room-ids (mapv :id others)})))))
 
+(defn room-closed?
+  "Whether this native Room acknowledged runtime close. Store-acquisition
+   retirement is a separate owner-layer obligation."
+  [room]
+  (= :closed (get-in @(:meta room) [fork-transfer-state-key :state])))
+
 (defn- finish-room-context-close! [room required?]
   (when required?
     (assert-context-unshared! room)
