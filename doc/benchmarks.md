@@ -100,10 +100,7 @@ The providers are not part of the `dvergr` jar. They live in
 suite, `clojure -M:test`, includes them). `dvergr` itself keeps what a
 benchmark is built with, so that a benchmark of your own is one more provider
 in your own repo: `dvergr.agent.evaluation`, `environment`, `experiment`,
-`experiment.runner`, `verifiers` (a registry for capabilities by reference;
-the tau2, BFCL, BIRD and AutomationBench providers have a `register!` for it
-that nothing calls, and nothing in `src/` reads it: the runner is handed the
-capabilities), `roster`.
+`experiment.runner`, `roster`.
 
 | Tier | Meaning | Status |
 | --- | --- | --- |

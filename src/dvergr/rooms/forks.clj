@@ -536,65 +536,6 @@
     (catch Throwable t {:ok? false :error (.getMessage t)})))
 
 ;; ---------------------------------------------------------------------------
-;; Agent merge-reviewer — an agent (a one-shot LLM) reads the diff and decides.
-;; Trivial forks auto-merge; reviewable/conflict go to the reviewer.
-;; ---------------------------------------------------------------------------
-
-(declare discard!)
-
-(defn- fmt-delta [[sid delta]]
-  (cond
-    (:error delta)   (str "• " sid ": (diff error) " (:error delta))
-    (contains? delta :files)
-    (str "• " sid " [git]: " (count (:files delta)) " file(s) changed"
-         (when (seq (:files delta))
-           (str " — " (str/join ", " (map :path (take 25 (:files delta))))))
-         (when-let [s (:stat delta)] (str "\n" (str/trim s))))
-    (contains? delta :summary)
-    (let [s (:summary delta)]
-      (str "• " sid " [datahike]: +" (:added-datoms s) " / -" (:removed-datoms s)
-           " datoms across " (:entities-touched s) " entit"
-           (if (= 1 (:entities-touched s)) "y" "ies")
-           (when (seq (:added delta))
-             (str "\n  added (sample): "
-                  (str/join " " (map pr-str (take 12 (:added delta))))))))
-    :else (str "• " sid ": " (pr-str delta))))
-
-(defn review-prompt
-  "Human/LLM-readable summary of a fork's review for the merge decision."
-  [fork {:keys [tier diff conflicts]}]
-  (str "Fork: " (:slug fork) "  (tier: " (name tier) ")\n"
-       "Parent: " (or (try (some-> (rreg/lookup (:parent-id fork)) :slug)
-                           (catch Throwable _ nil))
-                      (:parent-id fork)) "\n\n"
-       "Changes vs parent (note: a live parent may have advanced — judge the\n"
-       "fork's OWN additions, not the parent's concurrent activity):\n"
-       (str/join "\n" (map fmt-delta diff))
-       (when (seq conflicts)
-         (str "\n\nCONFLICTS (" (count conflicts) "): "
-              (str/join "; " (map (fn [c] (str (:system c) " " (pr-str (:entity c)) " " (:attr c)))
-                                  (take 10 conflicts)))))))
-
-(def ^:private review-instruction
-  (str "You are a careful merge reviewer for an agent workspace. Given a fork's "
-       "changes vs its parent, decide whether to MERGE the fork back, DISCARD it, "
-       "or HOLD for a human. Merge only coherent, beneficial changes; discard junk "
-       "or accidental forks; hold if genuinely unsure or there are conflicts you "
-       "cannot resolve. Reply with exactly one line `DECISION: MERGE|DISCARD|HOLD` "
-       "followed by a one-sentence rationale."))
-
-(defn- parse-decision [text]
-  (let [t (str/upper-case (str text))]
-    (condp #(str/includes? %2 %1) t
-      "DECISION: MERGE"   :merge
-      "DECISION: DISCARD" :discard
-      "DECISION: HOLD"    :hold
-      ;; fall back to a looser scan
-      (cond (str/includes? t "MERGE")   :merge
-            (str/includes? t "DISCARD") :discard
-            :else                       :hold))))
-
-;; ---------------------------------------------------------------------------
 ;; Agent conflict reconciler — when two branches changed the SAME field
 ;; differently (a genuine 3-way conflict the identity-keyed merge can't union),
 ;; a one-shot agent picks the winning value per field; we force past the merge
@@ -685,36 +626,6 @@
              :parent-slug (:slug parent) :rationale (:text resp)})
           (catch Throwable t {:ok? false :error (.getMessage t)}))
         {:ok? false :error "fork has no live parent in the registry"}))))
-
-(defn merge-review!
-  "Review a `:ctx` fork and act on it:
-     :trivial (and `auto-trivial?`) → auto-merge, no LLM.
-     :conflict → the agent CONFLICT RECONCILER resolves each field then merges.
-     :reviewable → a one-shot LLM reviewer reads the diff and decides
-       MERGE (→ merge!) / DISCARD (→ discard!) / HOLD (leave it).
-   Returns {:tier :decision :auto? :rationale :action}, or {:error …}."
-  [fork & {:keys [auto-trivial?] :or {auto-trivial? true}}]
-  (if-not (ctx-fork? fork)
-    {:error "not a :ctx fork — nothing to review/merge"}
-    (let [{:keys [tier] :as rev} (review fork)]
-      (cond
-        (and auto-trivial? (= :trivial tier) (empty? (:conflicts rev)))
-        {:tier tier :decision :merge :auto? true :action (merge! fork)}
-
-        (= :conflict tier)
-        {:tier tier :decision :reconcile :auto? false :action (reconcile-merge! fork)}
-
-        :else
-        (let [call (requiring-resolve 'dvergr.tools.llm-call/cheap-llm-call)
-              resp (try (call review-instruction (review-prompt fork rev) {})
-                        (catch Throwable t {:error (.getMessage t)}))
-              text (:text resp)
-              decision (if (:error resp) :hold (parse-decision text))]
-          (merge {:tier tier :decision decision :auto? false :rationale text}
-                 (case decision
-                   :merge   {:action (merge! fork)}
-                   :discard {:action (discard! fork)}
-                   {:action :held})))))))
 
 (defn discard!
   "Discard a fork (`discourse/discard`) — deletes its branches. Returns

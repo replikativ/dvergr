@@ -516,23 +516,6 @@
 
   :closed)
 
-;; ============================================================================
-;; Serialization (for checkpointing)
-;; ============================================================================
-
-(defn snapshot-chat
-  "Create a serializable snapshot of chat state.
-
-   Returns map that can be serialized and restored later."
-  [chat-ctx]
-  {:chat-id (:chat-id chat-ctx)
-   :title (:title chat-ctx)
-   :messages (get-messages chat-ctx)
-   :budget (get-budget chat-ctx)
-   :status (get-status chat-ctx)
-   ;; Spindel context can be serialized too
-   :spindel-snapshot (ctx/serialize-context (:spindel-ctx chat-ctx))})
-
 (defn load-messages
   "Load persisted messages for `chat-id` from datahike, ordered by
    :message/created-at. Returns a vector of entity maps in the same
@@ -562,30 +545,6 @@
                    :data {:chat-id chat-id :error (.getMessage e)}}
                   "Failed to load persisted messages")
         []))))
-
-(defn restore-chat
-  "Restore chat from a snapshot produced by snapshot-chat.
-
-   Creates a fresh ChatContext with a new spindel execution context,
-   then loads messages, budget, and status from the snapshot.
-   The spindel context is not deserialized — only the data is restored.
-
-   Returns the restored ChatContext."
-  [{:keys [chat-id title messages budget status] :as snapshot}]
-  (let [chat-ctx (create-chat-context
-                  {:title (or title "Restored chat")
-                   :budget (or (:total budget) (* 1000000 1))})]
-    ;; Restore messages
-    (when (seq messages)
-      (replace-messages! chat-ctx messages))
-    ;; Restore budget (overwrite the fresh budget with saved state)
-    (when budget
-      (binding [rtc/*execution-context* (selected-execution-context chat-ctx)]
-        (reset! (:budget-signal chat-ctx) budget)))
-    ;; Restore status
-    (when (and status (not= status :active))
-      (set-status! chat-ctx status))
-    chat-ctx))
 
 (comment
   ;; Example usage:

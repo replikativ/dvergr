@@ -1191,19 +1191,17 @@
    base-path controls where babashka.fs and git/* resolve relative paths.
    Pass the worktree directory for task contexts.
 
-   proc-allow is accepted for compatibility and unused (there is no proc
-   namespace; commands run through the jailed shell). git/* is always
-   available and uses git directly (already scoped to worktree).
+   Commands run through the jailed shell. git/* is always available and
+   uses git directly (already scoped to worktree).
 
    allowed-http-domains is a set of URL prefixes; non-empty restricts outbound HTTP.
 
    Every file, git and HTTP operation is an effect (`dvergr.effects`): decided by
    the boundary the world binding carries (mode, admission, acting identity) and
    receipted into `receipts` (a sink; a fresh one when absent), which is returned."
-  [sci-ctx spindel-ctx & {:keys [base-path proc-allow allowed-http-domains room-conn kb-conn room-id
+  [sci-ctx spindel-ctx & {:keys [base-path allowed-http-domains room-conn kb-conn room-id
                                  room-runtime-id room-incarnation capability-id
-                                 agent-program-ceiling receipts]
-                          :or   {proc-allow #{}}}]
+                                 agent-program-ceiling receipts]}]
   (let [audit-log  (or receipts (make-audit-log))
         binding-resolver (when capability-id
                            (runtime-ctx/sandbox-binding-resolver spindel-ctx capability-id))

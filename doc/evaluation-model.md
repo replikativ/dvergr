@@ -170,15 +170,12 @@ records it as `:verifier-trust` in its metrics:
 
 Every Attempt is stored, in every tier: trust is a field on the record, not
 a storage decision. An agent cannot claim a higher tier, because only host
-code constructs an Evaluator and agent code can only name one by ref. There
-are two host registries. `dvergr.agent.evaluators` holds what the
-sandbox's `run-experiment!` may use (the wiki benchmark and the workflow
-completion check). `dvergr.agent.verifiers` is a second registry with a
-`register!` in the tau2, BFCL, BIRD and AutomationBench providers, but no
-code path calls them and only the registry's own test reads it: the shared
-runner (`dvergr.agent.experiment.runner`) builds the capability maps
-`experiment/run` takes from the provider's `{:world-setup :protocol
-:evaluator}` directly.
+code constructs an Evaluator and agent code can only name one by ref. The host
+registry `dvergr.agent.evaluators` holds what the sandbox's
+`run-experiment!` may use (the wiki benchmark and the workflow completion
+check). The shared runner (`dvergr.agent.experiment.runner`) builds the
+capability maps `experiment/run` takes from the provider's
+`{:world-setup :protocol :evaluator}` directly.
 
 Not built: a minimum tier for Scorecards (one more check in
 `validate-scorecard-attempts`, which already re-verifies every entry);
@@ -420,8 +417,7 @@ Refactor first. Each step keeps the suite green.
 
 1. **Fold tau2 into `evaluate`.** DONE (2026-09-20), except the last item.
    - Trust tiers on the Evaluator (`make-evaluator :tier`), recorded on
-     every receipt (`dvergr.agent.verifiers`, the registry this step added,
-     is unused outside its tests).
+     every receipt.
    - Environment protocols (`evaluation/make-protocol`): a Run hosts a
      trusted interaction in its world, under its own supervisor.
    - `experiment/run`: protocols, each Attempt's cell identity, `:resume?`,

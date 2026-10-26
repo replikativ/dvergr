@@ -21,7 +21,6 @@
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.spend :as spend]
-            [dvergr.agent.verifiers :as verifiers]
             [dvergr.benchmarks.bfcl.core :as bfcl]
             [dvergr.benchmarks.bfcl.harness :as harness]
             [dvergr.benchmarks.live :as live]
@@ -162,14 +161,6 @@
                             (not (:valid verdict))
                             (assoc (keyword "bfcl.error" (str/replace (str (:error-type verdict)) #"[^A-Za-z0-9_.\-]" "_"))
                                    false))}))})})
-
-(defn register!
-  "Register `capabilities` in the process registry. Returns their references:
-   `{:setup :protocol :verifier}`."
-  [{:keys [world-setup protocol evaluator]}]
-  {:setup (verifiers/register-world-setup! world-setup)
-   :protocol (verifiers/register-protocol! protocol)
-   :verifier (verifiers/register-evaluator! evaluator)})
 
 (defn environment-def
   "EnvironmentDef for one BFCL task on the generic evaluation path."

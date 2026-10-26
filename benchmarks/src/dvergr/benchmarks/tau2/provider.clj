@@ -22,7 +22,6 @@
             [dvergr.agent.environment :as environment]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.spend :as spend]
-            [dvergr.agent.verifiers :as verifiers]
             [dvergr.benchmarks.tau2.core :as t2]
             [dvergr.benchmarks.tau2.episode :as episode]
             [dvergr.benchmarks.live :as live]
@@ -147,14 +146,6 @@
                     :checks (merge {:terminated-normally (contains? #{:agent-stop :user-stop} termination)}
                                    (into {} (map (fn [[k v]] [k (= 1.0 (double v))]))
                                          (:reward-breakdown grade)))}))})}))
-
-(defn register!
-  "Register `capabilities` in the process registry. Returns their references:
-   `{:setup :protocol :verifier}`."
-  [{:keys [world-setup protocol evaluator]}]
-  {:setup (verifiers/register-world-setup! world-setup)
-   :protocol (verifiers/register-protocol! protocol)
-   :verifier (verifiers/register-evaluator! evaluator)})
 
 (defn- id-name
   "`task-id` as the name part of a readable keyword: ids with characters a
