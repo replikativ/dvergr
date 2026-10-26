@@ -1,6 +1,7 @@
 (ns dvergr.catalog.context-fixture-test
   (:require [clojure.test :refer [deftest is]]
             [datahike.api :as db]
+            [datahike.blob :as blob]
             [dvergr.agent.checkpoint-admission-test :as fixture]
             [dvergr.agent.checkpoint-prediction-test :as prediction]
             [dvergr.agent.evaluation :as evaluation]
@@ -10,11 +11,31 @@
             [geschichte.bytes :as bytes]
             [geschichte.query :as query]
             [muschel.fs :as fs]
-            [muschel.fs.geschichte :as primary]))
+            [muschel.fs.geschichte :as primary]
+            [org.replikativ.spindel.engine.core :as ec]))
 
 (def limits {:max-files 10 :max-file-bytes 1024 :max-bytes 4096})
 
 (defn- error [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (or (:reason (ex-data e)) (:type (ex-data e)) :exception))))
+
+(deftest fixture-preflight-needs-no-world-and-preserves-exact-text-identity
+  (binding [ec/*execution-context* nil]
+    (let [files {"/wiki/A.md" "# A €\n" "/a.clj" "(+ 1 2)"}
+          entries (catalog/prepare-fixture-files files limits)]
+      (is (= ["/a.clj" "/wiki/A.md"] (vec (keys entries))))
+      (doseq [[path text] files]
+        (let [bytes (.getBytes ^String text "UTF-8")]
+          (is (= {:text text :content (blob/blob-id bytes) :size (alength bytes)} (get entries path)))))
+      (is (= {"/wiki/A.md" "# A €\n" "/a.clj" "(+ 1 2)"} files))
+      (is (= {} (catalog/prepare-fixture-files {} {:max-files 0 :max-file-bytes 0 :max-bytes 0}))))))
+
+(deftest fixture-preflight-refuses-invalid-bytes-paths-and-file-parent-collisions
+  (binding [ec/*execution-context* nil]
+    (doseq [files [{"relative.clj" "x"} {"/a/../alias" "x"}
+                   {"/a" "parent" "/a/b" "child"}
+                   {"/invalid.txt" (String. (char-array [(char 0xD800)]))}
+                   {"/large.txt" (apply str (repeat 1024 "€"))}]]
+      (is (some? (error #(catalog/prepare-fixture-files files limits)))))))
 
 (defn- with-child [f]
   (@#'fixture/with-room-workspace
@@ -42,6 +63,10 @@
         (is (= 3 (:files result)))
         (is (:changed? result))
         (is (= (set (keys files)) (set (keys (:manifest result)))))
+        (is (= (into {} (map (fn [[path entry]] [path (select-keys entry [:content :size])])
+                             (catalog/prepare-fixture-files files limits)))
+               (into {} (map (fn [[path entry]] [path (select-keys entry [:content :size])])
+                             (:manifest result)))))
         (is (= "# Company €\n" (fs/read-file (workspace/filesystem) "/wiki/Company.md")))
         (is (= "" (fs/read-file (workspace/filesystem) "/helpers/empty.txt")))
         (is (:clean? (repo/status child)))

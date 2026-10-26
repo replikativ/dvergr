@@ -104,7 +104,12 @@
       (let [bytes (byte-array size)] (.get buffer bytes) bytes))
     (catch CharacterCodingException _ (refuse-seed! :invalid-utf8))))
 
-(defn- fixture-files! [files limits]
+(defn prepare-fixture-files
+  "HOST preflight without selecting or writing a workspace. Return a sorted
+   map of canonical paths to {:text :content :size}, using strict UTF-8 and
+   finite limits. Loads the fixed canonical path validator when needed.
+   These data convey neither workspace authority nor publication proof."
+  [files limits]
   (when-not (and (map? limits) (= (set (keys fixture-seed-limits)) (set (keys limits)))
                  (every? (fn [[k v]] (and (integer? v) (<= 0 v (get fixture-seed-limits k)))) limits)
                  (map? files) (<= (count files) (:max-files limits)))
@@ -138,7 +143,7 @@
   [files limits]
   (when (simple/on-drain-thread?) (refuse-seed! :engine-drain))
   (when-not (gs/workspace-selected?) (refuse-seed! :workspace-not-selected))
-  (let [entries (fixture-files! files limits)
+  (let [entries (prepare-fixture-files files limits)
         selected (gs/selected-system-id)
         workspace (or (gs/current-workspace) (refuse-seed! :workspace-unavailable))
         conn (:conn workspace)

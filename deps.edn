@@ -38,7 +38,7 @@
         ;; is.simm.partial-cps.*). Every released dependency now depends on it;
         ;; only the :local checkouts below still exclude the old is.simm jar,
         ;; for checkouts that predate the move.
-        org.replikativ/partial-cps {:mvn/version "0.1.68"}
+        org.replikativ/partial-cps {:mvn/version "0.1.69"}
 
         ;; Spindel — Reactive runtime with CoW forking.
         ;; 0.1.35 (#27 lost-wakeup redesign + follow-ups): continuation
@@ -105,9 +105,9 @@
         ;; independent Sessions at fork creation (spindel#145/#146).
         ;; Reviewed staged-interpreter publication API (Spindel PR #147).
         ;; Historical savepoint forks own isolated workspaces; settlement joins
-        ;; native overlay disposal (Spindel #148). Public commit pending release.
-        org.replikativ/spindel     {:git/url "https://github.com/replikativ/spindel.git"
-                                    :git/sha "2e394753b9871b0c705d21e6aef1784b2b74d6b0"}
+        ;; native overlay disposal. 0.1.148 adds exact native checkpoint
+        ;; admission, construction recovery and reactive lifetime corrections.
+        org.replikativ/spindel     {:mvn/version "0.1.148"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,
@@ -134,7 +134,7 @@
         ;; Yggdrasil adapter lives only in Yggdrasil.
         ;; 0.1.22 binds prepared publication to an exact transaction basis and
         ;; physical workspace, for atomic commit/ref/application receipts.
-        org.replikativ/geschichte  {:mvn/version "0.1.24"}
+        org.replikativ/geschichte  {:mvn/version "0.1.25"}
 
         ;; rewrite-clj for structural editing
         rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
@@ -158,9 +158,9 @@
         ;; whose parent gained a commit meanwhile merges instead of fencing.
         ;; Independent owned cleanup leases (#30) let copied sibling overlays
         ;; settle after their temporary source branch has already been disposed.
-        ;; Keep this direct pin aligned; an old Maven pin would override it.
-        org.replikativ/yggdrasil   {:git/url "https://github.com/replikativ/yggdrasil"
-                                    :git/sha "b271739dbfa8ddbd5dfac7db314e821212cdfa00"
+        ;; 0.3.52 delegates exact checkpoint allocation to Geschichte and
+        ;; validates portable checkpoint origins before native allocation.
+        org.replikativ/yggdrasil   {:mvn/version "0.3.52"
                                     :exclusions  [org.babashka/sci]}
 
         ;; Scriptum — CoW Lucene indices for fulltext search

@@ -93,6 +93,13 @@ changed paths, commits through the retained workspace descriptor and requires a
 clean final state. Existing executable modes are preserved. Empty or repeated
 inputs do not create a logical commit.
 
+`catalog.workspace/prepare-fixture-files` exposes the same pure preflight for
+HOST coordinators that need to derive an expected complete manifest before
+allocation. It returns canonical paths with exact UTF-8 text, logical content
+IDs and byte sizes, without selecting or writing a workspace. Modes come from
+the baseline file, or the regular-file default for a new file. This preflight
+does not establish publication, authorization or ownership of a workspace.
+
 Its portable result contains file/byte counts, a written manifest and
 `:changed?` for logical tree changes. This is not Simmis semantic projection,
 authorization, evidence retention or a published checkpoint claim. The caller
