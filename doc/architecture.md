@@ -254,7 +254,7 @@ graph TD
 | `agent/{evaluation,environment,experiment,experiment/{runner,preflight,select,stats},verifiers,evaluators,attempt,attempt/governance,grounds,spend,trajectory,conversation,episode}` | L5/L6 | the evaluation path (doc/evaluation-model.md): Attempts, EnvironmentDefs, experiments and their runner, preflight, case selection and statistics, verifier trust tiers, the writer predicate that keeps certified rows immutable, what an Attempt's result rests on (its grounds), spend, trajectory export, certified conversations |
 | `agent/{observation,arenas/renewal}` | L5/L6 | bounded, scoped projections over one agent execution tree; a state-backed renewal-intervention arena |
 | `catalog` + `catalog/{wiki,wiki_gen,room,room_run,casepack,casepack_cli,report,workspace}` | L6 | catalog workflows (the wiki family) and room workflows (doc/room-workflows.md): bundles, case packs (and `casepack-cli`, a table of cases into a bundle from the shell), `room-run` (a client of the room path), the report |
-| `jobs`, `artifact`, `activity` | L6 | long operations as durable Runs; content-addressed portable values; durable observations on room messages |
+| `jobs`, `artifact`, `activity` | L6 | [Jobs with retained cleanup leases](jobs-lifecycle.md); content-addressed portable values; durable observations on room messages |
 | `orchestration/{daemon,skills,tasks,stats}` | L6 | the runtime daemon (boot/shutdown, agent lifecycle, channel/MCP/web wiring, GC loop); skill registry; task ledger; stats cache |
 | `actors` + `actors/transport` | L6 | durable actor identity table; PActorTransport impls |
 | `ops` | L6 | central operations spec — one data map; web/MCP/Telegram surfaces derived (datahike-spec pattern) |

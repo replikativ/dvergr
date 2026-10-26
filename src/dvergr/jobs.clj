@@ -31,8 +31,8 @@
   "Longest a status call blocks: below the shortest common client timeout."
   25000)
 
-;; job id -> {:room :done}: where a job's Run is stored and the promise its
-;; waiters block on. Process-local handles, never state: status is the Run's.
+;; The existing process-local Job owner retains cleanup stages/callbacks and
+;; waiters until native acknowledgement. Execution status remains the Run's.
 (defonce ^:private live (atom {}))
 
 (defn job-room
@@ -66,20 +66,121 @@
      :error (:run/error r)
      :reason (:run/reason r)}))
 
+(defn- error-message [error]
+  (try
+    (let [message (or (ex-message error) (.getName (class error)))]
+      (subs message 0 (min 4096 (count message))))
+    (catch Throwable _ "Job failed")))
+
+(def ^:private next-stage
+  {:before-finish :persist :persist :settled :settled :release :release :done})
+
+(defn- retained-run! [{:keys [id room state]}]
+  (let [{:keys [outcome]} @state
+        {:keys [status opts]} outcome
+        active (some #(when (= id (:run/id %)) %) (run/active-runs (:id room)))]
+    (when-not (and active (= status (:run/status active))
+                   (= (:now opts) (:run/ended-at active))
+                   (= (:reason opts) (:run/reason active))
+                   (= (some-> (:error opts) ex-message) (:run/error active)))
+      (throw (ex-info "Job terminal persistence is not confirmed"
+                      {:type ::terminal-unconfirmed :job id})))
+    active))
+
+(defn- perform-stage! [{:keys [id room before-finish settled state] :as owner} stage]
+  (let [{:keys [status value error opts]} (:outcome @state)]
+    ;; The execution context may be destroyed by adapter retirement. All
+    ;; lifecycle/cleanup callbacks use the surviving control Room context.
+    (binding [ec/*execution-context* (:ctx room)]
+      (case stage
+        :before-finish (when before-finish (before-finish id status (or error value)))
+        :persist (do (run/retain-finished! id status opts) (retained-run! owner))
+        :settled (when settled (settled status (or error value)))
+        :release (when (some #(= id (:run/id %)) (run/active-runs (:id room)))
+                   (retained-run! owner)
+                   (run/release-finished! id))))))
+
+(defn- drive-finish! [{:keys [id done state] :as owner}]
+  (loop []
+    (let [stage (:stage @state)]
+      (if (= :done stage)
+        (do
+          ;; No Room/context access follows release of the active Run lease.
+          (reset! state {:phase :done})
+          (swap! live dissoc id)
+          (deliver done true)
+          {:id id :settled? true})
+        (let [failure (try (perform-stage! owner stage) nil (catch Throwable error error))]
+          (if failure
+            (do
+              ;; Keep the original callbacks/outcome private in this existing
+              ;; Job owner. Every failed attempt gets a distinct recovery token.
+              (swap! state assoc :phase :held :error failure :token (random-uuid))
+              (tel/log! {:level :warn :id ::cleanup-held
+                         :data {:job id :stage stage :error (error-message failure)}}
+                        "Job cleanup requires explicit HOST recovery")
+              {:id id :settled? false :cleanup-required? true :cleanup-stage stage})
+            (do (swap! state assoc :stage (get next-stage stage)) (recur))))))))
+
+(defn- finish-owned! [{:keys [state] :as owner} status value error reason]
+  (let [opts (cond-> {:now (java.util.Date.)}
+               error (assoc :error (ex-info (error-message error) {}))
+               reason (assoc :reason reason))]
+    (reset! state {:phase :finishing :stage :before-finish
+                   :outcome {:status status :value value :error error :opts opts}})
+    (drive-finish! owner)))
+
+(defn recovery-state
+  "HOST-only exact held-stage locator. Not a tool or SCI capability. Callers
+   reconcile the original native operation before retrying or acknowledging it;
+   tokens are coordination data, not authorization or proof of cleanup."
+  [id]
+  (when-let [state (:state (get @live id))]
+    (let [current @state]
+      (when (= :held (:phase current)) (select-keys current [:stage :token])))))
+
+(defn recover!
+  "HOST-only recovery of this process's original Job owner. EXPECTED is the
+   exact recovery-state read after native reconciliation. ACTION is :retry
+   (only if safe to repeat that failed callback) or :acknowledge (HOST attests
+   that stage's physical outcome, without calling it again). Successful stages
+   never repeat. No timers, new execution or recovery from replacement Rooms."
+  [id expected action]
+  (when (simple/on-drain-thread?)
+    (throw (ex-info "Job recovery requires a HOST worker thread" {:type ::engine-thread})))
+  (when-not (#{:retry :acknowledge} action)
+    (throw (ex-info "Invalid Job recovery action" {:type ::invalid-recovery})))
+  (let [{:keys [state] :as owner} (get @live id)
+        current (when state @state)]
+    (when-not (and state (= :held (:phase current))
+                   (= expected (select-keys current [:stage :token]))
+                   (compare-and-set! state current (-> current (assoc :phase :finishing) (dissoc :token :error))))
+      (throw (ex-info "Job cleanup recovery does not own this held stage"
+                      {:type ::stale-recovery :job id})))
+    (try
+      (when (= :acknowledge action)
+        ;; A persistence acknowledgement cannot invent the retained Run lease.
+        (when (= :persist (:stage current)) (retained-run! owner))
+        (when (and (= :release (:stage current))
+                   (some #(= id (:run/id %)) (run/active-runs (:id (:room owner)))))
+          (throw (ex-info "Job execution lease release is not confirmed"
+                          {:type ::release-unconfirmed :job id})))
+        (swap! state assoc :stage (get next-stage (:stage current))))
+      (drive-finish! owner)
+      (catch Throwable error
+        (swap! state assoc :phase :held :error error :token (random-uuid))
+        (throw error)))))
+
 (defn start!
-  "Start `(work job-id)`, a Spin, in `room` as a job and return the job at
-   once. The job is a durable Run of `kind` (one of `kinds`), stored before
-   `work` is called; pass its id to the evaluations `work` starts as their
-   `:parent-run`. `:parent` makes the job itself a child Run (a sub-experiment
-   of the Run that started it); `:actor` is who starts it, its owner (default
-   `:dvergr`, the process); `:ctx` is the context `work`'s Spin runs in
-   (default `room`'s, where the job Run is stored). `finish`, a fn of the
-   Spin's value, runs before the Run completes; `reason-of`, a fn of the
-   value, the reason a completed Run records (a keyword, or nil); `settled`, a
-   fn of the final status and the value (or the error), after it has settled,
-   whatever the outcome. `before-finish`, a host fn of job-id/status/value,
-   joins physical cleanup and returns delegated resources BEFORE the Run
-   terminalizes. It also runs when synchronous work construction fails."
+  "Start `(work job-id)`, a Spin, as one durable Job Run. Work construction is
+   synchronous, then its monitor waits off the engine drain. `:before-finish`
+   joins physical work/returns resources before terminal persistence. `:settled`
+   retires adapters after terminal persistence while the Run's execution lease
+   is still held. Callbacks run under the control Room context, even when :ctx
+   names a separate work context. Cleanup failure retains this Job owner and
+   its active lease until explicit HOST recovery; :settled? remains false.
+   :parent names a parent Run and :actor the owner (default :dvergr). `finish`
+   observes the work value; `reason-of` supplies an optional reason keyword."
   [room {:keys [kind parent ctx actor]} work & {:keys [finish settled reason-of before-finish]}]
   (when-not (contains? kinds kind)
     (throw (ex-info "Unknown job kind" {:type ::unknown-kind :kind kind :kinds kinds})))
@@ -88,77 +189,39 @@
             (run/start! room (or actor :dvergr) (random-uuid) nil
                         (cond-> {:kind kind} parent (assoc :parent parent))))
         id (:run/id r)
-        done (promise)
-        finish-boundary (fn [status value]
-                          (when before-finish
-                            (binding [ec/*execution-context* ctx]
-                              (before-finish id status value))))]
-    (swap! live assoc id {:room room :done done})
+        owner {:id id :room room :done (promise) :state (atom {:phase :working})
+               :before-finish before-finish :settled settled}]
+    (swap! live assoc id owner)
     (try
       (let [spin (binding [ec/*execution-context* ctx] (work id))]
         (run/register-cancel-hook! id ::spin
                                    #(binding [ec/*execution-context* ctx]
                                       (spin-core/cancel-spin! spin)))
         (threads/future
-          ;; A future conveys its caller's bindings; a job started from
-          ;; inside a Spin (a sub-experiment) must not look like a drain.
-          (binding [simple/*in-drain?* false
-                    ec/*spin-id* nil]
-            (let [value (volatile! nil)
-                  [status error]
+          (binding [simple/*in-drain?* false ec/*spin-id* nil]
+            (let [[status value error reason]
                   (try
-                    (let [v (binding [ec/*execution-context* ctx] @spin)]
-                      (vreset! value v)
-                      (when finish (finish v))
-                      [:completed nil])
-                    (catch Throwable t
+                    (let [value (binding [ec/*execution-context* ctx] @spin)]
+                      (when finish (finish value))
+                      [:completed value nil (when reason-of (reason-of value))])
+                    (catch Throwable error
                       (if (run/cancel-requested? id)
-                        [:cancelled nil]
-                        (do (tel/log! {:level :warn :id ::failed
-                                       :data {:job id :kind kind :error (ex-message t)}}
-                                      "Job failed")
-                            [:failed t]))))]
-              (let [boundary-error (try (finish-boundary status (or error @value)) nil
-                                        (catch Throwable t t))
-                    status (if boundary-error :failed status)
-                    error (or boundary-error error)]
-                (try
-                  (binding [ec/*execution-context* ctx]
-                    (run/finish! id status (cond-> {}
-                                             error (assoc :error error)
-                                             (and reason-of (= :completed status))
-                                             (merge (when-let [r (reason-of @value)] {:reason r})))))
-                  (catch Throwable t
-                    (tel/log! {:level :error :id ::finish-failed
-                               :data {:job id :status status :error (ex-message t)}}
-                              "Job Run could not be finished")))
-                (when settled
-                  (try (settled status (or error @value))
-                       (catch Throwable t
-                         (tel/log! {:level :warn :id ::settled-failed
-                                    :data {:job id :error (ex-message t)}}
-                                   "Job settled callback failed"))))
-              ;; a waiter (`status` with wait-ms) is released once the job
-              ;; has settled too: a host that then closes the job's stores
-              ;; must not pull them from under `settled`
-                (swap! live dissoc id)
-                (deliver done true))))))
-      (catch Throwable t
-        ;; `work` itself failed (validation, say): the Run must not stay open.
-        ;; Work construction can fail after allocating a wallet. Apply the
-        ;; same physical cleanup boundary as asynchronous completion.
-        (let [boundary-error (try (finish-boundary :failed t) nil (catch Throwable e e))]
-          (binding [ec/*execution-context* ctx]
-            (run/finish! id :failed {:error (or boundary-error t)})))
-        (swap! live dissoc id)
-        (deliver done true)
-        (throw t)))
+                        [:cancelled nil nil nil]
+                        [:failed nil error nil])))]
+              (finish-owned! owner status value error reason)))))
+      (catch Throwable error
+        ;; No monitor owns synchronous construction failure. The SAME staged
+        ;; owner joins cleanup and adapter retirement exactly once here.
+        (finish-owned! owner :failed nil error nil)
+        (throw error)))
     (job room r)))
 
 (defn status
   "The job `id` (its Run's id), waiting up to `wait-ms` (capped at
    `max-wait-ms`) for it to finish; nil for an unknown id. Also returns the
-   room it is stored in (`:room-value`) for callers that read its results."
+   room it is stored in (`:room-value`) for callers that read its results.
+   Held native cleanup reports :cleanup-required? and a stage keyword; private
+   errors, callbacks, outcome handles and recovery tokens are not projected."
   ([id] (status id 0))
   ([id wait-ms]
    (when-let [room (job-room id)]
@@ -166,9 +229,13 @@
        (when-let [done (get-in @live [id :done])]
          (deref done (min max-wait-ms (long wait-ms)) nil)))
      (let [r (binding [ec/*execution-context* (:ctx room)] (run/run room id))]
-       ;; `:settled?`: its Run is over and so is its `settled` callback
-       ;; (until then the job is live here, however its Run reads)
-       (some-> (job room r) (assoc :room-value room :settled? (not (contains? @live id))))))))
+       ;; Terminal persistence alone is insufficient: the retained lease and
+       ;; this owner remain until every native cleanup stage acknowledges.
+       (let [current (some-> (get @live id) :state deref)]
+         (some-> (job room r)
+                 (assoc :room-value room :settled? (not (contains? @live id)))
+                 (cond-> (= :held (:phase current))
+                   (assoc :cleanup-required? true :cleanup-stage (:stage current)))))))))
 
 (defn cancel!
   "Stop the job `id`: request cancellation of its Run, which stops its work
