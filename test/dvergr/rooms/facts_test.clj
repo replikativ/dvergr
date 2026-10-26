@@ -32,8 +32,6 @@
          (rreg/register! ~sym)
          ~@body)
        (finally
-         (try (binding [ec/*execution-context* (:ctx ~sym)] (rreg/unregister! (:id ~sym)))
-              (catch Throwable _# nil))
          (d/close-room! ~sym)))))
 
 (defn- version [room]

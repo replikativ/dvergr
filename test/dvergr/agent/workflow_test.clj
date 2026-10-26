@@ -60,7 +60,6 @@
                 (is (every? #(nil? (rreg/lookup %)) (map :world rows))
                     "no attempt world is left open"))))))
       (finally
-        (try (binding [ec/*execution-context* (:ctx room)] (rreg/unregister! (:id room))) (catch Throwable _ nil))
         (d/close-room! room)))))
 
 (deftest the-op-returns-the-table-and-the-way-to-adopt
@@ -90,7 +89,6 @@
               (is (= a (:merged (ops/invoke {:execution-ctx (:ctx room)} dvergr.principal/local-principal :room/merge {:room a}))))
               (is (= {:discarded b} (ops/invoke {:execution-ctx (:ctx room)} dvergr.principal/local-principal :room/discard {:room b})))))))
       (finally
-        (try (binding [ec/*execution-context* (:ctx room)] (rreg/unregister! (:id room))) (catch Throwable _ nil))
         (d/close-room! room)))))
 
 (deftest bounds-are-enforced
@@ -110,8 +108,6 @@
        (binding [ec/*execution-context* (:ctx ~sym)] (rreg/register! ~sym))
        ~@body
        (finally
-         (try (binding [ec/*execution-context* (:ctx ~sym)] (rreg/unregister! (:id ~sym)))
-              (catch Throwable _# nil))
          (d/close-room! ~sym)))))
 
 (deftest a-workflow-runs-as-a-job-a-client-polls
@@ -216,7 +212,6 @@
           (doseq [fork (rreg/list-rooms)
                   :when (= (:id room) (:forked-from @(:meta fork)))]
             (d/discard fork)))
-        (try (binding [ec/*execution-context* (:ctx host)] (rreg/unregister! (:id room))) (catch Throwable _ nil))
         (d/close-room! room)
         (d/close-room! host)))))
 
