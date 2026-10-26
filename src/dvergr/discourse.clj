@@ -1182,7 +1182,7 @@
 
 (defn- drain-room-runs!
   "Request cancellation of every live Run owned by `room` and wait up to five
-   seconds for their executors to acknowledge a terminal state. The lifecycle
+   seconds for their executors to release their execution leases. The lifecycle
    watch is installed before cancellation so the final transition cannot race
    the wait. This covers LLM turns and directly interpreted agent programs."
   [room]
