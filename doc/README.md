@@ -1,3 +1,5 @@
+On `next`, only [specification.md](specification.md) is current; the other pages describe `main`.
+
 # dvergr Documentation
 
 New to dvergr? Start with **[Getting Started](getting-started.md)**.

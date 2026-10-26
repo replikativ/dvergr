@@ -1,3 +1,5 @@
+> Branch `next` holds the core rewrite against [doc/specification.md](doc/specification.md). The released implementation is on `main`.
+
 # ⚒️ dvergr
 
 [![Clojars Project](https://img.shields.io/clojars/v/org.replikativ/dvergr.svg)](https://clojars.org/org.replikativ/dvergr)

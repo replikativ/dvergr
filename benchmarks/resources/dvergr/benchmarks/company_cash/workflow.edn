@@ -1,6 +1,0 @@
-{:title "Company cash: model a small company's receivables and plan eight weeks"
- :doc "A synthetic small software company's documents: eighteen months of invoices with the collection action taken on each, the bank statement, and recent notes and emails. The agent builds a model of how each customer pays and what reminders, calls and factoring change, reads the notes for what the history does not yet show, chooses one action per open invoice under a ruin limit, and forecasts payments and cash. Scored against the case's hidden true world: the decision's share of the best found plan's gain, the Brier skill of the payment forecasts and the quantile skill of the cash forecast, each between a pooled baseline and the truth. Synthetic scenario, not market data."
- :task "Read /inputs/brief.md, then /inputs/terms.edn, /inputs/invoices.csv, /inputs/bank.csv and /inputs/notes.md. Build a model of the company's receivables and cash, decide one action per open invoice, and forecast. Write /out/answer.edn as described in the brief, early and then improved: only the answer present when you stop is scored. Put your model under /out/model/ and your reasoning in /out/rationale.md. Do not browse or contact anyone."
- :capture ["/out"]
- :outputs ["/out/answer.edn"]
- :score-on-timeout true}

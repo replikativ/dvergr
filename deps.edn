@@ -1,347 +1,52 @@
-{:paths ["src" "resources"]
+{:paths ["src"]
 
- :deps {org.clojure/clojure       {:mvn/version "1.12.5"}
-
-        ;; HTTP client for provider APIs
-        hato/hato                  {:mvn/version "1.0.0"}
-        ;; document processing (dvergr.media.doc — pdf text extraction)
-        org.apache.pdfbox/pdfbox   {:mvn/version "3.0.3"}
-        org.jsoup/jsoup           {:mvn/version "1.22.1"}
-
-        ;; JSON encoding/decoding
-        metosin/jsonista           {:mvn/version "0.3.8"}
-
-        ;; Schema validation
-        metosin/malli              {:mvn/version "0.16.4"}
-
-        ;; File system utilities
-        babashka/fs                {:mvn/version "0.5.21"}
-
-        ;; Time handling
-        clojure.java-time/clojure.java-time {:mvn/version "1.4.2"}
-
-        ;; ANSI colors for REPL output
-        io.aviso/pretty            {:mvn/version "1.4.4"}
-
-        ;; Async utilities
-        org.clojure/core.async     {:mvn/version "1.6.681"}
-
-        ;; SCI — Small Clojure Interpreter for sandboxing. The replikativ build
-        ;; carries forkable interpreter worlds while sci#1084 is upstreamed;
-        ;; replikativ.5 preserves the :static-methods value-path fix
-        ;; (sci#1118) alongside the merge-opts permission fix (sci#1119).
-        org.replikativ/sci         {:mvn/version "0.15.59-replikativ.5"}
-
-        ;; Dvergr uses the async sequence/CPS namespaces directly; keep this a
-        ;; direct dependency instead of relying on Spindel's implementation deps.
-        ;; partial-cps moved to org.replikativ (namespaces unchanged:
-        ;; is.simm.partial-cps.*). Every released dependency now depends on it;
-        ;; only the :local checkouts below still exclude the old is.simm jar,
-        ;; for checkouts that predate the move.
+ :deps {org.clojure/clojure {:mvn/version "1.12.5"}
+        ;; Native checkpoints, construction recovery and reactive lifetimes.
+        org.replikativ/spindel {:mvn/version "0.1.148"}
+        ;; Forkable worlds; static-methods value paths and merge-opts permissions.
+        org.replikativ/sci {:mvn/version "0.15.59-replikativ.5"}
+        ;; Direct CPS dependency; published under org.replikativ, namespaces unchanged.
         org.replikativ/partial-cps {:mvn/version "0.1.69"}
-
-        ;; Spindel — Reactive runtime with CoW forking.
-        ;; 0.1.35 (#27 lost-wakeup redesign + follow-ups): continuation
-        ;; failures reject the owning spin (spawn!/supervisor observe
-        ;; them), one-shot waiter handoffs run as :cont-resume events
-        ;; with a transactional pop+enqueue, engine-wide fault hook
-        ;; (engine.fault/set-fault-reporter!). Forks inherit NO events —
-        ;; an event is delivered in exactly one world; in-flight mailbox
-        ;; claims are undone in the fork (spindel#30, fixes the
-        ;; duplicate room-log writes 0.1.31 caused in hire!). Node-record
-        ;; invariant enforced at field-write sites (spindel#31/#32).
-        ;; Pubsub buffers are atom-backed (spindel#34/#35): the JVM
-        ;; LinkedList buffers were a cross-thread data race that could
-        ;; silently lose one delivery in exactly OUR bus topology
-        ;; (mailbox→mult→tap→pub→topic-mult→tap) under load.
-        ;; Substrate for the durable-cursor bus pump + supervisor
-        ;; restart.
-        ;; 0.1.44 includes structured work admission, cancellation hand-back,
-        ;; canonical inference worlds, and forkable SCI world components.
-        ;; 0.1.48 adds falsey deferred values (#50), spawn success
-        ;; observation (#49), reusable affine world scopes (#51), and seeded
-        ;; inference draws with correct MCMC replay (#54).
-        ;; 0.1.49 adds world-backed finite MCTS (`spindel.search.mcts`, #52).
-        ;; 0.1.52 fixes overlay tombstones reviving as {} instead of nil in a
-        ;; fork (#53): a reaped spin node re-registered under the same id threw
-        ;; at settlement and left the room unable to heal.
-        ;; 0.1.53 adds savepoints, traces and replay, portable savepoints, a
-        ;; resource authority on world.scope, pinned components; MCMC on traces;
-        ;; pubsub pulls from the first demand (`start-mult!`/`start-pub!` for
-        ;; buffer-only taps); needs partial-cps 0.1.63 (lost-continuation fixes).
-        ;; 0.1.54 signals an access to a runtime atom, deferred or mailbox from
-        ;; a world with no state for it (`spindel.missing-state`; the tests throw).
-        ;; 0.1.85: settlement by intent (`register!` :intents/:stamp/
-        ;; :parent-footprint; merge-fork!, copy families and checkpoint!
-        ;; replay a room's :book instead of merging datoms), and review sees
-        ;; intents and the parent's claims; inference measures of pure
-        ;; particles hold Samples (read worlds via `measure/world-descriptors`).
-        ;; 0.1.88: every inference method runs on savepoints, :world-policy
-        ;; :fork included (the coordinator is retired): each canonical
-        ;; particle runs the whole model in a fork of the caller's world; a
-        ;; particle's slot is [:inference :slot]. world.scope/copy! splits a
-        ;; world's budget between copies.
-        ;; 0.1.89: canonical particles are copies of worlds; 0.1.90: effect
-        ;; adapters as functions (foerster's effects in ClojureScript).
-        ;; 0.1.96: trace :until and replay :seed, O(log n) world release,
-        ;; runs release what they held (resample-move SMC).
-        ;; 0.1.106: awaiting a queued mailbox message or an assigned deferred
-        ;; no longer nests a trampoline per iteration (a work/parallel runner
-        ;; with a backlog died of StackOverflowError and hung its completion);
-        ;; a dead work runner fails its completion.
-        ;; 0.1.107: a body started inside another body (spawn!, an inline
-        ;; executor's child, a generator step) runs in its own trampoline, so
-        ;; its loop no longer stops at the first synchronous await.
-        ;; 0.1.110/0.1.111: cancellation is claimed exactly once. A spin that
-        ;; parks while it is cancelled is rejected (#116, a cancelled job
-        ;; stayed :running); child awaits, inline child completion and a
-        ;; directly cancelled race no longer strand or double-run their
-        ;; continuations (#118).
-        ;; 0.1.113: SCI code gets an opaque name for its world, not the
-        ;; ExecutionContext; clojure.lang.Var/Namespace are closed classes;
-        ;; bound-fn runs in the fork it is called in (#121).
-        ;; Nil-grant authority initialization is required, including forks of
-        ;; plain Room contexts, source-preserving failed-copy recovery, and
-        ;; independent Sessions at fork creation (spindel#145/#146).
-        ;; Reviewed staged-interpreter publication API (Spindel PR #147).
-        ;; Historical savepoint forks own isolated workspaces; settlement joins
-        ;; native overlay disposal. 0.1.148 adds exact native checkpoint
-        ;; admission, construction recovery and reactive lifetime corrections.
-        org.replikativ/spindel     {:mvn/version "0.1.148"}
-        ;; probabilistic inference in forkable worlds, split out of spindel:
-        ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
-        ;; 0.1.45: savepoint inference throughout, resample-move, tempering,
-        ;; SMCP3, barrier factors and foerster.steer (infer/steer).
-        ;; 0.1.100: foerster.sandbox (the :foerster/inference extension) and
-        ;; :seed for Markov-chain kernels.
-        ;; 0.1.114: particle MCMC, exact enumeration and PMMH in foerster.sandbox, foerster.core's
-        ;; re-exported effects, the current distributions; MIT licence.
-        org.replikativ/foerster    {:mvn/version "0.1.114"}
-
-        ;; muschel — bash → AST → safely runnable shell.
-        ;; muschel.session.spindel is fork-aware via spindel/fork-context
-        ;; so a forked chat-ctx gets an isolated muschel session
-        ;; (jobs, cd, env) for free.
-        ;; 0.2.18 is the release that carries the Geschichte-workspace mount
-        ;; API this branch's agent workspaces are built on (isolated worktrees,
-        ;; checkout semantics delegated to Geschichte, Git served from a virtual
-        ;; GeschichteFS base) — so no local root is needed to build it.
-        org.replikativ/muschel     {:mvn/version "0.2.19"
-                                    :exclusions  [org.babashka/sci]}
-
-        ;; Geschichte — authoritative virtual filesystem + Git compatibility.
-        ;; Geschichte remains the authoritative virtual filesystem; its
-        ;; Yggdrasil adapter lives only in Yggdrasil.
-        ;; 0.1.22 binds prepared publication to an exact transaction basis and
-        ;; physical workspace, for atomic commit/ref/application receipts.
-        org.replikativ/geschichte  {:mvn/version "0.1.25"}
-
-        ;; rewrite-clj for structural editing
-        rewrite-clj/rewrite-clj    {:mvn/version "1.1.48"}
-
-        ;; Datahike — persistent Datalog storage
-        ;; Keep the direct dependency current: Dvergr uses Datahike's API and
-        ;; transaction predicates itself, not merely through Geschichte.
-        ;; Released listener-ACK fix (Datahike #1120, merged ee3e066c).
-        ;; A throwing observer must not strand an already committed publication.
-        org.replikativ/datahike    {:mvn/version "0.8.1910"}
-        ;; 0.1.37 provides conserved resource vectors, durable receipts, and
-        ;; mandatory Datahike invariants for Run resource delegation.
-        ;; 0.1.38 settles a world's book by replay (ADR-172, `kontor.settlement`):
-        ;; the room's :book system (dvergr.substrate.kontor-book).
-        ;; 0.1.40 exposes canonical resource account identities without loading
-        ;; database initialization into model/gateway-only clients.
-        org.replikativ/kontor      {:mvn/version "0.1.40"}
-
-        ;; Yggdrasil — CoW branching for git and Datahike
-        ;; 0.3.46 merges a diverged Geschichte overlay three-way (#24): a fork
-        ;; whose parent gained a commit meanwhile merges instead of fencing.
-        ;; Independent owned cleanup leases (#30) let copied sibling overlays
-        ;; settle after their temporary source branch has already been disposed.
-        ;; 0.3.52 delegates exact checkpoint allocation to Geschichte and
-        ;; validates portable checkpoint origins before native allocation.
-        org.replikativ/yggdrasil   {:mvn/version "0.3.52"
-                                    :exclusions  [org.babashka/sci]}
-
-        ;; Scriptum — CoW Lucene indices for fulltext search
-        org.replikativ/scriptum    {:mvn/version "0.1.32"}
-
-        ;; Briefkasten (local IMAP mirror) is OPTIONAL — it backs dvergr.intake.mail
-        ;; only, and pulls the jakarta-mail tree, so it lives in the
-        ;; :dev/:test/:cli/:tui aliases (with clojure-mail), not core.
-
-        ;; Dvergr derives stable activity and environment identities directly.
-        ;; Match Datahike's current array-hashing implementation.
-        org.replikativ/hasch       {:mvn/version "0.4.104"}
-        ;; Dvergr's drive blob store uses Konserve directly. Keep this aligned
-        ;; with Datahike rather than relying on Datahike's transitive API.
-        org.replikativ/konserve    {:mvn/version "0.9.394"}
-
-        ;; tools.analyzer for code indexing
-        org.clojure/tools.analyzer.jvm {:mvn/version "1.3.0"}
-
-        ;; Paren repair utilities (from clojure-mcp, EPL-2.0)
-        borkdude/edamame           {:mvn/version "1.5.35"}
-        org.clojars.oakes/parinfer {:mvn/version "0.4.0"}
-
-        ;; (dvergr.intake.mail's deps — clojure-mail + briefkasten — are OPTIONAL,
-        ;; in the :dev/:test/:cli/:tui aliases; see the note above. postal was a
-        ;; dead dep and has been dropped entirely.)
-
-        ;; HTTP-kit for Kabel WebSocket server + dvergr web dashboard
-        http-kit/http-kit          {:mvn/version "2.8.0"}
-
-        ;; Hiccup for HTML generation (dashboard + agent web UIs; also the SCI
-        ;; sandbox's dev ns, so it's core). NOTE: reitit (the spec-derived JSON
-        ;; HTTP API) is web-client-only → it lives in the :dev/:test/:cli/:tui
-        ;; aliases, not here, so library consumers don't pull its tree.
-        hiccup/hiccup              {:mvn/version "2.0.0"}
-
-        ;; Structured logging
-        com.taoensso/telemere      {:mvn/version "1.2.1"}
-        ;; dvergr.substrate.log configures timbre (routed to telemere). It
-        ;; arrived transitively through spindel → anglican until inference
-        ;; moved to foerster; the version it resolved to then.
-        com.taoensso/timbre        {:mvn/version "4.10.0"}
-
-        ;; katzen (Catlab/GATlab port) — the shared categorical schema
-        ;; substrate: the KB + Clojure-code ACSet schemas live in
-        ;; katzen.schema.* and dvergr binds them (dvergr.kb.schema,
-        ;; dvergr.code.index). katzen core is zero-dep; the datahike backend
-        ;; reuses dvergr's datahike.
-        org.replikativ/katzen      {:mvn/version "0.1.11"}}
+        ;; Exact Geschichte checkpoints and portable checkpoint origin validation.
+        org.replikativ/yggdrasil {:mvn/version "0.3.52"
+                                  :exclusions [org.babashka/sci]}
+        ;; Listener ACK fix: a throwing observer cannot strand a committed publication.
+        org.replikativ/datahike {:mvn/version "0.8.1910"}
+        ;; Keep the direct blob-store dependency aligned with Datahike.
+        org.replikativ/konserve {:mvn/version "0.9.394"}
+        ;; Canonical resource account identities without database initialization.
+        org.replikativ/kontor {:mvn/version "0.1.40"}
+        ;; Authoritative virtual filesystem and Git; exact-basis publication.
+        org.replikativ/geschichte {:mvn/version "0.1.25"}
+        com.taoensso/telemere {:mvn/version "1.2.1"}}
 
  :aliases
- ;; :dev, :test, :benchmarks, :repl and :cli cap the heap, so those JVMs
- ;; cannot grow to the JVM's default (a quarter of RAM) beside other JVMs on a
- ;; shared machine. Other aliases and plain invocations are not capped. An
- ;; explicit -J-Xmx on the command line still wins.
- {:dev  {:extra-paths ["dev" "test" "src-clients"
-                       "benchmarks/src" "benchmarks/resources" "benchmarks/test"]
-         :jvm-opts    ["-Xmx3g"]
-         :extra-deps  {nrepl/nrepl          {:mvn/version "1.3.0"}
-                       cider/cider-nrepl    {:mvn/version "0.50.2"}
-                       clj-kondo/clj-kondo  {:mvn/version "2026.04.15"}
-                       metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
-                       io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
-                       org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
-                       org.replikativ/spindel-tui {:mvn/version "0.1.14"}
-                       org.replikativ/pg-datahike {:mvn/version "0.1.319"}
-                       org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
-                       org.replikativ/rechentafel {:mvn/version "0.1.11"} ; SpreadsheetBench
-                       org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}}}
+ {:test {:extra-paths ["test"]
+         :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                      lambdaisland/kaocha-junit-xml {:mvn/version "1.17.101"}
+                      org.clojure/test.check {:mvn/version "1.1.1"}}
+         ;; Cross-world state access must fail instead of merely warning.
+         :jvm-opts ["-Xmx1500m" "-Dspindel.missing-state=throw"]
+         :main-opts ["-m" "kaocha.runner"]}
 
-  ;; src-clients/ on the test path so dvergr.web.server-test still
-  ;; loads the namespaces it tests.
-  ;; The benchmark providers (benchmarks/, their own artefact) are tested
-  ;; with the rest: they are the widest integration test of the evaluation path.
-  :test {:extra-paths ["test" "src-clients"
-                       "benchmarks/src" "benchmarks/resources" "benchmarks/test"]
-         :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}
-                       lambdaisland/kaocha-junit-xml {:mvn/version "1.17.101"} ; CI: test results and split timings
-                       metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
-                       io.forward/clojure-mail {:mvn/version "1.0.8"} ; mail intake
-                       org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
-                       org.replikativ/spindel-tui {:mvn/version "0.1.14"}
-                       org.replikativ/pg-datahike {:mvn/version "0.1.319"}
-                       org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
-                       org.replikativ/rechentafel {:mvn/version "0.1.11"} ; SpreadsheetBench
-                       org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}
-                       org.clojure/test.check {:mvn/version "1.1.1"}} ; laws (effects algebra)
-         ;; State touched from another world (e.g. a control room's context)
-         ;; fails the test instead of warning; see spindel's missing-state-mode.
-         ;; Tests' temporary files go to target/test-tmp, emptied after the run
-         ;; (dvergr.test-tmp), not to /tmp.
-         :jvm-opts    ["-Xmx3200m" "-Dspindel.missing-state=throw" "-Djava.io.tmpdir=target/test-tmp"]
-         :main-opts   ["-m" "kaocha.runner"]}
+  :repl {:extra-deps {nrepl/nrepl {:mvn/version "1.3.0"}}
+         :jvm-opts ["-Xmx1500m"]
+         :main-opts ["-m" "nrepl.cmdline" "--interactive"]}
 
-  ;; The benchmarks (`dvergr.benchmarks.*`: tau2, BFCL, the coding, discovery
-  ;; and market-evidence fixtures). Not on the
-  ;; default path and not in the dvergr jar: they ship as
-  ;; org.replikativ/dvergr-benchmarks (`clj -T:build benchmarks-jar`), or as a
-  ;; git dep with `:deps/root "benchmarks"`. See benchmarks/README.md.
-  :benchmarks {:extra-paths ["benchmarks/src" "benchmarks/resources"]
-               :jvm-opts ["-Xmx3g"]
-               ;; BIRD: SQLite (the gold) and SQL over Datahike
-               :extra-deps {org.replikativ/pg-datahike {:mvn/version "0.1.319"}
-                            org.xerial/sqlite-jdbc {:mvn/version "3.50.3.0"}
-                       org.replikativ/rechentafel {:mvn/version "0.1.11"} ; SpreadsheetBench
-                       org.apache.poi/poi-ooxml {:mvn/version "5.5.1"} org.apache.poi/poi-ooxml-full {:mvn/version "5.5.1"}}}
-
-  :repl {:jvm-opts ["-Xmx3g"]
-         :main-opts ["-m" "nrepl.cmdline"
-                     "--middleware" "[cider.nrepl/cider-middleware]"
-                     "--interactive"]}
-
-  ;; Web dashboard + JSON API deps. These are NOT in :deps (the web layer is
-  ;; optional for library consumers), so a plain `-M:local` daemon boots HEADLESS.
-  ;; Combine this alias to get the dashboard, e.g. `-M:local:web` for a REPL or
-  ;; `-M:local:web:repl`. (:cli/:dev/:test already bundle these.)
-  :web {:extra-deps {metosin/reitit-ring        {:mvn/version "0.7.2"}
-                     metosin/reitit-malli       {:mvn/version "0.7.2"}
-                     metosin/reitit-middleware  {:mvn/version "0.7.2"}
-                     metosin/reitit-swagger     {:mvn/version "0.7.2"}
-                     io.github.nextjournal/markdown {:mvn/version "0.7.222"}}}
-
-  ;; Drop back to sibling repos when opening upstream PRs.
-  ;; Also includes muschel — `:deps` pins the published version, but
-  ;; if you need to develop muschel-side fixes in parallel, activate
-  ;; this alias to override.
-  ;; datahike's pluggable secondary-index adapters (scriptum fulltext + proximum
-  ;; vector) live in a separate `src-secondary` root. The RELEASED jar ships them
-  ;; (config.edn build :src-dirs include src-secondary — verified in
-  ;; datahike-0.8.1708.jar), so the maven dep needs nothing extra. But a
-  ;; `:local/root "../datahike"` override uses datahike's DEFAULT :paths (which
-  ;; exclude src-secondary), so we add it here for the source-override dev path.
+  ;; Datahike's local default paths omit the secondary-index adapters.
+  ;; Older checkouts still depend on the former is.simm/partial-cps coordinate.
   :local {:extra-paths ["../datahike/src-secondary"]
-          :extra-deps {org.replikativ/sci         {:local/root "../sci"}
-                       org.replikativ/datahike    {:local/root "../datahike" :exclusions [is.simm/partial-cps]}
-                       org.replikativ/scriptum    {:local/root "../scriptum"}
-                       org.replikativ/yggdrasil   {:local/root "../yggdrasil" :exclusions [is.simm/partial-cps]}
-                       org.replikativ/spindel     {:local/root "../spindel" :exclusions [is.simm/partial-cps]}
-                       org.replikativ/spindel-tui {:local/root "../spindel-tui"}
-                       org.replikativ/muschel     {:local/root "../muschel"}}}
+          :extra-deps {org.replikativ/sci {:local/root "../sci"}
+                       org.replikativ/spindel {:local/root "../spindel"
+                                               :exclusions [is.simm/partial-cps]}
+                       org.replikativ/yggdrasil {:local/root "../yggdrasil"
+                                                 :exclusions [is.simm/partial-cps]}
+                       org.replikativ/datahike {:local/root "../datahike"
+                                                :exclusions [is.simm/partial-cps]}}}
 
-  ;; CLI: the user-facing entry. Starts daemon + nREPL + TUI.
-  ;; Equivalent to running dvergr.cli.main/-main directly (see that ns
-  ;; for flags: -p/--port, --no-tui, --help). Headless mode is
-  ;; possible via --no-tui; otherwise the TUI launches automatically
-  ;; because spindel-tui is on the classpath via this alias.
-  :cli {:extra-paths ["src-clients"]
-        :extra-deps  {org.replikativ/spindel-tui {:mvn/version "0.1.14"}
-                      metosin/reitit-ring {:mvn/version "0.7.2"} metosin/reitit-malli {:mvn/version "0.7.2"} metosin/reitit-middleware {:mvn/version "0.7.2"} metosin/reitit-swagger {:mvn/version "0.7.2"} io.github.nextjournal/markdown {:mvn/version "0.7.222"} ; web (reitit, sans swagger-ui — add reitit-swagger-ui for the /docs page)
-                      io.forward/clojure-mail    {:mvn/version "1.0.8"}    ; mail intake
-                      org.replikativ/briefkasten {:mvn/version "0.1.2"} ; briefkasten (mail)
-                      nrepl/nrepl                {:mvn/version "1.3.0"}}
-        :jvm-opts    ["-Xmx4g" "--enable-native-access=ALL-UNNAMED"]
-        :main-opts   ["-m" "dvergr.cli.main"]}
-
-  ;; Run a standalone example scenario (examples/ on the classpath).
-  ;;   clj -M:examples -m scenario-auditor
-  ;;   clj -X:examples humans-and-agents/run
-  :examples {:extra-paths ["examples" "benchmarks/src" "benchmarks/resources"]}
-
-  ;; Clay notebooks — render the literate notebooks (which import examples/) to
-  ;; browsable HTML (dev-only, never shipped).
-  ;;   clj -M:clay -m notebooks.render        ; build docs/notebooks/*.html
-  :clay {:extra-paths ["notebooks" "examples" "benchmarks/src" "benchmarks/resources"]
-         :extra-deps  {org.scicloj/clay   {:mvn/version "2.0.13"}
-                       org.scicloj/kindly {:mvn/version "4-beta23"}}}
-
-  ;; Formatting (cljfmt) — matches the replikativ convention (konserve/datahike).
-  ;;   clj -M:format   — check formatting (also run in CI)
-  ;;   clj -M:ffix     — fix formatting in place
   :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
-           :main-opts  ["-m" "cljfmt.main" "check" "src" "src-clients" "test" "examples"
-                        "benchmarks/src" "benchmarks/test"]}
-  :ffix   {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
-           :main-opts  ["-m" "cljfmt.main" "fix" "src" "src-clients" "test" "examples"
-                        "benchmarks/src" "benchmarks/test"]}
-
-  ;; Build tooling: library jar, harness uberjar, install, clojars deploy.
-  ;;   clj -T:build jar       — library jar + pom (org.replikativ/dvergr)
-  ;;   clj -T:build install   — install the library jar to ~/.m2
-  ;;   clj -T:build deploy    — deploy to Clojars (needs CLOJARS_USERNAME/PASSWORD)
-  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}
-                 slipset/deps-deploy           {:mvn/version "0.2.2"}}
-          :ns-default build}}}
+           :jvm-opts ["-Xmx1500m"]
+           :main-opts ["-m" "cljfmt.main" "check" "src" "test"]}
+  :ffix {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+         :jvm-opts ["-Xmx1500m"]
+         :main-opts ["-m" "cljfmt.main" "fix" "src" "test"]}}}

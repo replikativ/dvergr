@@ -1,25 +1,8 @@
 #kaocha/v1
-{:tests [{:id          :unit
-          :test-paths  ["test" "benchmarks/test"]
-          ;; Skip ^:integration tests by default — they make real Fireworks
-          ;; API calls and hang (or burn budget) without FIREWORKS_API_KEY.
-          ;; Opt in explicitly: clojure -M:test --focus-meta :integration
-          ;;
-          ;; Skip ^:security-open too — those are the sandbox-escape corpus
-          ;; entries that pin the SECURE spec of escapes still open (they FAIL
-          ;; until the owner-level fix lands, so they'd redden CI). Review the
-          ;; live escape status on demand:
-          ;;   clojure -M:test --focus-meta :security-open
-          :skip-meta   [:integration :security-open]}]
- ;; A bit more output during long runs so we can tell which ns is in flight.
- :reporter [kaocha.report/dots]
- ;; Tests write under java.io.tmpdir (target/test-tmp, see the :test alias);
- ;; dvergr.test-tmp creates it before the run and empties it after.
- :plugins [:kaocha.plugin/hooks :kaocha.plugin/profiling]
- ;; The profiling plugin prints the slowest namespaces and tests after the run.
- :kaocha.plugin.profiling/count 40
- ;; In CI, dvergr.test-split narrows the run to one container's namespaces.
- :kaocha.hooks/pre-load [dvergr.test-tmp/pre-load dvergr.test-split/pre-load
-                         dvergr.test-phases/pre-load]
- :kaocha.hooks/post-load [dvergr.test-phases/post-load]
- :kaocha.hooks/post-run [dvergr.test-phases/post-run dvergr.test-tmp/post-run]}
+{:tests [{:id :laws
+          :test-paths ["test/dvergr/laws"]}
+         {:id :adapters
+          :test-paths ["test/dvergr/adapters"]}
+         {:id :process
+          :test-paths ["test/dvergr/process"]}]
+ :reporter [kaocha.report/dots]}

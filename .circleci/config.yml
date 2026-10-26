@@ -1,12 +1,6 @@
 version: 2.1
 
-# CI for dvergr — runs the test suite and builds the standalone harness uberjar
-# (daemon + nREPL + TUI + web + Telegram). On `main` it cuts a GitHub release with
-# the uberjar attached, and (optionally) deploys the library jar to Clojars.
-#
-# Ported from ../stratum. The base deps.edn uses published Maven versions
-# (spindel/datahike/yggdrasil/muschel/…) + the SCI git dep, so CI resolves without
-# the dev-only :local alias; the SCI git dep is bundled into the uberjar.
+# CI for the core rewrite on next: formatting and all core test suites.
 
 commands:
   install-clojure:
@@ -29,7 +23,7 @@ executors:
     working_directory: ~/repo
     resource_class: large
     environment:
-      JVM_OPTS: "-Xmx3200m"
+      JVM_OPTS: "-Xmx1500m"
 
 jobs:
   setup:
@@ -44,12 +38,7 @@ jobs:
       - run:
           name: Download dependencies
           command: |
-            # Immutable Git dependencies can require Java interface preparation.
-            # Cache the prepared gitlibs as well as the downloaded dependencies.
-            clojure -X:deps prep
             clojure -P -M:test
-            clojure -P -M:cli
-            clojure -P -T:build
             clojure -P -M:format
       - save_cache:
           paths:
@@ -77,11 +66,6 @@ jobs:
 
   test:
     executor: clojure-java22
-    # The suite runs in parallel containers, each on its share of the test
-    # namespaces (CircleCI balances the shares by the timings of earlier
-    # runs). dvergr.test-split checks that the shares cover every test
-    # namespace, so nothing is skipped. One check, `test`, for all of them.
-    parallelism: 3
     steps:
       - attach_workspace:
           at: ~/
@@ -91,114 +75,12 @@ jobs:
             - v1-deps-
       - install-clojure
       - run:
-          # bin/dvergr-mcp (the MCP relay) is a babashka script: its tests
-          # skip without bb
-          name: Install babashka 1.12.200
-          command: |
-            curl -sSL -o /tmp/bb.tar.gz \
-              https://github.com/babashka/babashka/releases/download/v1.12.200/babashka-1.12.200-linux-amd64-static.tar.gz
-            sudo tar -xzf /tmp/bb.tar.gz -C /usr/local/bin bb
-            bb --version
-      - run:
-          # the dashboard's service worker (dvergr-sw.js) is tested under
-          # node: without it that test makes no assertion and fails
-          name: Install node 22.12.0
-          command: |
-            curl -sSL -o /tmp/node.tar.xz \
-              https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz
-            sudo tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 node-v22.12.0-linux-x64/bin/node
-            node --version
-      - run:
-          name: Run tests (kaocha), this container's share of the namespaces
-          command: |
-            mkdir -p target/test-split test-results/kaocha
-            .circleci/test-namespaces.sh > target/test-split/all.txt
-            circleci tests split --split-by=timings --timings-type=classname \
-              target/test-split/all.txt > target/test-split/mine.txt
-            DVERGR_TEST_ALL_NAMESPACES=target/test-split/all.txt \
-            DVERGR_TEST_NAMESPACES=target/test-split/mine.txt \
-              clojure -M:test --plugin kaocha.plugin/junit-xml \
-                --junit-xml-file test-results/kaocha/results.xml
-          # The dots reporter may produce no newline while a compilation-heavy
-          # namespace runs. Keep CircleCI's inactivity watchdog above the
-          # suite's bounded test waits; assertion failures still exit normally.
-          no_output_timeout: 20m
-      - store_test_results:
-          path: test-results
-
-  build-harness:
-    executor: clojure-java22
-    steps:
-      - attach_workspace:
-          at: ~/
-      - restore_cache:
-          keys:
-            - v1-deps-{{ checksum "deps.edn" }}
-            - v1-deps-
-      - install-clojure
-      - run:
-          name: Build standalone harness uberjar
-          command: clojure -T:build harness
-      - store_artifacts:
-          path: target
-      - persist_to_workspace:
-          root: ~/
-          paths:
-            - repo/target
-
-  deploy:
-    executor: clojure-java22
-    steps:
-      - attach_workspace:
-          at: ~/
-      - restore_cache:
-          keys:
-            - v1-deps-{{ checksum "deps.edn" }}
-            - v1-deps-
-      - install-clojure
-      - run:
-          name: Deploy library jar and benchmarks jar to Clojars
-          command: |
-            if [ "${CIRCLE_BRANCH}" = "main" ] && [ -n "${CLOJARS_USERNAME}" ]; then
-              clojure -T:build deploy
-              # the benchmark providers, their own artefact at the same version
-              clojure -T:build benchmarks-deploy
-            else
-              echo "Skipping Clojars deploy (not main, or no credentials)."
-            fi
-
-  release:
-    executor: clojure-java22
-    steps:
-      - attach_workspace:
-          at: ~/
-      - run:
-          name: Install GitHub CLI
-          command: |
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-            sudo apt update
-            sudo apt install gh -y
-      - run:
-          name: Create GitHub release with the harness uberjar
-          command: |
-            if [ "${CIRCLE_BRANCH}" = "main" ] && [ -n "${GITHUB_TOKEN}" ]; then
-              UBER_FILE=$(ls target/dvergr-*-harness.jar | head -1)
-              VERSION=$(basename "$UBER_FILE" | sed 's/dvergr-//' | sed 's/-harness.jar//')
-              if gh release view "v${VERSION}" >/dev/null 2>&1; then
-                echo "Release v${VERSION} already exists — skipping."
-              else
-                gh release create "v${VERSION}" "$UBER_FILE" \
-                  --title "dvergr v${VERSION}" \
-                  --notes "Standalone harness uberjar — daemon + nREPL + TUI + web + Telegram. Run: java -jar $(basename "$UBER_FILE")"
-              fi
-            else
-              echo "Skipping GitHub release (not main, or no GITHUB_TOKEN)."
-            fi
+          name: Run all core test suites (kaocha)
+          command: clojure -M:test
 
 workflows:
   version: 2
-  test-build-release:
+  core-checks:
     jobs:
       - setup
       - format:
@@ -206,26 +88,4 @@ workflows:
             - setup
       - test:
           requires:
-            - setup
-      - build-harness:
-          requires:
-            - setup
-      - deploy:
-          context:
-            - clojars-deploy
-          filters:
-            branches:
-              only: main
-          requires:
-            - test
             - format
-      - release:
-          context:
-            - github-token
-          filters:
-            branches:
-              only: main
-          requires:
-            - test
-            - format
-            - build-harness

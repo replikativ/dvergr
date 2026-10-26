@@ -1,3 +1,5 @@
+> Branch `next` holds the core rewrite against [doc/specification.md](doc/specification.md); the released implementation is on `main`. The Layout and Running-benchmarks sections below describe `main`.
+
 # CLAUDE.md — Dvergr development notes
 
 Dvergr is a Clojure agent harness built on the spindel FRP runtime: rooms, agents and their Runs are
