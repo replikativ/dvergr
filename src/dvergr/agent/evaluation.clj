@@ -365,20 +365,18 @@
                              :cleanup-error (native-error-summary error)}))))
         (finally (when @interrupted? (.interrupt (Thread/currentThread))))))))
 
-(defn with-checkpoint-world!
-  "HOST-only blocking metadata computation in an owned checkpoint world.
-   No Run, Room, wallet, preparer or provider dispatch is created. Register
-   cleanup before allocation; unresolved native ownership stays in the existing
-   room/group cleanup manager until explicit HOST recovery. Never call on drain."
-  [room world-parent group checkpoints f]
+(defn- with-owned-checkpoint-world!
+  [purpose room world-parent group checkpoints f]
   (when (simple/on-drain-thread?)
-    (throw (ex-info "Checkpoint prediction must run off the engine drain" {:type ::native-on-drain})))
+    (throw (ex-info "Checkpoint computation must run off the engine drain" {:type ::native-on-drain})))
   (when (some? group) (require-cleanup-group! group))
-  (when-not (fn? f) (throw (ex-info "Prediction requires a host function" {:type ::invalid-native-computation})))
-  (let [checkpoints (environment/validate-checkpoints checkpoints)
+  (when-not (fn? f) (throw (ex-info "Checkpoint computation requires a host function" {:type ::invalid-native-computation})))
+  (let [prediction? (= purpose :input-prediction)
+        label (if prediction? "Checkpoint prediction" "Checkpoint fixture construction")
+        checkpoints (environment/validate-checkpoints checkpoints)
         source (:ctx world-parent)
-        scope (world-scope/create {:purpose :input-prediction :retain-released? false})
-        activity (world-scope/begin-activity! scope :prediction)
+        scope (world-scope/create {:purpose purpose :retain-released? false})
+        activity (world-scope/begin-activity! scope (if prediction? :prediction :fixture-construction))
         scope-key (cleanup-scope room) token (random-uuid) gate (promise)
         phase (atom :running)
         entry {:gate gate :group group :native-scope scope :native-phase phase}
@@ -387,7 +385,8 @@
         (try
           (binding [ec/*execution-context* source]
             (let [state (savepoint/independent-fork-state
-                         (savepoint/derive-seed (savepoint/seed source) :dvergr/prediction token))
+                         (savepoint/derive-seed (savepoint/seed source)
+                                                (if prediction? :dvergr/prediction :dvergr/checkpoint-fixture) token))
                   world (native-outcome
                          @(start-native-op
                            #(world-scope/fork! scope source
@@ -397,7 +396,8 @@
               {:ok (binding [ec/*execution-context* (:child-ctx world)]
                      (let [value (f)]
                        (when-not (roster/data-value? value)
-                         (throw (ex-info "Prediction must return portable metadata" {:type ::non-portable-prediction})))
+                         (throw (ex-info (str label " must return portable metadata")
+                                         {:type (if prediction? ::non-portable-prediction ::non-portable-fixture)})))
                        value))}))
           (catch Throwable error {:error error}))
         interrupted? (volatile! (or (Thread/interrupted)
@@ -410,15 +410,16 @@
           (catch Throwable error error))
         _ (when (instance? InterruptedException cleanup-error) (vreset! interrupted? true))
         failure (when (or cleanup-error (:error outcome))
-                  (ex-info (if cleanup-error "Checkpoint prediction cleanup remains owned"
-                               "Checkpoint prediction failed")
-                           (cond-> {:type (if cleanup-error ::checkpoint-prediction-cleanup-required
-                                              ::checkpoint-prediction-failed)
+                  (ex-info (str label (if cleanup-error " cleanup remains owned" " failed"))
+                           (cond-> {:type (if prediction?
+                                            (if cleanup-error ::checkpoint-prediction-cleanup-required ::checkpoint-prediction-failed)
+                                            (if cleanup-error ::checkpoint-fixture-cleanup-required ::checkpoint-fixture-failed))
                                     :cleanup/token token
                                     :room/id (:id room) :room/incarnation (:incarnation room)
                                     :cleanup/group group}
                              cleanup-error (assoc :cleanup-error (native-error-summary cleanup-error))
-                             (:error outcome) (assoc :prediction-error (native-error-summary (:error outcome))))))]
+                             (:error outcome) (assoc (if prediction? :prediction-error :fixture-error)
+                                                     (native-error-summary (:error outcome))))))]
     ;; Full native errors never cross the SCI boundary or the cleanup observer.
     (when failure
       (swap! pending-tasks assoc-in [scope-key token :native-errors]
@@ -430,6 +431,26 @@
     (when-not failure (remove-task! scope-key token))
     (when @interrupted? (.interrupt (Thread/currentThread)))
     (if failure (throw failure) (:ok outcome))))
+
+(defn with-checkpoint-world!
+  "HOST-only blocking metadata computation in an owned checkpoint world.
+   No Run, Room, wallet, preparer or provider dispatch is created. Register
+   cleanup before allocation; unresolved native ownership stays in the existing
+   room/group cleanup manager until explicit HOST recovery. Never call on drain."
+  [room world-parent group checkpoints f]
+  (with-owned-checkpoint-world! :input-prediction room world-parent group checkpoints f))
+
+(defn with-checkpoint-fixture!
+  "HOST-only bounded fixture construction in an owned temporary checkpoint
+   world. Runs f with that world's context bound and returns portable metadata
+   only. No Room, Run, wallet or provider dispatch is created by this helper.
+   Caller retains original authorization and source lifetime through the call,
+   preflights byte/count bounds and bounds callback execution; this helper does
+   not impose those limits itself. Only the temporary fork belongs to this scope: persist any external durable
+   pin intent before pin IO, and retain uncertain outcomes separately. Never
+   call on the engine drain. Cleanup uses the existing Room/group manager."
+  [room world-parent group checkpoints f]
+  (with-owned-checkpoint-world! :fixture-construction room world-parent group checkpoints f))
 
 (defn make-evaluator
   "Create a process-local trusted evaluator capability.

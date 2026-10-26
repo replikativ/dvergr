@@ -57,3 +57,18 @@ available to execution, not a claim about which files were actually read.
 Checkpointing an authoring repository does not provide clean benchmark fixtures.
 Other cases and gold must remain unavailable to candidates through the existing
 fixture isolation policy. The catalog's default fixture setup is unchanged here.
+
+HOST fixture construction can use `evaluation/with-checkpoint-fixture!`. It
+shares prediction's native fork ownership, independent context state, portable
+return requirement, cancellation, bounded cleanup joins and explicit recovery
+manager, with a separate fixed construction purpose. It creates no Room, Run,
+wallet or provider call. The caller retains original source lifetime and
+authority, validates finite input limits and bounds callback execution; the
+helper does not impose byte/count limits or bound arbitrary HOST callback code.
+
+Only the temporary fork is owned by that scope. A durable GC pin created by the
+callback belongs to its separate evidence journal: persist that pin's exact
+intent before native IO, retain ambiguous outcomes, and verify the pin before
+retiring its builder. Discarding the temporary world neither releases nor proves
+ownership of those external roots. The callback returns portable identity, never
+native connections, contexts or recovery handles.
