@@ -16,6 +16,7 @@ New to dvergr? Start with **[Getting Started](getting-started.md)**.
 
 ## 📚 Concepts
 
+- **[Specification](specification.md)** — the normative contract of the programming model the `next` core is written against: worlds, forks, settlement, effects, resources, discourse, Runs and Attempts, each with laws and their status
 - **[Programming Model](programming-model.md)** — Rooms and Participants on a Bus, addressing, forks; tagged messages, capability routing, escalation; why "discourse"
 - **[Architecture](architecture.md)** — the L0–L7 layer map, subsystem graph, inbound message flow, per-namespace table
 - **[Runs](runs.md)** — durable execution identity, kinds, lifecycle and reasons, how a turn ends, cancellation, processes, resuming from savepoints
