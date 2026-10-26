@@ -139,7 +139,10 @@ A provider is a namespace (`dvergr.benchmarks.<name>.provider`) with:
 
 1. **`capabilities`**: `{:world-setup :protocol :evaluator}`, trusted closures
    made with `evaluation/make-world-setup`, `make-protocol` and
-   `make-evaluator`.
+   `make-evaluator`. Use `:world-setups {exact-setup-ref WorldSetup, ...}`
+   instead of `:world-setup` when environments have distinct initial worlds.
+   The runner validates every capability and exact reference before admission;
+   singular and plural forms cannot be combined, even with nil values.
    - *World setup* installs the task's initial world in the Run's forked world
      and returns evidence about it (tau2: the initial DB hash; BFCL: the digest
      of the tool specs the candidate is given).

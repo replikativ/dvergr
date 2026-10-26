@@ -266,6 +266,26 @@
                        error (assoc :error error))}
               "Experiment cell finished")))
 
+(defn- world-setups! [capabilities]
+  (when (and (contains? capabilities :world-setup)
+             (contains? capabilities :world-setups))
+    (throw (ex-info "Use either :world-setup or :world-setups"
+                    {:type ::ambiguous-world-setups})))
+  (let [setups (if (contains? capabilities :world-setups)
+                 (:world-setups capabilities)
+                 (if-let [setup (:world-setup capabilities)]
+                   {(evaluation/world-setup-ref setup) setup}
+                   {}))]
+    (when-not (map? setups)
+      (throw (ex-info "WorldSetups must be an exact host capability map"
+                      {:type ::invalid-world-setups})))
+    (doseq [[ref setup] setups]
+      (evaluation/validate-world-setup setup)
+      (when-not (= ref (evaluation/world-setup-ref setup))
+        (throw (ex-info "WorldSetup map key does not match its exact reference"
+                        {:type ::world-setup-reference-mismatch}))))
+    setups))
+
 (defn run-in
   "The experiment `experiment` (an ExperimentDef) of `team` in `room`, as a
    Spin: every cell an evaluation in a fork of `room`, certified into its
@@ -276,11 +296,14 @@
    `room`), whoever calls; each cell's own fork context is chosen inside
    `experiment/run`. A daemon room's context is a fork of the daemon's, and an
    evaluation in the latter loses its Run's wakeups. `capabilities` is
-   `{:world-setup :protocol :evaluator}` (setup and protocol when named)."
+   `{:world-setup :protocol :evaluator}` (setup and protocol when named).
+   For distinct environment setups, replace :world-setup with :world-setups,
+   a map from exact setup references to HOST WorldSetup capabilities."
   [room {:keys [capabilities team experiment parallelism cleanup-group benchmark parent-run
                 world-parent admit resume?]
          :or {parallelism 1 resume? true}}]
-  (let [{:keys [world-setup protocol evaluator]} capabilities
+  (let [{:keys [protocol evaluator]} capabilities
+        world-setups (world-setups! capabilities)
         cells (* (count (:experiment/candidates experiment))
                  (count (get-in experiment [:experiment/dataset :dataset/environments]))
                  (:experiment/repetitions experiment))]
@@ -288,9 +311,7 @@
       (experiment/run
        room team experiment
        {(evaluation/evaluator-ref evaluator) evaluator}
-       {:world-setups (if world-setup
-                        {(evaluation/world-setup-ref world-setup) world-setup}
-                        {})
+       {:world-setups world-setups
         :protocols (if protocol {(evaluation/protocol-ref protocol) protocol} {})
         :parallelism parallelism
         :max-parallelism (max 16 parallelism)
@@ -640,8 +661,9 @@
      :daemon        instead of `:dir`: run in this running daemon's home
                     (needs `:experiment-id`)
      :benchmark     keyword; namespaces the experiment and dataset ids
-     :capabilities  `{:world-setup :protocol :evaluator}`; the setup and the
-                    protocol only when the environments name them (an
+     :capabilities  `{:world-setup :protocol :evaluator}`; replace :world-setup
+                    with :world-setups for an exact reference-to-capability map.
+                    Setup and protocol only when environments name them (an
                     ordinary agent program has no protocol)
      :environments  EnvironmentDefs, one per task
      :team          roster of candidate AgentDefs
