@@ -41,6 +41,14 @@
               (let [ok? (= {:state "C1" :prepared "Ready at C1"} (:result evidence))]
                 {:checks {:exact? ok?} :reward (if ok? 1.0 0.0)}))}))
 
+(deftest checkpoint-definition-shape-is-portable-without-assuming-a-storage-backend
+  (let [origins {"custom" {:kind :custom :revision "A"}}
+        ref (evaluation/world-setup-ref (setup "v1" origins))]
+    (is (= origins (:setup/checkpoints ref)))
+    (is (m/validate @#'sci-agent/SetupRef ref))
+    (doseq [native [(atom :native) (fn [] :native)]]
+      (is (thrown? clojure.lang.ExceptionInfo (setup "v1" {"custom" native}))))))
+
 (deftest setup-checkpoint-identity-is-distinct-from-arbitrary-caller-basis
   (let [selected {"workspace" (origin)} base {:setup/id :checkpoint/fixture :setup/version 1 :setup/basis "v1"}
         selected-setup (setup "v1" selected)
@@ -53,7 +61,7 @@
     (is (not= (:environment/content-id (definition (evaluation/world-setup-ref selected-setup)))
               (:environment/content-id (definition (evaluation/world-setup-ref changed)))))
     (is (not (contains? (set authority/host-option-keys) :checkpoints)))
-    (doseq [bad [false [] {"workspace" (assoc (origin) :extra true)} {nil (origin)}]]
+    (doseq [bad [false [] {"workspace" nil} {nil (origin)}]]
       (is (thrown? clojure.lang.ExceptionInfo (setup "v1" bad))))))
 
 (deftest tainted-setup-capability-refuses-before-native-world-or-run-admission
@@ -172,7 +180,7 @@
                                           ":verifier {:id :checkpoint/check :version 1} "
                                           ":world {:isolation :ctx :settlement :discard :setup ref}})))")}})]
         (is (m/validate @#'sci-agent/SetupRef ref))
-        (is (not (m/validate @#'sci-agent/SetupRef (assoc-in ref [:setup/checkpoints "workspace" :extra] true))))
+        (is (not (m/validate @#'sci-agent/SetupRef (assoc-in ref [:setup/checkpoints "workspace"] nil))))
         (let [result @(program/hire-in!
                        room room team :reader {:task nil :settlement :discard}
                        {:experiment-capabilities {:evaluators {(evaluation/evaluator-ref evaluator) evaluator}

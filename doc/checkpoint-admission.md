@@ -2,8 +2,12 @@
 
 A trusted host may select an exact initial repository state for one Run through
 `dvergr.agent.program/hire-in!` or a WorldSetup. The `:checkpoints` map names
-registered systems and closed physical checkpoint descriptors. Spindel validates
-all origins before allocation and constructs ordinary owned workspaces.
+registered systems and bounded portable, adapter-defined checkpoint descriptors.
+Spindel validates all origins before allocation and constructs ordinary owned
+workspaces. Dvergr validates portable definition data and exact capability
+references; the underlying adapter validates the origin's backend-specific fields.
+Geschichte owns its repository checkpoint resolution and construction, with
+Yggdrasil retaining the overlay lifecycle and cross-system dispatch.
 
 WorldSetup accepts `:checkpoints` beside its existing basis and preparer. Its exact
 portable reference has an optional top-level `:setup/checkpoints` field; absent

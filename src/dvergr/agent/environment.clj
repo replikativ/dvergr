@@ -52,7 +52,7 @@
       basis (assoc :verifier/basis basis))))
 
 (defn validate-checkpoints
-  "Validate portable physical checkpoint origins, without loading source state
+  "Validate portable adapter-defined checkpoint origins, without loading source state
    or acquiring retention. The admitting host owns retention and authorization;
    Spindel validates each actual source before native allocation."
   [value]
@@ -61,7 +61,7 @@
                    (every? (fn [[system origin]]
                              (and (or (string? system) (keyword? system) (uuid? system))
                                   (ygg/checkpoint-origin? origin))) origins))
-      (invalid! "Checkpoint policy must map portable system identities to closed origins"
+      (invalid! "Checkpoint policy must map portable system identities to nonnil portable origins"
                 ::invalid-checkpoints {}))
     origins))
 
