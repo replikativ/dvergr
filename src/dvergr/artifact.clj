@@ -142,8 +142,10 @@
                       text (str (.decode decoder (java.nio.ByteBuffer/wrap bytes)))]
                   (check-edn-depth! text)
                   (with-open [reader (PushbackReader. (StringReader. text))]
-                    (let [value (edn/read {:eof ::eof} reader)]
-                      (when (or (= ::eof value) (not= ::eof (edn/read {:eof ::eof} reader)))
+                    (let [eof (Object.)
+                          value (edn/read {:eof eof} reader)]
+                      (when (or (identical? eof value)
+                                (not (identical? eof (edn/read {:eof eof} reader))))
                         (throw (ex-info "Artifact must contain one EDN value" {:type ::invalid-value})))
                       {:value value :ref ref :size (long (alength ^bytes bytes))
                        :codec :edn-v1}))))))

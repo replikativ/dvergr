@@ -12,6 +12,7 @@
             [dvergr.agent.roster :as roster]
             [dvergr.agent.spend :as spend]
             [dvergr.room.store :as store]
+            [dvergr.scorecard.bounds :as read-bounds]
             [hasch.core :as hasch]
             [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.core :as sp]
@@ -821,6 +822,21 @@
       (invalid! "Configured Room store does not support durable Scorecards"
                 ::unsupported-scorecard-store {:store (class room-store)}))
     nil))
+
+(defn scorecard-bounded
+  "Read one managed Scorecard under independent byte, dimension and matrix
+   ceilings. Options may lower those ceilings. No legacy/unbounded fallback."
+  ([room scorecard-id] (scorecard-bounded room scorecard-id {}))
+  ([room scorecard-id options]
+   (let [budget (read-bounds/limits options)]
+     (when-not (uuid? scorecard-id)
+       (throw (ex-info "A Scorecard content UUID is required" {:type ::invalid-scorecard-id})))
+     (if-let [room-store (:store room)]
+       (if (satisfies? store/PBoundedScorecardStore room-store)
+         (store/-load-scorecard-bounded room-store (store/conversation-id room) scorecard-id budget)
+         (throw (ex-info "Room store has no bounded Scorecard reader"
+                         {:type ::unsupported-bounded-scorecards})))
+       nil))))
 
 (defn scorecards
   "List completed certified Scorecards in `room` using indexed exact filters."
