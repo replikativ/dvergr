@@ -9,8 +9,11 @@
   ;; one Scorecard (results-correctness review): their versions are in it now
   (let [v (runner/library-versions)]
     (doseq [lib ["org.replikativ/spindel" "org.replikativ/datahike"]]
-      (is (let [source (get v lib)]
-            (or (string? source) (string? (:git/sha source)))) (pr-str v)))))
+      (if (get-in (basis/current-basis) [:libs (symbol lib) :local/root])
+        (is (not (contains? v lib))
+            "an unversioned local checkout must not borrow stale packaging metadata")
+        (is (let [source (get v lib)]
+              (or (string? source) (string? (:git/sha source)))) (pr-str v))))))
 
 (deftest resolved-datahike-git-sha-not-cache-location-identifies-execution
   (let [first-sha "1234567890123456789012345678901234567890"
