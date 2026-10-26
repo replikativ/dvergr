@@ -31,10 +31,7 @@ Benchmarks for dvergr's evaluation path.
 This is its own artefact, `org.replikativ/dvergr-benchmarks`. The `dvergr` jar
 does not contain it. What stays in `dvergr` is what a benchmark is built
 *with*: `dvergr.agent.evaluation`, `environment`, `experiment`,
-`experiment.runner`, `verifiers` (a registry for capabilities by reference; the
-tau2, BFCL, BIRD and AutomationBench providers have a `register!` for it that
-nothing calls, and nothing in `src/` reads it: the providers hand the
-capabilities to the runner themselves), `roster`. A benchmark of your own is a third
+`experiment.runner`, `roster`. A benchmark of your own is a third
 provider next to these, in your repo (the provider contract:
 doc/benchmarks.md, "What a benchmark brings").
 

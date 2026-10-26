@@ -26,7 +26,6 @@
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.spend :as spend]
-            [dvergr.agent.verifiers :as verifiers]
             [dvergr.benchmarks.automationbench.episode :as ep]
             [dvergr.benchmarks.automationbench.harness :as harness]
             [dvergr.benchmarks.automationbench.sidecar :as sc]
@@ -149,14 +148,6 @@
                                                              (str/replace (str t) #"[^A-Za-z0-9_.\-]" "_"))
                                                     false]))
                                       (distinct failed))}))))})}))
-
-(defn register!
-  "Register `capabilities` in the process registry. Returns their references:
-   `{:setup :protocol :verifier}`."
-  [{:keys [world-setup protocol evaluator]}]
-  {:setup (verifiers/register-world-setup! world-setup)
-   :protocol (verifiers/register-protocol! protocol)
-   :verifier (verifiers/register-evaluator! evaluator)})
 
 (defn environment-def
   "EnvironmentDef for one task: `{\"domain\" \"id\" \"contract\"}` as

@@ -287,13 +287,10 @@
      :relay-tag       — extras to merge into each relayed message —
                         typically `{:dvergr/origin <room-id>
                         :dvergr/scope :room}` or `:fork`. Required when
-                        `:relay-to` is set.
-     :log?            — accepted for compatibility; the log is now the
-                        fan-out source of truth and always kept."
+                        `:relay-to` is set."
   ([] (create-bus {}))
-  ([{:keys [ctx durable-append! durable-append-batch! relay-to relay-tag log?] :as _opts}]
-   (let [_ log? ;; vestigial — see docstring
-         ctx (or ctx (ectx/create-execution-context))]
+  ([{:keys [ctx durable-append! durable-append-batch! relay-to relay-tag] :as _opts}]
+   (let [ctx (or ctx (ectx/create-execution-context))]
      (binding [ec/*execution-context* ctx]
        (let [source     (sync/create-mailbox ctx)
              hint-mbx   (sync/create-mailbox ctx)

@@ -28,7 +28,6 @@
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.spend :as spend]
-            [dvergr.agent.verifiers :as verifiers]
             [dvergr.benchmarks.bird.compat :as compat]
             [dvergr.benchmarks.bird.core :as bird]
             [dvergr.benchmarks.bird.dialect :as dialect]
@@ -632,11 +631,6 @@
                     :checks {:submitted submitted?
                              :runs (boolean (and r (not (:error r))))
                              :correct correct?}}))})}))
-
-(defn register!
-  [{:keys [protocol evaluator]}]
-  {:protocol (verifiers/register-protocol! protocol)
-   :verifier (verifiers/register-evaluator! evaluator)})
 
 (defn environment-def
   "EnvironmentDef of one question."

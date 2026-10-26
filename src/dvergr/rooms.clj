@@ -29,16 +29,6 @@
             [dvergr.chat.schema :as chat-schema]
             [taoensso.telemere :as tel]))
 
-;; ============================================================================
-;; State
-;; ============================================================================
-
-(defn init!
-  "Deprecated no-op (RF5 S4): the registry is system-db now; there is no shared
-   chat-db conn to store. Retained until the daemon boot call site is cleaned up."
-  [_datahike-conn]
-  nil)
-
 ;; create-room! / join-agent! both call into discourse-join!, defined
 ;; further down. Declare it here so create-room! can resolve it at
 ;; compile time.
