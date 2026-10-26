@@ -355,6 +355,27 @@
                   (some? basis) (assoc :setup/basis basis))
                 prepare))
 
+(defn validate-world-setup
+  "Validate a HOST WorldSetup capability without executing its preparer.
+   Rebuild its portable reference through the constructor so altered records
+   cannot bypass constructor validation or name a different admission policy."
+  [setup]
+  (when-not (instance? WorldSetup setup)
+    (throw (ex-info "Expected a host WorldSetup capability"
+                    {:type ::invalid-world-setup})))
+  (let [ref (:ref setup)
+        rebuilt (make-world-setup
+                 {:id (:setup/id ref) :version (:setup/version ref)
+                  :basis (:setup/basis ref) :prepare (:prepare setup)
+                  :checkpoints (:checkpoints setup)})]
+    (when (and (seq (:checkpoints setup)) (not (contains? rebuilt :checkpoints)))
+      (throw (ex-info "Installed WorldSetup does not support checkpoint admission"
+                      {:type ::unsupported-setup-checkpoints})))
+    (when-not (= ref (:ref rebuilt))
+      (throw (ex-info "WorldSetup does not match its canonical reference"
+                      {:type ::invalid-world-setup-reference}))))
+  setup)
+
 (defn make-protocol
   "Create a process-local trusted interaction protocol.
 
@@ -453,6 +474,7 @@
       (throw (ex-info "WorldSetup does not match EnvironmentDef"
                       {:type ::world-setup-mismatch
                        :expected expected :actual (:ref setup)})))
+    (when setup (validate-world-setup setup))
     setup))
 
 (defn- require-matching-protocol! [definition protocol]
