@@ -72,3 +72,28 @@ intent before native IO, retain ambiguous outcomes, and verify the pin before
 retiring its builder. Discarding the temporary world neither releases nor proves
 ownership of those external roots. The callback returns portable identity, never
 native connections, contexts or recovery handles.
+
+`catalog.workspace/seed-in-context!` initializes bounded text fixtures in the
+explicitly selected primary repository of a caller-owned temporary context. It
+resolves that workspace once and revalidates its identity and selection under
+the existing workspace lock. The primary Geschichte filesystem adapter prevents
+nested mount tables from redirecting writes. Existing Room-bound `seed!` keeps
+its original behavior and shares the low-level mkdir/write loop.
+
+The new initializer requires all three limits (`:max-files`, `:max-file-bytes`,
+`:max-bytes`), which may only lower `fixture-seed-limits`. It rejects noncanonical
+paths, file/parent collisions, malformed UTF-8 and oversized inputs before any
+write. Both index and worktree must start clean, even for empty input. It verifies
+written and staged content IDs, byte sizes and modes, stages only permitted
+changed paths, commits through the retained workspace descriptor and requires a
+clean final state. Existing executable modes are preserved. Empty or repeated
+inputs do not create a logical commit.
+
+Its portable result contains file/byte counts, a written manifest and
+`:changed?` for logical tree changes. This is not Simmis semantic projection,
+authorization, evidence retention or a published checkpoint claim. The caller
+still verifies the complete baseline-plus-case manifest and resolves the actual
+stored checkpoint basis. An unchanged child may retain C0's physical CID while
+its live branch configuration differs; resolve the published DB from the
+original store rather than inventing a new child-specific checkpoint. On any
+failure, the caller's existing scope owns disposal or explicit recovery.
