@@ -123,7 +123,12 @@
   [:map {:closed true}
    [:setup/id :keyword]
    [:setup/version PosInt]
-   [:setup/basis {:optional true} :any]])
+   [:setup/basis {:optional true} :any]
+   [:setup/checkpoints {:optional true}
+    [:map-of [:or :string :keyword :uuid]
+     [:map {:closed true}
+      [:version [:= 1]] [:kind [:= :datahike]] [:commit :uuid]
+      [:source [:map {:closed true} [:store :uuid] [:repository :uuid]]]]]]])
 
 (def ^:private EnvironmentSpec
   [:map {:closed true}

@@ -390,3 +390,8 @@ domain's section), BFCL ([Equivalence](../benchmarks/doc/bfcl.md#equivalence)). 
 that are not transcriptions argue validity otherwise: AutomationBench runs upstream's code
 and replays every world, BIRD cross-checks its grader against upstream's `execute_sql`,
 SpreadsheetBench certifies tasks with an oracle, and the wiki is calibrated.
+
+
+Exact repository origins at admission and checkpoint-aware input prediction are
+described in [checkpoint admission](checkpoint-admission.md). The host retains
+origins; selecting an authoring repository does not replace clean fixture isolation.

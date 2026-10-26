@@ -13,6 +13,7 @@
             [dvergr.agent.spend :as spend]
             [dvergr.room.store :as store]
             [dvergr.scorecard.bounds :as read-bounds]
+            [dvergr.sandbox.workspace :as workspace]
             [hasch.core :as hasch]
             [org.replikativ.spindel.blocking :as blocking]
             [org.replikativ.spindel.core :as sp]
@@ -388,20 +389,31 @@
                (store/-list-attempts room-store (store/conversation-id room) {:limit 1000000})))))
 
 (defn- current-inputs-ids
-  "`{[candidate-id environment-content-id] inputs-id}`: the inputs id each
-   cell's candidate would be presented with if it started now
-   (`program/run-inputs`, in the bound context: the world the cells fork),
-   computed once per candidate and protocol. Tokens are not spent: the
-   system prompt is assembled, not sent."
-  [team experiment protocols host-options]
-  (let [by (memoize (fn [candidate protocol]
-                      (program/inputs-id
-                       (program/run-inputs (exact-agent! team candidate) protocol host-options))))]
+  "Inputs for each candidate/environment before dispatch. Checkpointed setups
+   read the selected repository in a temporary owned native world; no preparer,
+   Run, wallet or inference dispatch executes. Other cells keep the original
+   current-context path. Cache per candidate, protocol and checkpoint policy."
+  [room team experiment protocols world-setups host-options]
+  (let [by (memoize
+            (fn [candidate protocol checkpoints]
+              (let [read-inputs #(program/inputs-id
+                                  (program/run-inputs (exact-agent! team candidate) protocol host-options))]
+                (if (seq checkpoints)
+                  (do
+                    (when (some? workspace/*workspace-dir*)
+                      (invalid! "Checkpoint prediction cannot use a host workspace override"
+                                ::checkpoint-workspace-override {}))
+                    (evaluation/with-checkpoint-world!
+                      room (or (:world-parent host-options) room) (:cleanup-group host-options)
+                      checkpoints read-inputs))
+                  (read-inputs)))))]
     (into {}
           (for [candidate (:experiment/candidates experiment)
-                definition (get-in experiment [:experiment/dataset :dataset/environments])]
+                definition (get-in experiment [:experiment/dataset :dataset/environments])
+                :let [setup (world-setup! world-setups definition)
+                      checkpoints (or (:checkpoints setup) {})]]
             [[(:candidate/id candidate) (:environment/content-id definition)]
-             (by candidate (protocol! protocols definition))]))))
+             (by candidate (protocol! protocols definition) checkpoints)]))))
 
 (defn- completed-cells
   "What this exact ExperimentDef already has in `room`, for a resume:
@@ -965,7 +977,7 @@
                                     definition)))
          ;; what each cell's candidate would be presented with now: a kept
          ;; cell must have been made with exactly that, and so must a new one
-         current (current-inputs-ids team experiment protocols opts)
+         current (current-inputs-ids room team experiment protocols world-setups opts)
          {:keys [done stale]} (if resume? (completed-cells room experiment current) {:done {} :stale #{}})
          _ (when (seq stale)
              (tel/log! {:level :info :id ::inputs-changed

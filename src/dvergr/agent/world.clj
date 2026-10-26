@@ -24,7 +24,7 @@
    (default `parent`) is the Room that keeps the Run."
   ([parent run-id policy] (open! parent run-id policy parent))
   ([parent run-id policy record-room] (open! parent run-id policy record-room nil))
-  ([parent run-id policy record-room {:keys [snapshots]}]
+  ([parent run-id policy record-room {:keys [snapshots checkpoints]}]
    (when-not (contains? settlement-policies policy)
      (throw (ex-info "Unknown Run settlement policy"
                      {:type ::invalid-settlement-policy
@@ -36,6 +36,9 @@
                                                ;; resuming: the systems as the
                                                ;; savepoint recorded them
                                                :snapshots snapshots
+                                               ;; A one-admission HOST origin, never
+                                               ;; inheritable delegation authority.
+                                               :checkpoints checkpoints
                                                ;; Hiring starts an independent computation,
                                                ;; not a continuation of the parent's session.
                                                :state-updates

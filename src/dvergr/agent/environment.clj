@@ -6,7 +6,8 @@
    The content ID identifies this exact definition; individual attempts retain
    fresh Run identities."
   (:require [dvergr.agent.roster :as roster]
-            [hasch.core :as hasch]))
+            [hasch.core :as hasch]
+            [yggdrasil.protocols :as ygg]))
 
 (def ^:private allowed-keys
   #{:id :version :task :verifier :limits :world :metadata})
@@ -50,7 +51,21 @@
              :verifier/version (or version 1)}
       basis (assoc :verifier/basis basis))))
 
-(def ^:private setup-ref-keys #{:setup/id :setup/version :setup/basis})
+(defn validate-checkpoints
+  "Validate portable physical checkpoint origins, without loading source state
+   or acquiring retention. The admitting host owns retention and authorization;
+   Spindel validates each actual source before native allocation."
+  [value]
+  (let [origins (if (nil? value) {} value)]
+    (when-not (and (map? origins) (roster/data-value? origins)
+                   (every? (fn [[system origin]]
+                             (and (or (string? system) (keyword? system) (uuid? system))
+                                  (ygg/checkpoint-origin? origin))) origins))
+      (invalid! "Checkpoint policy must map portable system identities to closed origins"
+                ::invalid-checkpoints {}))
+    origins))
+
+(def ^:private setup-ref-keys #{:setup/id :setup/version :setup/basis :setup/checkpoints})
 
 (defn- setup-ref! [setup]
   (when-not (map? setup)
@@ -66,10 +81,11 @@
   (when-not (roster/data-value? (:setup/basis setup))
     (invalid! "World setup :setup/basis must contain only portable data"
               ::non-portable-setup-basis {:basis (:setup/basis setup)}))
-  (cond-> {:setup/id (:setup/id setup)
-           :setup/version (:setup/version setup)}
-    (some? (:setup/basis setup))
-    (assoc :setup/basis (:setup/basis setup))))
+  (let [checkpoints (validate-checkpoints (:setup/checkpoints setup))]
+    (cond-> {:setup/id (:setup/id setup)
+             :setup/version (:setup/version setup)}
+      (some? (:setup/basis setup)) (assoc :setup/basis (:setup/basis setup))
+      (seq checkpoints) (assoc :setup/checkpoints checkpoints))))
 
 (def ^:private protocol-ref-keys
   #{:protocol/id :protocol/version :protocol/basis})
