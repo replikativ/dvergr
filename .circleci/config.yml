@@ -75,8 +75,13 @@ jobs:
             - v1-deps-
       - install-clojure
       - run:
+          # W6 across a real restart: one JVM persists the evidence and exits,
+          # the suite's JVM reopens only the control store.
+          name: Persist lineage evidence in a separate JVM
+          command: clojure -Sdeps '{:paths ["src" "test"]}' -M -m dvergr.process.lineage-test /tmp/dvergr-process-evidence
+      - run:
           name: Run all core test suites (kaocha)
-          command: clojure -M:test
+          command: DVERGR_PROCESS_EVIDENCE=/tmp/dvergr-process-evidence clojure -M:test
 
 workflows:
   version: 2
