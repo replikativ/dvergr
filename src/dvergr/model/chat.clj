@@ -126,6 +126,13 @@
 ;; HTTP Request
 ;; ============================================================================
 
+(def ^:dynamic *request-open-timeout-ms*
+  "Maximum wait for HTTP response headers, before stream-idle supervision can
+   begin. A TCP connect timeout alone does not bound a provider that accepts
+   the request but never opens its response. Streaming bodies keep their own
+   idle deadline after headers arrive."
+  180000)
+
 (defn- make-request
   "Make HTTP request with error handling. Returns response or throws. The
    usage a subscription provider reports in the headers is recorded, also
@@ -137,6 +144,7 @@
                                     :credentials credentials
                                     :body (json/write-value-as-string body)
                                     :as :stream
+                                    :timeout *request-open-timeout-ms*
                                     :http-client (get-http-client)
                                     :throw-exceptions false})]
     (try (subscription/observe-headers! provider-id (:headers response))
@@ -252,6 +260,8 @@
                    provider)]
     (loop [attempt 0
            last-error nil]
+      (when (and (:cancel? opts) ((:cancel? opts)))
+        (throw (java.util.concurrent.CancellationException. "Model call cancelled before dispatch")))
       (if (>= attempt (:max-retries retry-config))
         (throw (ex-info "Max retries exceeded"
                         {:provider (p/provider-id provider)
