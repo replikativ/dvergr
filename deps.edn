@@ -2,9 +2,9 @@
 
  :deps {org.clojure/clojure {:mvn/version "1.12.5"}
         ;; Native checkpoints, construction recovery and reactive lifetimes.
-        org.replikativ/spindel {:mvn/version "0.1.148"}
+        org.replikativ/spindel {:mvn/version "0.1.150"}
         ;; Forkable worlds; static-methods value paths and merge-opts permissions.
-        org.replikativ/sci {:mvn/version "0.15.59-replikativ.5"}
+        org.replikativ/sci {:mvn/version "0.15.59-replikativ.7"}
         ;; Direct CPS dependency; published under org.replikativ, namespaces unchanged.
         org.replikativ/partial-cps {:mvn/version "0.1.69"}
         ;; Exact Geschichte checkpoints and portable checkpoint origin validation.

@@ -20,7 +20,7 @@
                 false)))))
 
 (defn control-schema
-  "Return slice 1's control-only schema."
+  "Return the control-only schema."
   []
   (mapv (fn [[id type unique?]]
           (cond-> {:db/ident id :db/valueType type :db/cardinality :db.cardinality/one}
@@ -36,7 +36,7 @@
   "Validate the complete versioned record, including its immutable identity."
   [kind record]
   (v/portable! record limits)
-  (when-not (#{:installation :world :room} kind)
+  (when-not (#{:installation :world :room :ask :session-ending} kind)
     (v/fail! :reserved-record-kind {:kind kind}))
   (let [required (case kind
                    :installation #{:installation/id :control-store/id :schema/version :store/role}
@@ -45,7 +45,9 @@
                             :assembly/spindel-descriptor :assembly/cut :assembly/claims
                             :assembly/components :assembly/effect-policy :assembly/resource-authority}
                    :room (cond-> #{:room/id :room/world :room/kind :schema/version}
-                           (= 2 (:schema/version record)) (conj :room/discourse)))]
+                           (= 2 (:schema/version record)) (conj :room/discourse))
+                   :ask #{:ask/id :ask/intent :ask/terminal :schema/version}
+                   :session-ending #{:session/id :session/process :schema/version})]
     (when-not (and (map? record) (= required (set (keys record))))
       (v/fail! :invalid-control-record {:kind kind})))
   (try
@@ -66,12 +68,31 @@
                              (uuid? (:projection d)) (= :indefinite (:retention d)))
                 (v/fail! :invalid-control-record {}))
               (v/identity! :system (:system d)))))
+      :ask
+      (let [intent (:ask/intent record) terminal (:ask/terminal record)]
+        (when-not (and (= 1 (:schema/version record)) (uuid? (:ask/id record))
+                       (= #{:fingerprint :message/id :caller :target :session :deadline :room/id :projection/id
+                            :world/id :process :policy :decision} (set (keys intent)))
+                       (uuid? (:target intent)) (or (nil? (:session intent)) (uuid? (:session intent)))
+                       (pos-int? (:deadline intent)) (= 1 (:policy intent))
+                       (or (nil? terminal)
+                           (case (:status terminal)
+                             :reply (and (= #{:status :message/id} (set (keys terminal)))
+                                         (uuid? (:message/id terminal)))
+                             :timeout (= #{:status} (set (keys terminal)))
+                             (:cancelled :leave) (= #{:status :reason} (set (keys terminal)))
+                             false)))
+          (v/fail! :invalid-control-record {})))
+      :session-ending
+      (when-not (and (= 1 (:schema/version record)) (uuid? (:session/id record))
+                     (uuid? (:session/process record)))
+        (v/fail! :invalid-control-record {}))
       :world
       (do (doseq [k [:world/id :world/root]] (v/identity! :world (get record k)))
           (v/identity! :control-store (:assembly/control-store record))
           (when-let [source (:world/source record)] (v/identity! :world source))
           (when-not (and (= 1 (:assembly/version record))
-                         (= :unavailable-in-slice-1 (:assembly/effect-policy record))
+                         (= :unavailable (:assembly/effect-policy record))
                          (= :unbound (:assembly/resource-authority record))
                          (map? (:assembly/components record))
                          (every? component? (:assembly/components record))

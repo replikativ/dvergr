@@ -12,12 +12,12 @@
             [yggdrasil.adapters.geschichte :as git]
             [yggdrasil.protocols :as p]))
 
-(defrecord ^:private Installation [id control live lock owners])
+(defrecord ^:private Installation [id control live lock owners process])
 (alter-meta! #'->Installation assoc :private true)
 (alter-meta! #'map->Installation assoc :private true)
 
 (defn ^:no-doc installation [control]
-  (->Installation (:installation/id (store/info control)) control (atom {}) (Object.) (atom {})))
+  (->Installation (:installation/id (store/info control)) control (atom {}) (Object.) (atom {}) (random-uuid)))
 
 (def ^:dynamic ^:no-doc *installation* nil)
 
@@ -36,8 +36,12 @@
   (when-not ec/*execution-context* (v/fail! :no-selected-world {}))
   (let [ctx (ec/current-execution-context)
         id (context/get-fork-id ctx)
-        world (get @(:live installation) id)]
-    (when-not (and world (identical? ctx (:context world))) (v/fail! :unknown-world {}))
+        world (get @(:live installation) id)
+        home (ec/home-context ctx)]
+    ;; Only documented lexical bindings may differ on an async resume.
+    ;; restore-scope normalizes those; forged metadata still refuses.
+    (when-not (and world (identical? home (:context world))
+                   (= home (ec/restore-scope home ctx home))) (v/fail! :unknown-world {}))
     (when-not (some #(= anchor (:world/id %)) (store/lineage (:control installation) id))
       (v/fail! :unrelated-lineage {}))
     world))
@@ -170,7 +174,7 @@
       (v/fail! :invalid-request {}))))
 
 (defn invoke!
-  "Invoke a keyword operation with bounded data. Queries arrive with the effects slice."
+  "Invoke a keyword operation with bounded data. Queries arrive with the effect boundary."
   [installation handle operation request]
   (locking (:lock installation)
     (let [system (resolve! installation handle operation)

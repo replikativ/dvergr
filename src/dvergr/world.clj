@@ -8,7 +8,7 @@
             [org.replikativ.spindel.engine.context :as context]))
 
 (def ^:private versions
-  {:spindel "0.1.148" :sci "0.15.59-replikativ.5" :yggdrasil "0.3.52"
+  {:spindel "0.1.150" :sci "0.15.59-replikativ.7" :yggdrasil "0.3.52"
    :datahike "0.8.1910" :kontor "0.1.40" :geschichte "0.1.25"})
 
 (defn installation
@@ -43,7 +43,7 @@
                 (cond-> (into {} (map (fn [[id spec]] [id (:manifest spec)])) systems)
                   sci-ref (assoc (:id sci-ref) {:classification :snapshotted :mechanism :sci-forkable
                                                 :tier nil :classifier :dvergr.injection/v1}))
-                :assembly/effect-policy :unavailable-in-slice-1 :assembly/resource-authority :unbound}
+                :assembly/effect-policy :unavailable :assembly/resource-authority :unbound}
         world {:context ctx :descriptor record :systems systems :sci-ref sci-ref
                :fork-handle fork-handle :active (atom 0)}]
     (store/put-world! (:control installation) record)
@@ -63,7 +63,7 @@
 (defn- validate-assembly! [installation spec]
   (when-not (and (= #{:systems :injections :effect-policy :resource-authority} (set (keys spec)))
                  (vector? (:systems spec))
-                 (= :unavailable-in-slice-1 (:effect-policy spec))
+                 (= :unavailable (:effect-policy spec))
                  (= :unbound (:resource-authority spec)))
     (v/fail! :unsupported-guarantee {}))
   (let [ids (mapv :id (:systems spec))]

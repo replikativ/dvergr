@@ -50,10 +50,20 @@
      :world (and (keyword? value) (nil? (namespace value))
                  (boolean (re-matches #"(?:root-|fork-)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
                                       (name value))))
-     (:installation :control-store :message :projection :participant :decision :room :run :attempt :grant :reservation
+     (:installation :control-store :message :projection :participant :session :ask :decision :room :run :attempt :grant :reservation
                     :receipt :admission :cancellation :settlement :recovery :account)
      (uuid? value)
      :system (or (keyword? value) (and (string? value) (<= 1 (count value) 256)))
      false)
     (fail! :invalid-identity {:kind kind}))
   value)
+
+(defn ^:no-doc fingerprint [value]
+  (letfn [(canonical [x]
+            (cond (map? x) (mapv (fn [[k v]] [(canonical k) (canonical v)]) (sort-by (comp pr-str key) x))
+                  (set? x) (mapv canonical (sort-by pr-str x))
+                  (coll? x) (mapv canonical x)
+                  :else x))]
+    (let [digest (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                          (.getBytes (pr-str (canonical value)) "UTF-8"))]
+      (apply str (map #(format "%02x" (bit-and 255 %)) digest)))))

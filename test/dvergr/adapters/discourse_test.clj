@@ -123,7 +123,7 @@
         (is (= record (dvergr.store/room-record (:control i) (get-in r [:record :room/id]))))))))
 
 (deftest w6-version-one-room-closure-remains-usable
-  "W6/closure: slice 1 room records remain readable and repeated room closure shares one passive observation."
+  "W6/closure: version 1 room records remain readable and repeated room closure shares one passive observation."
   (base/with-installation
     (fn [i]
       (let [r (room/create! i {:id (random-uuid) :kind :root :assembly (base/assembly)})
@@ -181,4 +181,6 @@
           (binding [org.replikativ.spindel.engine.core/*execution-context* (:context child)]
             (is (= 1 (:version (edit)))))
           (is (= 0 (:version (room/work! i v :discourse/read {:command :decision :id id}))))
-          (finally (room/close! i r)))))))
+          ;; This fixture installed a durable-only owner after making frozen
+          ;; children; it has no native topology to close.
+          (finally (swap! (:owners i) dissoc (:room/world record))))))))

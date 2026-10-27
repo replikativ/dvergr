@@ -5,4 +5,5 @@
           :test-paths ["test/dvergr/adapters"]}
          {:id :process
           :test-paths ["test/dvergr/process"]}]
+ :kaocha.filter/skip-meta [:pending-upstream]
  :reporter [kaocha.report/dots]}

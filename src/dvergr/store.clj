@@ -155,6 +155,38 @@
       (storage! d/release (.-conn control))
       (reset! (.-closed control) true))))
 
+(defn ^:no-doc ask-record [control id]
+  (v/identity! :ask id)
+  (read-record control (str "ask/" id)))
+
+(defn ^:no-doc put-ask! [control id intent]
+  (locking (.-lock ^ControlStore control)
+    (if-let [old (ask-record control id)]
+      (if (= intent (:ask/intent old)) old (v/fail! :identity-conflict {}))
+      (insert! control :ask id {:ask/id id :ask/intent intent :ask/terminal nil :schema/version 1}
+               (fn []) {}))))
+
+(defn ^:no-doc terminal! [control id candidate]
+  (locking (.-lock ^ControlStore control)
+    (let [old (or (ask-record control id) (v/fail! :unknown-ask {}))]
+      (or (:ask/terminal old)
+          (let [record (assoc old :ask/terminal candidate)]
+            (schema/control-record! :ask record)
+            (storage! d/transact (connection! control)
+                      [{:control/key (str "ask/" id) :control/payload (encode record)}])
+            candidate)))))
+
+(defn ^:no-doc asks [control]
+  (->> (storage! d/datoms @(connection! control) {:index :avet :components [:control/key]})
+       (keep #(when (str/starts-with? (:v %) "ask/") (read-record control (:v %)))) vec))
+
+(defn ^:no-doc end-session! [control id process]
+  (insert! control :session-ending id
+           {:session/id id :session/process process :schema/version 1} (fn []) {}))
+
+(defn ^:no-doc session-ended? [control id]
+  (boolean (and id (read-record control (str "session-ending/" id)))))
+
 (defn- work-record [db key]
   (when-let [eid (:e (storage! #(first (d/datoms db {:index :avet :components [:discourse/key key]}))))]
     (edn/read-string {:readers {} :default (fn [_ _] (v/fail! :history-unavailable {}))}

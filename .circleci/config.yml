@@ -83,6 +83,9 @@ jobs:
           name: Persist discourse evidence in a separate JVM
           command: clojure -Sdeps '{:paths ["src" "test"]}' -M -m dvergr.process.discourse-test /tmp/dvergr-process-evidence
       - run:
+          name: Persist live ask boundary evidence in a separate JVM
+          command: clojure -Sdeps '{:paths ["src" "test"]}' -M -m dvergr.process.live-test /tmp/dvergr-process-evidence
+      - run:
           name: Run all core test suites (kaocha)
           command: DVERGR_PROCESS_EVIDENCE=/tmp/dvergr-process-evidence clojure -M:test
 

@@ -45,7 +45,7 @@
   ([] (assembly []))
   ([systems]
    {:systems (vec systems) :injections {:bindings {} :operations {}}
-    :effect-policy :unavailable-in-slice-1 :resource-authority :unbound}))
+    :effect-policy :unavailable :resource-authority :unbound}))
 
 (defn work-assembly [specs]
   (assoc-in (assembly specs) [:injections :operations]
