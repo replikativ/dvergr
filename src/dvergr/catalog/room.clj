@@ -94,60 +94,68 @@
 
 (defn check-files
   "Problems with a bundle's files (`{relative-path text}`), as strings; empty
-   when it is well formed."
-  [files]
-  (let [definition (try (read-edn files "workflow.edn") (catch Exception e {::error (ex-message e)}))
-        pack-error (try (fixture-pack/decode files) nil (catch Exception e (ex-message e)))]
-    (cond-> []
-      pack-error (conj pack-error)
-      (not (contains? files "workflow.edn")) (conj "workflow.edn is missing")
-      (::error definition) (conj (::error definition))
-      (and (map? definition) (not (::error definition)) (not (m/validate Definition definition)))
-      (conj (str "workflow.edn: " (pr-str (me/humanize (m/explain Definition definition)))))
-      (not (contains? files "checker.clj")) (conj "checker.clj is missing")
-      (not (some #(or (= % "fixture-pack.edn") (str/starts-with? % "fixtures/") (str/starts-with? % "cases/")) (keys files)))
-      (conj "fixtures/ is empty and there are no cases/: every attempt's world would start with nothing")
+   when it is well formed. Defaults to strict benchmark validation.
+   :program validates the same definition without requiring evaluation files."
+  ([files] (check-files files :benchmark))
+  ([files purpose]
+   (when-not (#{:program :benchmark} purpose)
+     (throw (ex-info "Unknown workflow validation purpose" {:type ::invalid-purpose})))
+   (let [definition (try (read-edn files "workflow.edn") (catch Exception e {::error (ex-message e)}))
+         pack-error (try (fixture-pack/decode files) nil (catch Exception e (ex-message e)))]
+     (cond-> []
+       pack-error (conj pack-error)
+       (not (contains? files "workflow.edn")) (conj "workflow.edn is missing")
+       (::error definition) (conj (::error definition))
+       (and (contains? files "workflow.edn") (not (::error definition)) (not (m/validate Definition definition)))
+       (conj (str "workflow.edn: " (pr-str (me/humanize (m/explain Definition definition)))))
+       (and (= :benchmark purpose) (not (contains? files "checker.clj"))) (conj "checker.clj is missing")
+       (and (= :benchmark purpose)
+            (not (some #(or (= % "fixture-pack.edn") (str/starts-with? % "fixtures/") (str/starts-with? % "cases/")) (keys files))))
+       (conj "fixtures/ is empty and there are no cases/: every attempt's world would start with nothing")
 
-      (and (map? definition) (= :frozen (:web definition)) (not (contains? files "web.edn")))
-      (conj "workflow.edn says :web :frozen but web.edn is missing"))))
+       (and (map? definition) (= :frozen (:web definition)) (not (contains? files "web.edn")))
+       (conj "workflow.edn says :web :frozen but web.edn is missing")))))
 
 (defn bundle
   "A bundle from its files (`{relative-path text}`), or throws with its
    problems. `:id` is the bundle's content id: any change is a new bundle,
-   so a Scorecard never mixes versions."
-  [name files]
-  (when-let [problems (seq (check-files files))]
-    (throw (ex-info (str "Workflow bundle " name " is not well formed: " (str/join "; " problems))
-                    {:type ::invalid-bundle :problems (vec problems)})))
-  (let [definition (read-edn files "workflow.edn")
-        packed (fixture-pack/decode files)]
-    {:name name
+   so a Scorecard never mixes versions. Default validation is :benchmark;
+   :program allows ordinary execution without an evaluation pack. Both purposes
+   retain identical file-derived identities and neither evaluates checker code."
+  ([name files] (bundle name files :benchmark))
+  ([name files purpose]
+   (when-let [problems (seq (check-files files purpose))]
+     (throw (ex-info (str "Workflow bundle " name " is not well formed: " (str/join "; " problems))
+                     {:type ::invalid-bundle :problems (vec problems)})))
+   (let [definition (read-edn files "workflow.edn")
+         packed (fixture-pack/decode files)]
+     {:name name
      ;; what it was made of: what travels into a room (`room-run`)
-     :files files
-     :definition definition
-     :checker (get files "checker.clj")
-     :gold (read-edn files "gold.edn")
-     :calibration (read-edn files "calibration.edn")
+      :files files
+      :definition definition
+      :checker (get files "checker.clj")
+      :gold (read-edn files "gold.edn")
+      :calibration (read-edn files "calibration.edn")
      ;; a case pack's: which rows became cases, which could not and why
-     :certification (read-edn files "certification.edn")
-     :web (when (= :frozen (:web definition)) (read-edn files "web.edn"))
-     :fixtures (into (into (sorted-map) (:shared packed))
-                     (keep (fn [[path text]]
-                             (when (str/starts-with? path "fixtures/")
-                               [(subs path (count "fixtures")) text])))
-                     files)
+      :certification (read-edn files "certification.edn")
+      :web (when (= :frozen (:web definition)) (read-edn files "web.edn"))
+      :fixtures (into (into (sorted-map) (:shared packed))
+                      (keep (fn [[path text]]
+                              (when (str/starts-with? path "fixtures/")
+                                [(subs path (count "fixtures")) text])))
+                      files)
      ;; a dataset: cases/<id>/fixtures/… and cases/<id>/gold.edn, one
      ;; environment per case (its fixtures over the shared ones, its gold)
-     :cases (reduce (fn [cases [path text]]
-                      (if-let [[_ id rest] (re-find #"^cases/([^/]+)/(.+)$" path)]
-                        (cond
-                          (= rest "gold.edn") (assoc-in cases [id :gold] (read-edn files path))
-                          (str/starts-with? rest "fixtures/")
-                          (assoc-in cases [id :fixtures (subs rest (count "fixtures"))] text)
-                          :else cases)
-                        cases))
-                    (into (sorted-map) (for [[id fixtures] (:cases packed)] [id {:fixtures fixtures}])) files)
-     :id (hasch/uuid [:dvergr/room-workflow files])}))
+      :cases (reduce (fn [cases [path text]]
+                       (if-let [[_ id rest] (re-find #"^cases/([^/]+)/(.+)$" path)]
+                         (cond
+                           (= rest "gold.edn") (assoc-in cases [id :gold] (read-edn files path))
+                           (str/starts-with? rest "fixtures/")
+                           (assoc-in cases [id :fixtures (subs rest (count "fixtures"))] text)
+                           :else cases)
+                         cases))
+                     (into (sorted-map) (for [[id fixtures] (:cases packed)] [id {:fixtures fixtures}])) files)
+      :id (hasch/uuid [:dvergr/room-workflow files])})))
 
 (defn case-of
   "The case an environment of bundle `b` runs, from its metadata; nil for a
