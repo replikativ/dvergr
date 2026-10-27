@@ -130,8 +130,9 @@
   "Maximum wait for HTTP response headers, before stream-idle supervision can
    begin. A TCP connect timeout alone does not bound a provider that accepts
    the request but never opens its response. Streaming bodies keep their own
-   idle deadline after headers arrive."
-  180000)
+   idle deadline after headers arrive. Ten minutes accommodates reasoning-only
+   work before visible output; this is a per-dispatch bound, not a turn limit."
+  600000)
 
 (defn- make-request
   "Make HTTP request with error handling. Returns response or throws. The
