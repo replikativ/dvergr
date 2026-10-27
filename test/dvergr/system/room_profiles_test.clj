@@ -1,6 +1,7 @@
 (ns dvergr.system.room-profiles-test
   (:require [clojure.test :refer [deftest is]]
             [datahike.api :as d]
+            [datahike.db :as value-db]
             [datahike.tx-preds :as tx-preds]
             [dvergr.chat.schema :as chat-schema]
             [dvergr.substrate.geschichte :as g]
@@ -17,7 +18,10 @@
                     :crypto-hash? true :keep-history? false :attribute-refs? false})
         msgs-cfg (cfg) repo-cfg (cfg) root (context/create-execution-context)
         room-id (random-uuid) slug (str "profile-" room-id) chat-id (rooms/msgs-chat-id slug)
-        repo-id (random-uuid) msgs-id (random-uuid)]
+        repo-id (random-uuid) msgs-id (random-uuid)
+        control (atom (d/db-with (value-db/empty-db db/schema {:schema-flexibility :write})
+                                 [{:system/id repo-id :system/type :repo :system/repository-profile :fixture/knowledge}
+                                  {:room/id room-id :room/slug slug :room/default-repository [:system/id repo-id]}]))]
     (rooms/clear-room-ctxs!)
     (d/create-database msgs-cfg)
     (d/create-database repo-cfg)
@@ -28,7 +32,8 @@
                                  {:room/slug slug :room/type :internal})])
         (repo/init! repository {:name "Existing typed repository"})
         (with-redefs-fn
-          {#'db/all-rooms (fn [] [{:room/id room-id :room/slug slug}])
+          {#'db/get-conn (constantly control)
+           #'db/all-rooms (fn [] [{:room/id room-id :room/slug slug}])
            #'db/systems-for-room (fn [_] [{:system {:system/id repo-id :system/type :repo :system/scope "/fixture/repo"
                                                     :system/repository-profile :fixture/knowledge}}
                                           {:system {:system/id msgs-id :system/type :msgs :system/scope "/fixture/msgs"}}])
@@ -38,10 +43,7 @@
              (f {:room-id room-id :msgs msgs :repository repository :root root})))
         (finally
           (governance/ungovern! msgs)
-          (when-let [ctx (try (rooms/room-ctx-for room-id) (catch clojure.lang.ExceptionInfo _ nil))]
-            (binding [ec/*execution-context* ctx]
-              (doseq [[_ system] (ygg/registered-systems)] (d/release (:conn system)))))
-          (rooms/clear-room-ctxs!)
+          (binding [ec/*execution-context* root] (rooms/release-room-stores!))
           (d/release msgs)
           (d/release repository)
           (d/delete-database msgs-cfg)

@@ -107,7 +107,7 @@
       (binding [rtc/*execution-context* ctx]
         ((requiring-resolve 'dvergr.agent.room-context/clear-all!))
         (try ((requiring-resolve 'dvergr.rooms.messages/clear-all!))     (catch Throwable _))
-        (try ((requiring-resolve 'dvergr.system.rooms/clear-room-ctxs!)) (catch Throwable _)))
+        ((requiring-resolve 'dvergr.system.rooms/release-room-stores!)))
         ;; release the ctx's drain thread / executor (was leaked — never closed)
       (d/close-shutdown-contexts! shutdown)
       (reset! !lite-ctx nil)

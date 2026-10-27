@@ -190,7 +190,6 @@
     held))
 
 (defn- assert-no-retained-preparation! []
-  (doseq [[id entry] @room-ctxs] (assert-readable-entry! id entry))
   (when (some retained-preparation? (vals @room-hydration-errors))
     (throw (ex-info "Room bootstrap ownership must be reconciled before reset or release"
                     {:type ::pending-room-preparation}))))
@@ -207,20 +206,55 @@
     (swap! room-hydration-errors dissoc room-id)
     true))
 
+(defn- release-published-entry! [id entry]
+  (let [ctx (:ctx entry) root (rctx/current-root)
+        room (:room entry)
+        current! (fn []
+                   (when-not (and (identical? entry (get @room-ctxs id))
+                                  (identical? root (rctx/root-ctx ctx))
+                                  (nil? (room-registry/lookup (room-store/slug->room-id (:slug entry))))
+                                  (not-any? #(rctx/descendant-context? (:ctx %) ctx)
+                                            (room-registry/list-rooms))
+                                  (or (nil? room)
+                                      ((requiring-resolve 'dvergr.discourse/room-closed?) room)))
+                     (throw (ex-info "Room native shutdown has no quiescent exact owner"
+                                     {:type ::room-runtime-held :room/id id}))))
+        release! (fn []
+                   (binding [ec/*execution-context* ctx]
+                     (preparation/retire-published! (:owner entry) current!))
+                   (current!)
+                   (replace-entry! id entry nil))]
+    (current!)
+    (if room
+      (room-registry/with-close-reservation! room :removed (fn [_] (release!)))
+      ;; An unpublished runtime has no Room to reserve. The caller's stopped
+      ;; ingress contract excludes constructors; phase fencing and the exact
+      ;; context registration checks remain active throughout native cleanup.
+      (release!))))
+
 (defn release-room-stores!
-  "Release the Datahike connection of every store registered in a room's
-   context, all of its leases, and drop the room contexts: the daemon owns
-   them and is stopping. Datahike caches connections by store id, so a
-   connection left open would be handed out again to a same-process restart.
-   Best-effort per store; call once everything that writes has stopped."
+  "HOST shutdown after ingress and writers have stopped. Tracked profile
+   owners use their exact acquisition journal; failures preserve their entry
+   and progress. Normal shutdown preserves active control rows and files.
+   Legacy untracked contexts retain their existing best-effort release policy."
   []
   (assert-no-retained-preparation!)
-  (doseq [[_ {:keys [ctx]}] @room-ctxs]
-    (binding [ec/*execution-context* ctx]
-      (doseq [[_ system] (try (ygg/registered-systems) (catch Throwable _ {}))
-              :let [conn (:conn system)]
-              :when conn]
-        (try (d/release conn true) (catch Throwable _ nil)))))
+  (when (some :owner (vals @room-ctxs))
+    (when-not (and (not (simple/on-drain-thread?)) (ec/execution-context-bound?)
+                   (identical? (ec/current-execution-context) (rctx/current-root))
+                   (every? #(identical? (rctx/current-root) (rctx/root-ctx (:ctx %)))
+                           (vals @room-ctxs)))
+      (throw (ex-info "Tracked Room shutdown requires the owning host root"
+                      {:type ::requires-host-root}))))
+  (doseq [[id {:keys [ctx owner] :as entry}] @room-ctxs]
+    (if owner
+      (release-published-entry! id entry)
+      (do
+        (binding [ec/*execution-context* ctx]
+          (doseq [[_ system] (try (ygg/registered-systems) (catch Throwable _ {}))
+                  :let [conn (:conn system)] :when conn]
+            (try (d/release conn true) (catch Throwable _ nil))))
+        (replace-entry! id entry nil))))
   (clear-room-ctxs!))
 
 (defn clear-room-ctxs!
@@ -228,8 +262,18 @@
    restart doesn't reuse stale forked ctxs pointing at the previous daemon root."
   []
   (assert-no-retained-preparation!)
-  (reset! room-ctxs {})
-  (reset! room-hydration-errors {}))
+  (swap! room-ctxs
+         (fn [entries]
+           (when (some :owner (vals entries))
+             (throw (ex-info "Release published Room acquisitions before clearing their ownership"
+                             {:type ::room-runtime-held})))
+           {}))
+  (swap! room-hydration-errors
+         (fn [errors]
+           (when (some retained-preparation? (vals errors))
+             (throw (ex-info "Room bootstrap ownership appeared during reset"
+                             {:type ::pending-room-preparation})))
+           {})))
 
 (defn- scope-path [scope] (str (io/file (paths/systems-dir) scope)))
 
