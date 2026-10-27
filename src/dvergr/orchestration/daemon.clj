@@ -1204,7 +1204,8 @@
   (let [shutdown (d/close-registered-rooms! (:execution-ctx daemon))]
     (room-context/clear-all!)
     (sdist/unregister-context! :default)
-    (srooms/release-room-stores!)
+    (binding [rtc/*execution-context* (:execution-ctx daemon)]
+      (srooms/release-room-stores!))
     (d/close-shutdown-contexts! shutdown))
 
   (reset! (:status daemon) :stopped)
@@ -1225,7 +1226,8 @@
   (if-let [room @starting-room]
     (let [shutdown (d/close-registered-rooms! (:ctx room))]
       (room-context/clear-all!)
-      (srooms/release-room-stores!)
+      (binding [rtc/*execution-context* (:ctx room)]
+        (srooms/release-room-stores!))
       (d/close-shutdown-contexts! shutdown)
       (reset! starting-room nil))
     (srooms/release-room-stores!))

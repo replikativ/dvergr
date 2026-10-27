@@ -49,3 +49,15 @@ Retained evidence is independent of the live runtime: a pinned checkpoint must
 remain readable from its preserved store after the Room's live leases are gone.
 The retirement regressions verify this with a file-backed repository, an outsider
 lease, and a cold reopen of the pinned commit.
+
+## Daemon shutdown and reset
+
+After ingress and writers stop, shutdown consumes tracked profile owners through
+that same acquisition journal. A bound Room must have acknowledged close and no
+registered alias or descendant may still own its context. A prepared context
+without a registered Room is checked under the shutdown ingress fence. Normal
+shutdown does not archive durable Rooms; they can hydrate with fresh ownership
+on the next start. A failed owner retains its entry and progress, while already
+acknowledged entries stay evicted. Reset refuses every remaining acquisition
+owner rather than dropping its journal. Untracked contexts retain their existing
+shutdown policy; this does not infer a retirement journal for them.

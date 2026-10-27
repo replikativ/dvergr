@@ -121,3 +121,99 @@
           (is (identical? (:ctx room) (rooms/room-ctx-for id)))
           (finally (discourse/close-room! replacement))))
       (is (true? (rooms/retire-room-runtime! id room))))))
+
+(deftest reset-cannot-forget-live-published-acquisitions
+  (with-profile
+    (fn [{:keys [id room]}]
+      (is (thrown? clojure.lang.ExceptionInfo (rooms/clear-room-ctxs!)))
+      (is (identical? (:ctx room) (rooms/room-ctx-for id)))
+      (is (thrown? clojure.lang.ExceptionInfo (rooms/release-room-stores!)))
+      (is (identical? room (registry/lookup (:id room))))
+      (is (identical? (:ctx room) (rooms/room-ctx-for id)))
+      (discourse/close-room! room)
+      (rooms/release-room-stores!)
+      (is (nil? (rooms/room-ctx-for id))))))
+
+(deftest shutdown-consumes-the-journal-without-archiving-or-forcing-an-outsider
+  (with-profile
+    (fn [{:keys [id room root]}]
+      (let [conn (:conn (binding [ec/*execution-context* (:ctx room)] (rooms/default-workspace id)))
+            config (:config @conn) outsider (d/connect config)
+            release d/release releases (atom 0)]
+        (try
+          (discourse/close-room! room)
+          (with-redefs [d/release (fn [owned] (release owned) (swap! releases inc))]
+            (rooms/release-room-stores!)
+            (rooms/release-room-stores!))
+          (is (= 3 @releases))
+          (is (nil? (rooms/room-ctx-for id)))
+          (is (nil? (:room/archived-at (d/entity @(db/get-conn) [:room/id id]))))
+          (is (some? (repo/log outsider)))
+          ;; Active durable Rooms can hydrate again with a fresh acquisition
+          ;; owner; shutdown does not turn them into archived benchmark Rooms.
+          (rooms/hydrate-rooms! {:repository-profiles (@#'native/policies (atom []))})
+          (let [reopened (live/register-prepared-room! id)]
+            (try
+              (is (not (identical? (:ctx room) (:ctx reopened))))
+              (is (identical? reopened (registry/lookup (:id reopened))))
+              (finally
+                (discourse/close-room! reopened)
+                (rooms/release-room-stores!))))
+          (finally (release outsider)))))))
+
+(deftest shutdown-retry-preserves-partial-release-acknowledgements
+  (with-profile
+    (fn [{:keys [id room]}]
+      (discourse/close-room! room)
+      (let [release d/release list-rooms registry/list-rooms
+            releases (atom 0) hold? (atom true)]
+        (with-redefs [d/release (fn [owned] (release owned) (swap! releases inc))
+                      registry/list-rooms
+                      (fn [& args]
+                        (if (and @hold? (pos? @releases))
+                          [(assoc room :id :temporary-context-owner)]
+                          (apply list-rooms args)))]
+          (is (thrown? clojure.lang.ExceptionInfo (rooms/release-room-stores!)))
+          (is (= 1 @releases))
+          (is (thrown? clojure.lang.ExceptionInfo (rooms/room-ctx-for id)))
+          (is (thrown? clojure.lang.ExceptionInfo (rooms/clear-room-ctxs!)))
+          (reset! hold? false)
+          (rooms/release-room-stores!)
+          (is (= 3 @releases))
+          (is (nil? (rooms/room-ctx-for id))))))))
+
+(deftest failed-owner-shutdown-never-clears-the-cache-as-compensation
+  (with-profile
+    (fn [{:keys [id room]}]
+      (discourse/close-room! room)
+      (with-redefs [dvergr.system.room-preparation/retire-published!
+                    (fn [& _] (throw (ex-info "Test fence before native release" {})))]
+        (is (thrown? clojure.lang.ExceptionInfo (rooms/release-room-stores!)))
+        (is (identical? (:ctx room) (rooms/room-ctx-for id)))
+        (is (thrown? clojure.lang.ExceptionInfo (rooms/clear-room-ctxs!))))
+      (rooms/release-room-stores!)
+      (is (nil? (rooms/room-ctx-for id))))))
+
+(deftest publication-racing-with-reset-cannot-lose-its-acquisition-owner
+  (with-profile
+    (fn [{:keys [id room]}]
+      (let [cache (var-get #'rooms/room-ctxs)
+            original @cache entry (get original id)
+            ;; A unique unowned snapshot makes the interleaving deterministic.
+            initial {::unowned {:ctx (:ctx room)}}
+            values vals injected? (atom false)]
+        (try
+          (reset! cache initial)
+          (with-redefs [clojure.core/vals
+                        (fn [entries]
+                          (let [result (values entries)]
+                            ;; The first read sees no owner, but publication
+                            ;; commits before clear can replace that snapshot.
+                            (when (and (identical? entries initial)
+                                       (compare-and-set! injected? false true))
+                              (reset! cache (assoc initial id entry)))
+                            result))]
+            (is (thrown? clojure.lang.ExceptionInfo (rooms/clear-room-ctxs!))))
+          (is @injected?)
+          (is (identical? entry (get @cache id)))
+          (finally (reset! cache original)))))))

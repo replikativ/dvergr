@@ -3,6 +3,8 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [dvergr.orchestration.daemon :as daemon]
             [dvergr.system.db :as sdb]
+            [dvergr.system.rooms :as rooms]
+            [org.replikativ.spindel.engine.core :as ec]
             [dvergr.substrate.paths :as paths]
             [dvergr.substrate.config :as config]
             [dvergr.security.allowlist :as allowlist]
@@ -67,7 +69,13 @@
           (is (false? (:telegram-connected? status))))
 
       ;; Stop
-        (is (= :stopped (daemon/stop! d)))
+        (let [release rooms/release-room-stores!]
+          (with-redefs [rooms/release-room-stores!
+                        (fn []
+                          (is (identical? (:execution-ctx d) ec/*execution-context*)
+                              "shutdown releases under the actual owning root")
+                          (release))]
+            (is (= :stopped (daemon/stop! d)))))
         (is (= :stopped @(:status d)))
         (finally (when (not= :stopped @(:status d)) (daemon/stop! d)))))))
 
