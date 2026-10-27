@@ -44,7 +44,8 @@
                             :assembly/version :assembly/control-store :assembly/upstream-versions
                             :assembly/spindel-descriptor :assembly/cut :assembly/claims
                             :assembly/components :assembly/effect-policy :assembly/resource-authority}
-                   :room #{:room/id :room/world :room/kind :schema/version})]
+                   :room (cond-> #{:room/id :room/world :room/kind :schema/version}
+                           (= 2 (:schema/version record)) (conj :room/discourse)))]
     (when-not (and (map? record) (= required (set (keys record))))
       (v/fail! :invalid-control-record {:kind kind})))
   (try
@@ -57,8 +58,14 @@
       :room
       (do (v/identity! :room (:room/id record))
           (v/identity! :world (:room/world record))
-          (when-not (and (= 1 (:schema/version record)) (= :root (:room/kind record)))
-            (v/fail! :invalid-control-record {})))
+          (when-not (and (#{1 2} (:schema/version record)) (= :root (:room/kind record)))
+            (v/fail! :invalid-control-record {}))
+          (when (= 2 (:schema/version record))
+            (let [d (:room/discourse record)]
+              (when-not (and (= #{:system :projection :retention} (set (keys d)))
+                             (uuid? (:projection d)) (= :indefinite (:retention d)))
+                (v/fail! :invalid-control-record {}))
+              (v/identity! :system (:system d)))))
       :world
       (do (doseq [k [:world/id :world/root]] (v/identity! :world (get record k)))
           (v/identity! :control-store (:assembly/control-store record))
@@ -88,3 +95,48 @@
     (catch clojure.lang.ExceptionInfo _
       (v/fail! :invalid-control-record {:kind kind})))
   record)
+
+(defn ^:no-doc discourse-schema
+  "Dedicated work schema; no control attributes."
+  []
+  (mapv (fn [[id type unique?]]
+          (cond-> {:db/ident id :db/valueType type :db/cardinality :db.cardinality/one}
+            unique? (assoc :db/unique :db.unique/identity)
+            (#{:discourse/projection :discourse/order} id) (assoc :db/index true)))
+        [[:discourse/key :db.type/string true]
+         [:discourse/payload :db.type/string false]
+         [:discourse/message :db.type/uuid true]
+         [:discourse/projection :db.type/uuid false]
+         [:discourse/order :db.type/string false]]))
+
+(def ^:no-doc discourse-attributes
+  #{:discourse/key :discourse/payload :discourse/message :discourse/projection :discourse/order})
+
+(defn ^:no-doc request! [request]
+  (try (v/portable! request limits)
+       (catch clojure.lang.ExceptionInfo _ (v/fail! :invalid-request {})))
+  request)
+
+(defn ^:no-doc message! [spec]
+  (request! spec)
+  (when-not (and (map? spec)
+                 (every? #{:id :recipients :type :body :reply-to :ask/id :run/id :tags :control/refs}
+                         (keys spec))
+                 (every? #(contains? spec %) [:id :recipients :type :body])
+                 (uuid? (:id spec)) (keyword? (:type spec))
+                 (map? (:body spec))
+                 (or (= :broadcast (:recipients spec))
+                     (and (= #{:participants} (set (keys (:recipients spec))))
+                          (set? (get-in spec [:recipients :participants]))
+                          (seq (get-in spec [:recipients :participants]))
+                          (every? uuid? (get-in spec [:recipients :participants]))))
+                 (every? #(or (nil? (get spec %)) (uuid? (get spec %))) [:reply-to :ask/id :run/id])
+                 (or (nil? (:tags spec)) (and (set? (:tags spec)) (every? keyword? (:tags spec))))
+                 (or (nil? (:control/refs spec)) (vector? (:control/refs spec))))
+    (v/fail! :invalid-request {}))
+  (when (or (#{"control" "settlement" "admission" "receipt" "funding" "world" "session"}
+             (namespace (:type spec)))
+            (some #(#{"control" "settlement" "admission" "receipt" "funding"}
+                    (namespace %)) (keys (:body spec))))
+    (v/fail! :reserved-control-kind {}))
+  spec)

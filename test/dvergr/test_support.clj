@@ -4,6 +4,7 @@
             [datahike.api :as d]
             [dvergr.room :as room]
             [dvergr.store :as store]
+            [dvergr.value :as value]
             [dvergr.world :as world]
             [dvergr.world.sci :as sci]
             [geschichte.repo :as repo]
@@ -55,6 +56,8 @@
   ([installation parent] (frozen! installation parent {}))
   ([installation parent {:keys [systems sci? snapshots] :or {sci? true}}]
    (world/live! installation parent)
+   (when (seq (get @(:owners installation) (get-in parent [:descriptor :world/id])))
+     (value/fail! :world-busy {}))
    (let [selected (or systems (set (keys (:systems parent))))
          opts (cond-> {:mode :frozen :systems selected :sync? true
                        :forkable-components (if (and sci? (:sci-ref parent))

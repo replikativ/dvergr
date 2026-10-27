@@ -88,6 +88,7 @@
   (doseq [[ns-name names] operations [name spec] names]
     (when-not (and (map? spec) (= #{:system :operation} (set (keys spec)))
                    (keyword? (:operation spec))
+                   (not= :discourse/write (:operation spec))
                    (not (contains? (get bindings ns-name) name)))
       (v/fail! :unsupported-sci-option {})))
   manifest)

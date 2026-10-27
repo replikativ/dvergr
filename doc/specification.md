@@ -417,11 +417,11 @@ are separate operations. Delivering a speculative message outside its permitted 
 
 | Law | Statement | Status |
 |---|---|---|
-| D1 | On a store-backed bus, posting persists the envelope before live publication; a retried post with the same identity is one message. | holds (`test/dvergr/runtime/durable_cursor_bus_test.clj:16,48`; `test/dvergr/runtime/multicast_test.clj:10`) |
-| D2 | Each participant handler receives a matching message at most once per live-delivery session; raw bus subscribers may see redelivery after cursor recovery and are not participants. | target (raw redelivery intended, `durable_cursor_bus_test.clj:70`) |
+| D1 | On a store-backed bus, posting persists the envelope before live publication; a retried post with the same identity is one message. | holds on `next`, slice 2a durable surface; live publication is not offered. `test/dvergr/laws/discourse_test.clj`: `d1-posting-command-model`, `d1-history-independent-origins-and-fixed-pagination`, `d1-w1-history-cursors-cannot-read-child-or-sibling`, `d1-history-pages-budget-aggregate-envelopes`; `test/dvergr/adapters/discourse_test.clj`: `d1-commit-ambiguity-and-no-publication`; `test/dvergr/process/discourse_test.clj`: `d1-d4-process-history` |
+| D2 | Each participant handler receives a matching message at most once per live-delivery session; raw bus subscribers may see redelivery after cursor recovery and are not participants. | target (raw redelivery intended) |
 | D3 | An `ask` has at most one terminal resolution — reply, timeout, cancellation or leave (a missing participant resolves as leave, handler failure as an error reply, deliberate suppression as timeout). The deadline makes timeout due; resolution and cleanup complete eventually under the declared scheduler and recovery progress assumptions; no subscription or obligation leaks. | target |
-| D4 | Creating a discourse branch creates no isolated world; programs in it act on the shared world within their capabilities. | target (*current:* `fork-room :none` and `:ctx` share one name) |
-| D5 | Control-history events are never written to a work-message branch, and speculative messages leave their domain only through the effect boundary. | target |
+| D4 | Creating a discourse branch creates no isolated world; programs in it act on the shared world within their capabilities. | holds on `next`, slice 2a durable projections and decision bindings. `test/dvergr/laws/discourse_test.clj`: `d4-shared-world-and-fixed-parent-history`; `test/dvergr/adapters/discourse_test.clj`: `d4-versioned-decider-and-closed-owner`, `d4-w1-decision-binding-validates-projection-and-system`, `w1-w2-durable-writers-use-caller-world` |
+| D5 | Control-history events are never written to a work-message branch, and speculative messages leave their domain only through the effect boundary. | holds on `next`, slice 2a durable surface; external delivery refuses. `test/dvergr/laws/discourse_test.clj`: `d5-control-separation-and-egress-refusal`; `test/dvergr/adapters/discourse_test.clj`: `d5-closed-work-writers-and-host-injection`, `w5-d5-work-merge-preserves-control-and-never-publishes` |
 
 ## 8. Runs and Attempts
 

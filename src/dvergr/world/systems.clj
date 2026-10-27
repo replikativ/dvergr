@@ -12,12 +12,12 @@
             [yggdrasil.adapters.geschichte :as git]
             [yggdrasil.protocols :as p]))
 
-(defrecord ^:private Installation [id control live lock])
+(defrecord ^:private Installation [id control live lock owners])
 (alter-meta! #'->Installation assoc :private true)
 (alter-meta! #'map->Installation assoc :private true)
 
 (defn ^:no-doc installation [control]
-  (->Installation (:installation/id (store/info control)) control (atom {}) (Object.)))
+  (->Installation (:installation/id (store/info control)) control (atom {}) (Object.) (atom {})))
 
 (def ^:dynamic ^:no-doc *installation* nil)
 
@@ -42,7 +42,7 @@
       (v/fail! :unrelated-lineage {}))
     world))
 
-(def ^:private operation-vocabulary #{:datahike/pull :datahike/transact})
+(def ^:private operation-vocabulary #{:datahike/pull :datahike/transact :discourse/read :discourse/write})
 
 (defn ^:no-doc validate-spec! [control spec]
   (let [{:keys [id adapter connection operations attributes ownership]} spec]
@@ -57,6 +57,20 @@
                    (not-any? #(#{"db" "db.install" "db.alter"} (namespace %)) attributes)
                    (instance? datahike.connector.Connection connection))
       (v/fail! :unsupported-adapter {}))
+    (when (and (or (some schema/discourse-attributes attributes)
+                   (some #{:discourse/read :discourse/write} operations))
+               (or (not= attributes schema/discourse-attributes)
+                   (not= operations #{:discourse/read :discourse/write})))
+      (v/fail! :invalid-discourse-system {}))
+    (when (= attributes schema/discourse-attributes)
+      (when-not (and (true? (:keep-history? (:config @connection)))
+                     (true? (:commit-graph? (:config @connection)))
+                     (every? (fn [expected]
+                               (= expected (select-keys
+                                            (d/pull @connection '[*] [:db/ident (:db/ident expected)])
+                                            (keys expected))))
+                             (schema/discourse-schema)))
+        (v/fail! :invalid-discourse-system {})))
     (let [identity (store/storage-identity (:config @connection))
           control-id (store/provenance control)]
       (when-not identity (v/fail! :unsupported-adapter {}))
@@ -163,14 +177,19 @@
           {:keys [system-id]} (handle-data handle)
           world (get @(:live installation) (context/get-fork-id (ec/current-execution-context)))
           spec (get (:systems world) system-id)]
-      (request! spec operation request)
+      (if (#{:discourse/read :discourse/write} operation)
+        (schema/request! request)
+        (request! spec operation request))
       (try
         (v/portable!
          (case operation
+           (:discourse/read :discourse/write)
+           (store/work! system operation request)
            :datahike/pull (d/pull @(:conn system) (:selector request) (:eid request))
            :datahike/transact
            (let [report (d/transact (:conn system) request)]
              {:tempids (:tempids report) :datom-count (count (:tx-data report))}))
          schema/limits)
         (catch Throwable e
-          (throw (ex-info "Work adapter failed" {:dvergr/error :adapter-failure} e)))))))
+          (if (:dvergr/error (ex-data e)) (throw e)
+              (throw (ex-info "Work adapter failed" {:dvergr/error :adapter-failure} e))))))))

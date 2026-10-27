@@ -112,7 +112,8 @@
   [installation world]
   (locking (:lock installation)
     (live! installation world)
-    (when (or (pos? @(:active world)) (:fork-handle world)
+    (when (or (seq (get @(:owners installation) (get-in world [:descriptor :world/id])))
+              (pos? @(:active world)) (:fork-handle world)
               (some #(= (get-in world [:descriptor :world/id])
                         (get-in % [:descriptor :world/source])) (vals @(:live installation))))
       (v/fail! :world-busy {}))

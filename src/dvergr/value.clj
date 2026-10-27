@@ -50,7 +50,7 @@
      :world (and (keyword? value) (nil? (namespace value))
                  (boolean (re-matches #"(?:root-|fork-)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
                                       (name value))))
-     (:installation :control-store :room :run :attempt :grant :reservation
+     (:installation :control-store :message :projection :participant :decision :room :run :attempt :grant :reservation
                     :receipt :admission :cancellation :settlement :recovery :account)
      (uuid? value)
      :system (or (keyword? value) (and (string? value) (<= 1 (count value) 256)))

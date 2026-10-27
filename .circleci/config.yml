@@ -23,7 +23,7 @@ executors:
     working_directory: ~/repo
     resource_class: large
     environment:
-      JVM_OPTS: "-Xmx1500m"
+      JAVA_TOOL_OPTIONS: "-Xmx1500m"
 
 jobs:
   setup:
@@ -79,6 +79,9 @@ jobs:
           # the suite's JVM reopens only the control store.
           name: Persist lineage evidence in a separate JVM
           command: clojure -Sdeps '{:paths ["src" "test"]}' -M -m dvergr.process.lineage-test /tmp/dvergr-process-evidence
+      - run:
+          name: Persist discourse evidence in a separate JVM
+          command: clojure -Sdeps '{:paths ["src" "test"]}' -M -m dvergr.process.discourse-test /tmp/dvergr-process-evidence
       - run:
           name: Run all core test suites (kaocha)
           command: DVERGR_PROCESS_EVIDENCE=/tmp/dvergr-process-evidence clojure -M:test
