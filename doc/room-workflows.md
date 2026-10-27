@@ -491,3 +491,14 @@ job cancellation interrupts them and room teardown waits for their termination.
 
 Cancellation durably escalates every remaining undecided attempt before it
 propagates, including attempts whose reviewer has not started.
+
+### Ordinary program validation
+
+`dvergr.catalog.room/check-files` and `dvergr.catalog.room/bundle` default to
+strict benchmark validation. Their explicit `:program` purpose validates the
+same workflow definition but does not require `checker.clj` or fixtures/cases.
+This supports ordinary execution with no evaluation pack. Hosts still validate
+supported execution policies, inputs and resource limits before admission.
+Benchmark consumers retain the default strict validation. The two purposes
+produce the same file-derived bundle identity for identical files; neither
+purpose executes the checker during parsing or inspection.

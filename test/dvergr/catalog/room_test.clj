@@ -395,3 +395,28 @@
       (is (= 0.0 (:reward (verdict scoring {:result {:run/status :cancelled}})))))
     (testing "a completed attempt scores as before"
       (is (= 1.0 (:reward (verdict scoring {:result {:run/status :completed}})))))))
+
+(deftest ordinary-program-validation-keeps-benchmark-validation-strict
+  (let [program {"workflow.edn" "{:title \"Task\" :task \"Write /out/result.md\" :capture [\"/out\"]}"}
+        parsed (room-wf/bundle "task" program :program)]
+    (is (empty? (room-wf/check-files program :program)))
+    (is (nil? (:checker parsed)))
+    (is (empty? (:fixtures parsed)))
+    (is (empty? (:cases parsed)))
+    (is (= 2 (count (room-wf/check-files program))))
+    (is (thrown? Exception (room-wf/bundle "task" program)))
+    (is (= (:id (room-wf/bundle "competitors" files))
+           (:id (room-wf/bundle "competitors" files :program))))
+    (doseq [text ["true" "nil" "[]" "{:title \"missing task\"}" "{:title"]]
+      (is (seq (room-wf/check-files (assoc program "workflow.edn" text) :program))))
+    (is (thrown? Exception (room-wf/check-files program :unknown)))
+    (is (thrown? Exception (room-wf/bundle "task" program :unknown)))))
+
+(deftest program-validation-does-not-bypass-fixture-pack-validation
+  (let [program {"workflow.edn" "{:title \"Task\" :task \"Read input\"}"}
+        pack (pr-str {:kind :dvergr/fixture-pack :version 1 :files {"/docs/a.md" "packed"}})]
+    (doseq [source [(assoc program "fixture-pack.edn" "{}")
+                    (assoc program "cases/unselected/fixture-pack.edn" "nil")
+                    (assoc program "fixture-pack.edn" pack "fixtures/docs/a.md" "inline")]]
+      (is (seq (room-wf/check-files source :program)))
+      (is (thrown? clojure.lang.ExceptionInfo (room-wf/bundle "task" source :program))))))
