@@ -10,7 +10,8 @@
 (defn- allocated-bytes [thread-id]
   (.getThreadAllocatedBytes ^com.sun.management.ThreadMXBean mx (long thread-id)))
 ;; Plain ThreadLocal: semantic binding frames/continuations never convey it.
-(def ^:private current-observation (ThreadLocal.))
+;; This Var is read at every checkpoint; reflection allocates method arrays.
+(def ^:private ^ThreadLocal current-observation (ThreadLocal.))
 
 (defn- observation [kind]
   (let [thread-id (.getId (Thread/currentThread))]
