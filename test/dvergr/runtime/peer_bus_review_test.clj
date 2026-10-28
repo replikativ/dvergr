@@ -121,7 +121,7 @@
   (binding [ec/*execution-context* *base-ctx*]
     (let [parent (d/room :rollback-grant-parent *base-ctx*)
           grant {:room-id (random-uuid) :name "scratch" :scope :room}
-          dropped (atom nil)
+          dropped (atom [])
           bad (assoc (d/echo :bad-grant)
                      :factory (fn [_]
                                 (ec/swap-state! [:dvergr/pending-grants]
@@ -130,7 +130,7 @@
       (d/join parent bad)
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"clone failed after grant"
-           (with-redefs [srooms/drop-fork-grants! #(reset! dropped %)]
+           (with-redefs [srooms/drop-fork-grant! #(swap! dropped conj %)]
              (d/fork-room parent {:isolation :ctx}))))
       (is (= [grant] @dropped)
           "rollback releases storage grants provisioned inside the child world"))))
