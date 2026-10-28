@@ -595,25 +595,39 @@
            {:store {:backend :memory :id physical-id}})))
 
 (defn dispose-ephemeral-databases!
-  "Release and delete every process-global scratch database owned by the
-   currently selected interpreter world. Returns cleanup errors, if any."
+  "Release/delete selected scratch databases. Incomplete exact entries remain
+   owned for retry; connection release and deletion have separate ACKs. The
+   caller must fence work using this capability before starting cleanup."
   [binding-resolver binding-swap!]
   (when (and binding-resolver binding-swap!)
     (let [entries (or (:ephemeral-databases (binding-resolver)) {})
-          errors (reduce-kv
-                  (fn [errors name entry]
-                    (let [conn (entry-conn entry)
-                          cfg (:config entry)]
-                      (try
-                        (when conn (d/release conn))
-                        (when (and cfg (d/database-exists? cfg))
-                          (d/delete-database cfg))
-                        errors
-                        (catch Throwable error
-                          (conj errors {:name name :error error})))))
-                  [] entries)]
-      (binding-swap! assoc :ephemeral-databases {})
-      errors)))
+          update-entry!
+          (fn [name expected f]
+            (binding-swap!
+             (fn [binding]
+               (when-not (identical? expected (get-in binding [:ephemeral-databases name]))
+                 (throw (ex-info "Scratch cleanup no longer owns its exact database"
+                                 {:type ::stale-cleanup :name name})))
+               (update binding :ephemeral-databases f))))]
+      (reduce-kv
+       (fn [errors name entry]
+         (try
+           (let [conn (entry-conn entry)
+                 cfg (:config entry)
+                 released
+                 (if (and conn (not (::connection-released? entry)))
+                   (do
+                     (d/release conn)
+                     (get-in (update-entry! name entry
+                                            #(assoc % name (assoc entry ::connection-released? true)))
+                             [:ephemeral-databases name]))
+                   entry)]
+             (when (and cfg (d/database-exists? cfg))
+               (d/delete-database cfg))
+             (update-entry! name released #(dissoc % name))
+             errors)
+           (catch Throwable error (conj errors {:name name :error error}))))
+       [] entries))))
 
 (def ^:private sealing-safe-fns
   "Datahike's `safe-fns` (pure core, string and math functions), each seeing

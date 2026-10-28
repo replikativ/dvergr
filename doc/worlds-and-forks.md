@@ -124,6 +124,23 @@ Drains follow selected slots by their current lease identity, including a cleanu
 transfer occurring after the drain snapshot; the old owner's exit alone cannot
 acknowledge its replacement cleanup. The original join deadline is retained.
 
+Cached agent interpreters use the same retryable Room cleanup receipts when a
+projection is rebuilt, synchronous cache setup fails, or an agent is removed. Construction reserves
+a receipt before allocating; publication transfers its exact acquisition to the
+cache under the Room monitor. Release callbacks run outside that monitor. A
+failed release retains its interpreter and original callback for a later Room or
+agent drain, and prevents synchronous reuse by that agent until cleanup succeeds.
+Extension acquisitions capture their installer/destructor pair and acknowledge
+successful releases individually, in reverse acquisition order. Scratch database
+cleanup selects the exact owning world and retains connection-release progress
+when database deletion fails.
+
+These receipts do not establish a general Spindel task-tree join or enable
+automatic SCI retirement. Extension callbacks remain responsible for joining
+their own native work. The separate Run/preparation supervisor currently records
+cleanup failure without retrying that callback; recovering that path is a further
+supervisor change, not a guarantee of these cache cleanup receipts.
+
 ### Owned native SCI invocations
 
 Trusted application adapters use `dvergr.sandbox/start-evaluation!` with a

@@ -1345,17 +1345,21 @@
     audit-log))
 
 (defn release-agent-resources!
-  "Release disposable host resources owned by one SCI capability in `ctx`.
-   Durable/mergeable world state is deliberately untouched."
+  "Release disposable resources for the exact selected capability world.
+   Failed scratch cleanup remains owned and prevents interpreter removal."
   [ctx capability-id]
   (when capability-id
-    (try
-      (let [resolver (runtime-ctx/sandbox-binding-resolver ctx capability-id)
-            swap! (fn [f & args]
-                    (apply runtime-ctx/update-sandbox-binding!
-                           ctx capability-id f args))]
-        (ns-datahike/dispose-ephemeral-databases! resolver swap!))
-      (catch clojure.lang.ExceptionInfo _ nil))))
+    (binding [rtc/*execution-context* ctx]
+      (when (runtime-ctx/sandbox-binding ctx capability-id)
+        (let [resolver (runtime-ctx/sandbox-binding-resolver ctx capability-id)
+              swap! (fn [f & args]
+                      (apply runtime-ctx/update-sandbox-binding! ctx capability-id f args))
+              errors (ns-datahike/dispose-ephemeral-databases! resolver swap!)]
+          (when (seq errors)
+            (throw (ex-info "SCI scratch database cleanup is incomplete"
+                            {:type ::resource-cleanup-incomplete
+                             :databases (mapv :name errors)}
+                            (:error (first errors))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; clojure.test Integration (from Babashka)

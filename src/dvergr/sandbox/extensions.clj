@@ -86,12 +86,33 @@
       ((if (symbol? install) (requiring-resolve install) install) sci-ctx execution-ctx))
     sci-ctx))
 
+(defn snapshot
+  "Capture the exact installation and release functions for an acquisition.
+   Resolve before allocating a new interpreter. Later registry replacement must
+   not choose a different destructor for resources already acquired. HOST only."
+  [ids]
+  (let [resolve-fn (fn [f] (if (symbol? f) @(requiring-resolve f) f))]
+    (into (sorted-map)
+          (map (fn [id]
+                 (let [extension (lookup id)]
+                   [id (-> extension
+                           (update :install resolve-fn)
+                           (update :release resolve-fn))])))
+          ids)))
+
+(defn install-snapshot!
+  "Install a captured acquisition plan in its owning interpreter."
+  [sci-ctx execution-ctx plan]
+  (doseq [[_ {:keys [install]}] (sort-by key plan)]
+    (install sci-ctx execution-ctx))
+  sci-ctx)
+
 (defn release!
   "Release what the extensions `ids` hold for `sci-ctx` (their `:release`);
-   unknown ids and failures are skipped: releasing must not fail."
+   unknown ids have no acquired resources. Callback failures propagate so the
+   caller can retain ownership; returning is the callback's cleanup ACK."
   [sci-ctx ids]
   (doseq [id (sort ids)
           :let [release (:release (get @registry id))]
           :when (and sci-ctx release)]
-    (try ((if (symbol? release) (requiring-resolve release) release) sci-ctx)
-         (catch Throwable _ nil))))
+    ((if (symbol? release) (requiring-resolve release) release) sci-ctx)))

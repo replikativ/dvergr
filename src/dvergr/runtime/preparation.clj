@@ -326,25 +326,46 @@
    Called under the Room monitor by its pre-unregister hook, while that exact
    incarnation is still registered. Unlike ordinary failed worker cleanup, this
    host-owned, idempotent release can be retried by a later physical drain."
-  [room entries release!]
-  (when (simple/on-drain-thread?)
-    (throw (ex-info "Room cleanup requires a host thread"
-                    {:type ::blocking-cleanup :room-id (:id room)})))
-  (locking (:meta room)
-    (prune! room)
-    (when-not (binding [ec/*execution-context* (:ctx room)]
-                (identical? room (registry/lookup (:id room))))
-      (throw (ex-info "Room cleanup no longer owns the registered incarnation"
-                      {:type ::admission-closed :room-id (:id room)})))
-    (when (and (seq entries)
-               (>= (count (get @(:meta room) leases-key)) max-room-preparations))
-      (throw (ex-info "Room cleanup capacity exhausted"
-                      {:type ::capacity-exhausted :room-id (:id room)})))
-    (let [lease (room-cleanup-lease room entries release! nil)]
-      (when (seq entries)
+  ([room entries release!]
+   (retain-room-cleanup! room entries release! nil))
+  ([room entries release! agent-id]
+   (when (simple/on-drain-thread?)
+     (throw (ex-info "Room cleanup requires a host thread"
+                     {:type ::blocking-cleanup :room-id (:id room)})))
+   (locking (:meta room)
+     (prune! room)
+     (when-not (binding [ec/*execution-context* (:ctx room)]
+                 (identical? room (registry/lookup (:id room))))
+       (throw (ex-info "Room cleanup no longer owns the registered incarnation"
+                       {:type ::admission-closed :room-id (:id room)})))
+     (when (and (seq entries)
+                (>= (count (get @(:meta room) leases-key)) max-room-preparations))
+       (throw (ex-info "Room cleanup capacity exhausted"
+                       {:type ::capacity-exhausted :room-id (:id room)})))
+     (let [lease (cond-> (room-cleanup-lease room entries release! nil)
+                   agent-id (assoc :agent-id agent-id))]
+       (when (seq entries)
         ;; Retain BEFORE the caller detaches these entries from its live cache.
-        (swap! (:meta room) assoc-in [leases-key (:id lease)] lease))
-      lease)))
+         (swap! (:meta room) assoc-in [leases-key (:id lease)] lease))
+       lease))))
+
+(defn transfer-room-cleanup-entry!
+  "Acknowledge transfer of an unpublished acquisition to its published owner.
+   Caller holds the Room monitor, excludes concurrent cleanup, and has already
+   installed the receiver. This transfers ownership; it does not run disposal."
+  [{:keys [room id resource] :as lease} key expected]
+  (when-not (Thread/holdsLock (:meta room))
+    (throw (ex-info "Cleanup transfer requires the Room monitor"
+                    {:type ::unfenced-cleanup-transfer})))
+  (when-not (and (= :room-cleanup (:kind lease))
+                 (identical? lease (get-in @(:meta room) [leases-key id]))
+                 (identical? expected (get @resource key)))
+    (throw (ex-info "Cleanup transfer no longer owns its exact acquisition"
+                    {:type ::stale-cleanup-transfer})))
+  (swap! resource dissoc key)
+  (when (empty? @resource)
+    (swap! (:meta room) update leases-key dissoc id))
+  nil)
 
 (defn retain-host-cleanup!
   "Transfer an exact HOST owner's slot to retryable cleanup, including its
