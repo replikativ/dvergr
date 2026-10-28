@@ -51,7 +51,7 @@
 (defn- db-value? [x]
   (and (some? x) (not (instance? SandboxDb x)) (dbu/db? x)))
 
-(declare world-connection? callable? untrusted seal)
+(declare world-connection? callable? untrusted seal sealed-sequence)
 
 (def ^:private absent
   "The not-found marker of an entity lookup: an object no stored value is."
@@ -81,7 +81,7 @@
   (empty [_] {})
   (equiv [_ o] (and (instance? SandboxEntity o) (= e (.-e ^SandboxEntity o))))
   clojure.lang.Seqable
-  (seq [_] (seq (map (fn [[k v]] (clojure.lang.MapEntry. k (seal v))) e)))
+  (seq [_] (seq (mapv (fn [[k v]] (clojure.lang.MapEntry. k (seal v))) e)))
   Object
   (equals [this o] (.equiv this o))
   (hashCode [_] (hash e))
@@ -126,6 +126,53 @@
       x
       (rebuild x))))
 
+(defn- sequence-step [f]
+  (try (f)
+       (catch InterruptedException _
+         (.interrupt (Thread/currentThread))
+         (throw (InterruptedException. "Sandbox Datahike sequence interrupted")))
+       (catch Throwable error
+         ;; Lazy backend exceptions must not export raw DB/store values in
+         ;; their ex-data or cause after the initial mirrored call returned.
+         (throw (ex-info (str "Sandbox Datahike sequence failed: " (ex-message error))
+                         {:type ::sequence-failed})))))
+
+(deftype SealedSequence [source replay offset]
+  ;; Only the trusted datoms/seek-datoms boundary supplies a replay factory
+  ;; over an immutable database snapshot. Generic consuming results are usable
+  ;; locally but explicitly refuse forks. Neither source nor factory is exposed.
+  sci-fork/Forkable
+  (fork-value [_]
+    (when-not replay
+      (throw (ex-info "This sealed sequence has no immutable replay source"
+                      {:type ::nonreplayable-result})))
+    (sealed-sequence (delay (drop offset (replay))) replay offset))
+  clojure.lang.Sequential
+  clojure.lang.ISeq
+  (first [_] (seal (sequence-step #(first @source))))
+  (next [_] (when-let [tail (sequence-step #(next @source))]
+              (sealed-sequence (delay tail) replay (inc offset))))
+  (more [this] (or (.next this) ()))
+  (cons [this value] (clojure.lang.Cons. value this))
+  (seq [this] (when (sequence-step #(seq @source)) this))
+  (count [_] (sequence-step #(count @source)))
+  (empty [_] ())
+  (equiv [this other] (= (map identity this) other))
+  clojure.lang.IHashEq
+  (hasheq [this] (hash (map identity this)))
+  java.lang.Iterable
+  (iterator [this] (clojure.lang.SeqIterator. this))
+  Object
+  (equals [this other] (.equiv this other))
+  (hashCode [this] (.hashCode ^Object (map identity this)))
+  (toString [this] (pr-str (map identity this))))
+
+(defn- sealed-sequence [source replay offset]
+  (SealedSequence. source replay offset))
+
+(defmethod print-method SealedSequence [x ^java.io.Writer w]
+  (.write w (str x)))
+
 (defn seal
   "What sandbox code gets for `x`, deeply. Only data crosses: scalars
    (`plain?`), and maps, vectors, sets and sequences of data, without their
@@ -142,6 +189,7 @@
     (instance? SandboxDb x) x
     (world-connection? x) x
     (instance? SandboxEntity x) x
+    (instance? SealedSequence x) x
     (instance? datahike.impl.entity.Entity x) (SandboxEntity. x)
     (instance? datahike.datom.Datom x)
     (if (every? #(identical? % (seal %)) [(:e x) (:a x) (:v x) (:tx x) (:added x)]) x (leak! x))
@@ -155,10 +203,11 @@
                                          (transient (empty x)) x))))
     (vector? x) (seal-coll x seal #(mapv seal %))
     (set? x) (seal-coll x seal #(into (empty %) (map seal) %))
-    (seq? x) (map seal x) ; lazily: `datoms` over a large database stays a stream
+    (seq? x) (sealed-sequence (delay x) nil 0)
     ;; an index slice (`datoms`, `seek-datoms`): sealed as it is read
-    (instance? clojure.lang.Seqable x) (map seal (seq x))
-    (instance? java.lang.Iterable x) (map seal (iterator-seq (.iterator ^java.lang.Iterable x)))
+    (instance? clojure.lang.Seqable x) (sealed-sequence (delay (seq x)) nil 0)
+    (instance? java.lang.Iterable x)
+    (sealed-sequence (delay (iterator-seq (.iterator ^java.lang.Iterable x))) nil 0)
     :else (leak! x)))
 
 (defn- data?
@@ -469,6 +518,30 @@
     schema reverse-schema metrics db history as-of since filter
     transact transact! with])
 
+(defn- replayable-database? [db]
+  ;; FilteredDB contains an arbitrary predicate. Its results can be consumed
+  ;; locally, but must not silently carry that callback into another SCI world.
+  (cond
+    (instance? datahike.db.DB db) true
+    (instance? datahike.db.HistoricalDB db) (recur (.-origin-db ^datahike.db.HistoricalDB db))
+    (instance? datahike.db.AsOfDB db) (recur (.-origin-db ^datahike.db.AsOfDB db))
+    (instance? datahike.db.SinceDB db) (recur (.-origin-db ^datahike.db.SinceDB db))
+    :else false))
+
+(defn- immutable-index-argument? [x]
+  ;; A replay closure must not retain mutable/consuming arguments or callbacks.
+  ;; Unknown arguments retain native local-call behavior, but cannot fork.
+  (cond
+    (or (nil? x) (string? x) (number? x) (keyword? x) (boolean? x)
+        (uuid? x) (char? x)) true
+    (symbol? x) (nil? (meta x))
+    (and (nil? (meta x)) (not (record? x)) (not (sorted? x))
+         (or (vector? x) (set? x) (map? x)
+             (instance? clojure.lang.PersistentList x)
+             (instance? clojure.lang.PersistentList$EmptyList x)))
+    (every? immutable-index-argument? (if (map? x) (mapcat identity x) x))
+    :else false))
+
 (defn- certified-evaluation-attr? [x]
   (and (keyword? x)
        (contains? #{"attempt" "attempt.check"
@@ -595,25 +668,39 @@
            {:store {:backend :memory :id physical-id}})))
 
 (defn dispose-ephemeral-databases!
-  "Release and delete every process-global scratch database owned by the
-   currently selected interpreter world. Returns cleanup errors, if any."
+  "Release/delete selected scratch databases. Incomplete exact entries remain
+   owned for retry; connection release and deletion have separate ACKs. The
+   caller must fence work using this capability before starting cleanup."
   [binding-resolver binding-swap!]
   (when (and binding-resolver binding-swap!)
     (let [entries (or (:ephemeral-databases (binding-resolver)) {})
-          errors (reduce-kv
-                  (fn [errors name entry]
-                    (let [conn (entry-conn entry)
-                          cfg (:config entry)]
-                      (try
-                        (when conn (d/release conn))
-                        (when (and cfg (d/database-exists? cfg))
-                          (d/delete-database cfg))
-                        errors
-                        (catch Throwable error
-                          (conj errors {:name name :error error})))))
-                  [] entries)]
-      (binding-swap! assoc :ephemeral-databases {})
-      errors)))
+          update-entry!
+          (fn [name expected f]
+            (binding-swap!
+             (fn [binding]
+               (when-not (identical? expected (get-in binding [:ephemeral-databases name]))
+                 (throw (ex-info "Scratch cleanup no longer owns its exact database"
+                                 {:type ::stale-cleanup :name name})))
+               (update binding :ephemeral-databases f))))]
+      (reduce-kv
+       (fn [errors name entry]
+         (try
+           (let [conn (entry-conn entry)
+                 cfg (:config entry)
+                 released
+                 (if (and conn (not (::connection-released? entry)))
+                   (do
+                     (d/release conn)
+                     (get-in (update-entry! name entry
+                                            #(assoc % name (assoc entry ::connection-released? true)))
+                             [:ephemeral-databases name]))
+                   entry)]
+             (when (and cfg (d/database-exists? cfg))
+               (d/delete-database cfg))
+             (update-entry! name released #(dissoc % name))
+             errors)
+           (catch Throwable error (conj errors {:name name :error error}))))
+       [] entries))))
 
 (def ^:private sealing-safe-fns
   "Datahike's `safe-fns` (pure core, string and math functions), each seeing
@@ -651,7 +738,17 @@
                                        [sym (fn [& args]
                                               (let [resolved (host-args sym args)]
                                                 (try
-                                                  (sealed-result sym (untrusted #(apply f resolved)))
+                                                  (if (#{'datoms 'seek-datoms} sym)
+                                                    ;; Keep the exact immutable DB value and arguments,
+                                                    ;; not a consuming parent cursor or live connection.
+                                                    (let [replay #(untrusted (fn [] (apply f resolved)))]
+                                                      (when-not (dbu/db? (first resolved))
+                                                        (throw (ex-info "Index reads require a database snapshot" {})))
+                                                      (sealed-sequence (delay (replay))
+                                                                       (when (and (replayable-database? (first resolved))
+                                                                                  (every? immutable-index-argument? (rest resolved)))
+                                                                         replay) 0))
+                                                    (sealed-result sym (untrusted #(apply f resolved))))
                                                   (catch Throwable error
                                                     (throw (sandbox-error sym resolved error))))))])))
                                  data-ops))

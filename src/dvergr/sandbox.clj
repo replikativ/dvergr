@@ -36,6 +36,7 @@
             [dvergr.effects :as effects]
             [dvergr.runtime.ctx :as runtime-ctx]
             [dvergr.runtime.invocation :as invocation]
+            [dvergr.runtime.allocation :as allocation]
             [dvergr.runtime.bounded-output :as output]
             [dvergr.system.db :as sdb])
   (:import [java.lang.management ManagementFactory]))
@@ -201,14 +202,21 @@
       (doseq [s (vals @awaited)]
         (cancel-pending-spin! execution-ctx s)))))
 
-(def ^:private core-extras
+(defn- regex-result-snapshot
+  "Snapshot matches from one finite input; never export a native Matcher cursor."
+  [pattern text]
+  (some-> (re-seq pattern text) vec seq))
+
+(defn- core-extras
   "clojure.core 1.11/1.12 additions SCI's default set lacks. Copied from the REAL
    vars (docs + arglists intact) via `sci/copy-var` — the babashka approach (see
    `babashka.impl.clojure.core/core-extras`) — so the sandbox's clojure.core is
    reasonably complete, not a hand-rolled subset. Merged into BOTH the base ctx and
    the spindel-backed agent ctx (the spindel SCI starts fresh, so it needs these
    re-merged like the classes + clojure.test runners). Host is Clojure 1.12, so all
-   these resolve."
+   these resolve. Each interpreter gets fresh Var handles: retiring one world
+   must not poison the next interpreter through process-global imported Vars."
+  []
   {'random-uuid    (sci/copy-var random-uuid clojure-core-ns)
    'parse-uuid     (sci/copy-var parse-uuid clojure-core-ns)
    'parse-long     (sci/copy-var parse-long clojure-core-ns)
@@ -223,6 +231,9 @@
    'splitv-at      (sci/copy-var splitv-at clojure-core-ns)
    'partitionv     (sci/copy-var partitionv clojure-core-ns)
    'partitionv-all (sci/copy-var partitionv-all clojure-core-ns)
+   're-seq         (sci/new-var 're-seq regex-result-snapshot
+                                (assoc (select-keys (meta #'clojure.core/re-seq) [:doc :arglists])
+                                       :ns clojure-core-ns))
    'tap>           (sci/copy-var tap> clojure-core-ns)
    ;; add-tap/remove-tap are withheld: the tap set is JVM-global, so a sandbox
    ;; fn registered there would see every other sandbox's (and the host's) taps.
@@ -235,62 +246,24 @@
 ;; Resource Limits
 ;; ---------------------------------------------------------------------------
 
+(defn call-with-allocation-scope
+  "Run direct SCI work in a fresh HOST allocation scope on its actual thread.
+   eval-code/start-evaluation! already provide this, including realization.
+   Raw SCI embedders should use this around each top-level evaluation."
+  [f]
+  (allocation/call-with-scope f))
+
 (defn make-resource-limits
-  "Return an :interrupt-fn callback for sci/init.
+  "Return SCI's interruption/allocation callback. The default coarse backstop
+   is 4 GiB of cumulative allocation, not retained/peak memory. Owned evaluator
+   entries start fresh observations on their actual threads; callbacks carry
+   only policy across interpreter forks. Unscoped raw embedding keeps a
+   conservative cumulative fallback per physical thread, not per eval call.
 
-   SCI calls this at the start of every user-defined fn body. The
-   callback's job is twofold:
-
-     1. Pick up Thread.isInterrupted() so the host's outer Esc / watchdog
-        signal unwinds the eval cooperatively at the next fn boundary.
-     2. Enforce a single coarse bound — thread-allocated memory — so a
-        runaway allocation can't OOM the daemon. Sampled every 10k calls
-        to keep overhead negligible.
-
-   Token / dollar / time budgets are tracked by dvergr.chat.accounting +
-   chat-ctx ledger at much finer granularity; per-call wall-time and
-   op-count caps in here used to fight with those, hitting legitimate
-   long iterations (large folds, multi-step research) as easily as
-   actual infinite loops. They're gone now. The 60s eval-code outer
-   fence + Esc cancellation cover the same threat with no false
-   positives.
-
-   This counts CUMULATIVE thread allocation (getThreadAllocatedBytes),
-   garbage included — NOT retained/peak memory, so it's a coarse
-   runaway backstop, not a real OOM gauge (the 60s timeout fence + JVM
-   heap are that). A legitimate data job — fetch + parse several XML/RSS
-   feeds, map/filter/build — churns gigabytes of short-lived allocation
-   while retaining almost nothing, so a low cap false-positives on real
-   intake work (it killed Vár's 5-feed scan at 256 MiB). The threshold
-   is set high enough that only genuinely unbounded allocation (which a
-   true infinite loop produces within the 60s window) trips it.
-
-   Options:
-     :max-bytes - max cumulative bytes allocated by the current thread
-                  (default: 4 GiB)"
-  [& {:keys [max-bytes]
-      :or   {max-bytes (* 4 1024 1024 1024)}}]
-  (let [ops    (java.util.concurrent.atomic.AtomicLong. 0)
-        tmx    (ManagementFactory/getThreadMXBean)
-        tid    (.getId (Thread/currentThread))
-        mem0   (when (.isThreadAllocatedMemoryEnabled tmx)
-                 (.getThreadAllocatedBytes tmx tid))]
-    (fn []
-      ;; Cheap interrupt check on every call — picks up make-timeout watchdog signals.
-      ;; Thread/interrupted also clears the flag so subsequent code runs cleanly.
-      (when (.isInterrupted (Thread/currentThread))
-        (Thread/interrupted)
-        (throw (ex-info "Evaluation interrupted"
-                        {:cause :thread-interrupt})))
-      ;; Sample memory every 10k ops to amortise the ThreadMXBean call.
-      (let [n (.incrementAndGet ops)]
-        (when (and (zero? (mod n 10000))
-                   mem0
-                   (.isThreadAllocatedMemoryEnabled tmx))
-          (let [delta (- (.getThreadAllocatedBytes tmx tid) mem0)]
-            (when (> delta max-bytes)
-              (throw (ex-info "Resource limit: memory exceeded"
-                              {:limit-bytes max-bytes :allocated-bytes delta})))))))))
+   Options: :max-bytes (default 4 GiB). Custom callbacks and explicit nil in
+   create-base-ctx retain their existing behavior."
+  [& {:keys [max-bytes] :or {max-bytes (* 4 1024 1024 1024)}}]
+  (allocation/interrupt-policy max-bytes))
 
 (defn make-timeout
   "Start a watchdog daemon thread that interrupts the calling thread after timeout-ms.
@@ -361,7 +334,7 @@
    - Basic Java classes (Math, String, numeric wrappers, exception types, java.time, UUID,
      seeded Random and SplittableRandom)
    - Denies dangerous operations (eval, load-file, load-string)
-   - Resource limits on operation count, wall time, and thread memory allocation
+   - Cooperative interruption and a cumulative-allocation backstop
 
    Options:
      :resource-limits - result of (make-resource-limits ...) or nil to disable.
@@ -397,7 +370,7 @@
            ;; Clojure 1.11 core additions SCI's clojure.core lacks — agents reach for
            ;; `(random-uuid)`/`(parse-long …)` constantly, so provide equivalents
            ;; (pure, drop-in) rather than have them error with "Unable to resolve".
-          :namespaces {'clojure.core core-extras}
+          :namespaces {'clojure.core (core-extras)}
 
            ;; Features (for reader conditionals if needed)
           :features #{:clj}
@@ -466,7 +439,7 @@
     ;; bind clojure.test to this interpreter before any descendant forks it.
     (sci/merge-opts interpreter
                     {:classes base-classes
-                     :namespaces {'clojure.core core-extras}})
+                     :namespaces {'clojure.core (core-extras)}})
     (sci/merge-opts interpreter
                     {:namespaces
                      {'clojure.test
@@ -521,7 +494,7 @@
      ;; `(random-uuid)`/`(parse-long …)` in the real sandbox they actually run in).
      (when spindel-ctx
        (sci/merge-opts forked {:classes    base-classes
-                               :namespaces {'clojure.core core-extras}}))
+                               :namespaces {'clojure.core (core-extras)}}))
      ;; Re-bind high-level test runners to close over the forked ctx, not the base.
      ;; Without this, run-tests would look up vars in the base context and find none.
      (sci/merge-opts forked {:namespaces {'clojure.test (sci-test/ctx-aware-test-namespace forked)}})
@@ -554,12 +527,14 @@
      (snapshot))))
 
 (defn- eval-value! [sci-ctx code stdout stderr realize? output-limit]
-  (sci-ctx-store/with-ctx sci-ctx
-    (sci/binding [sci/out stdout sci/err stderr]
-      (let [value (sci/eval-string* sci-ctx code)
-            printed (when realize? (print-value value output-limit))]
-        (cond-> {:value (if realize? (:text printed) value) :success true}
-          (:truncated? printed) (assoc :value-truncated? true))))))
+  (call-with-allocation-scope
+   (fn []
+     (sci-ctx-store/with-ctx sci-ctx
+       (sci/binding [sci/out stdout sci/err stderr]
+         (let [value (sci/eval-string* sci-ctx code)
+               printed (when realize? (print-value value output-limit))]
+           (cond-> {:value (if realize? (:text printed) value) :success true}
+             (:truncated? printed) (assoc :value-truncated? true))))))))
 
 (defn- captured-output [stdout stderr result]
   (let [out ((:snapshot stdout)) err ((:snapshot stderr))]
@@ -1345,17 +1320,21 @@
     audit-log))
 
 (defn release-agent-resources!
-  "Release disposable host resources owned by one SCI capability in `ctx`.
-   Durable/mergeable world state is deliberately untouched."
+  "Release disposable resources for the exact selected capability world.
+   Failed scratch cleanup remains owned and prevents interpreter removal."
   [ctx capability-id]
   (when capability-id
-    (try
-      (let [resolver (runtime-ctx/sandbox-binding-resolver ctx capability-id)
-            swap! (fn [f & args]
-                    (apply runtime-ctx/update-sandbox-binding!
-                           ctx capability-id f args))]
-        (ns-datahike/dispose-ephemeral-databases! resolver swap!))
-      (catch clojure.lang.ExceptionInfo _ nil))))
+    (binding [rtc/*execution-context* ctx]
+      (when (runtime-ctx/sandbox-binding ctx capability-id)
+        (let [resolver (runtime-ctx/sandbox-binding-resolver ctx capability-id)
+              swap! (fn [f & args]
+                      (apply runtime-ctx/update-sandbox-binding! ctx capability-id f args))
+              errors (ns-datahike/dispose-ephemeral-databases! resolver swap!)]
+          (when (seq errors)
+            (throw (ex-info "SCI scratch database cleanup is incomplete"
+                            {:type ::resource-cleanup-incomplete
+                             :databases (mapv :name errors)}
+                            (:error (first errors))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; clojure.test Integration (from Babashka)
@@ -1372,7 +1351,7 @@
    Example:
    (add-binding! ctx 'session-id \"session-123\")"
   [sci-ctx sym val]
-  (sci/eval-string* sci-ctx (str "(def " sym " " (pr-str val) ")")))
+  (allocation/call-with-scope (fn [] (sci/eval-string* sci-ctx (str "(def " sym " " (pr-str val) ")")))))
 
 (defn add-namespace!
   "Add a namespace with bindings to the SCI context.
@@ -1396,7 +1375,7 @@
 
    Returns the result of the last evaluated form."
   [sci-ctx source]
-  (sci/eval-string* sci-ctx source))
+  (allocation/call-with-scope (fn [] (sci/eval-string* sci-ctx source))))
 
 (defn load-file!
   "Load a Clojure source file into SCI context.
@@ -1425,7 +1404,7 @@
   "Get public vars of a namespace in the SCI context.
    Returns a map of symbol -> var, like clojure.core/ns-publics."
   [sci-ctx ns-sym]
-  (sci/eval-string* sci-ctx (str "(ns-publics '" ns-sym ")")))
+  (allocation/call-with-scope (fn [] (sci/eval-string* sci-ctx (str "(ns-publics '" ns-sym ")")))))
 
 (defn sandbox-status
   "Read-only snapshot of a session SCI sandbox — for the UI/`/sandbox` command.

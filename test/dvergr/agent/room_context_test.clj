@@ -199,7 +199,7 @@
         (deliver release-constructor true)
         (ctx/close-context! c)))))
 
-(deftest resource-cleanup-failure-still-unregisters-component
+(deftest resource-cleanup-failure-retains-component-for-retry
   (let [c (ctx/create-execution-context)
         working (turn/new-working-ctx {:execution-ctx c :title "cleanup"})]
     (try
@@ -210,8 +210,10 @@
         (is (thrown-with-msg? java.io.IOException
                               #"injected cleanup failure"
                               (cctx/release-sci-in! working c))))
-      (is (empty? (binding [ec/*execution-context* c]
-                    (component/registered))))
+      (is (= 1 (count (binding [ec/*execution-context* c]
+                        (component/registered)))))
+      (cctx/release-sci-in! working c)
+      (is (empty? (binding [ec/*execution-context* c] (component/registered))))
       (finally
         (cctx/release-sci-in! working c)
         (ctx/close-context! c)))))

@@ -160,6 +160,24 @@ database creation/deletion. Eval metering: every eval
 reports thread CPU and wall time (`:meter`), and `clojure_eval` records it as an `:eval/run`
 receipt (recorded, not charged).
 
+The allocation backstop is separate from these receipts and from financial
+resource authority. `eval-code` and owned evaluation workers establish a fresh
+HOST observation on the actual evaluator thread, including requested result
+realization. Portable program execution, checker workers, bootstrap loads and
+TUI evaluations use the same scope. Nested scopes restore their caller in
+`finally`; the outer allocation baseline includes nested work.
+
+Observations use a plain, non-inheritable ThreadLocal, not interpreter/world
+state or Clojure dynamic bindings: forks, Spins and bound callbacks cannot
+capture them. Direct raw SCI embedding can wrap top-level work in
+`sandbox/call-with-allocation-scope`. Without an explicit scope, the guard keeps
+a conservative cumulative allowance per physical thread, starting at its first
+checkpoint; it cannot infer individual raw evaluation boundaries and never
+resets an exceeded allowance automatically. Deferred FRP callbacks outside
+wrapped entries use that fallback too. This is not a new FRP lifetime or budget
+authority. Allocation tracking remains conditional on JVM support/enabling.
+
+
 Also routed (read-only everywhere, 2026-10): every writer an agent reaches, at the shared
 gate of its capability rather than per call site.
 

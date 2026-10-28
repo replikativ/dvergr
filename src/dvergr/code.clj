@@ -19,7 +19,7 @@
    NOTE: resolution here is against the host JVM. For sandboxed *agent* code,
    analyze in the SCI ctx instead, so refs/capabilities reflect the sandbox's
    signature, not the host's (doc §7b)."
-  (:require [rewrite-clj.parser :as p]
+  (:require [dvergr.runtime.allocation :as allocation] [rewrite-clj.parser :as p]
             [rewrite-clj.node :as n]
             [clojure.string :as str]
             [clojure.tools.analyzer.jvm :as ana]
@@ -129,7 +129,7 @@
   (let [vars    (atom #{})
         defines (atom nil)
         locals  (atom #{})
-        mx (fn [f] (try (sci/eval-form ctx (list 'macroexpand (list 'quote f)))
+        mx (fn [f] (try (allocation/call-with-scope (fn [] (sci/eval-form ctx (list 'macroexpand (list 'quote f)))))
                         (catch Throwable _ f)))]
     (letfn [(w [f env]
               (cond

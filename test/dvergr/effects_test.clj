@@ -292,7 +292,7 @@
       (try
         (doseq [opts [{} {:timeout-ms 5000}]]
           (let [r (apply sandbox/eval-code sci-ctx "(reduce + (range 2000000))" (mapcat identity opts))]
-            (is (:success r))
+            (is (:success r) (pr-str {:opts opts :error (:error r)}))
             (is (nat-int? (get-in r [:meter :cpu-ms])) (str opts))
             (is (<= (get-in r [:meter :cpu-ms]) (+ 50 (get-in r [:meter :wall-ms]))))))
         (finally (ctx/stop-context! ec)))))

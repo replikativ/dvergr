@@ -534,8 +534,9 @@
         (.countDown gate)
         (d/close-room! room)))))
 
-(deftest concurrent-speculation-awaiters-clean-every-admitted-native-extent
-  (let [room (d/make-room {:id :shared-speculative-extent})
+(defn- check-concurrent-speculative-extents! [shared-task?]
+  (let [expected-extents (if shared-task? 1 2)
+        room (d/make-room {:id :shared-speculative-extent})
         entered (promise)
         second-entered (promise)
         second-awaiting (promise)
@@ -543,7 +544,7 @@
         first-result (promise)
         second-result (promise)
         gate (CountDownLatch. 1)
-        extent-exited (CountDownLatch. 2)
+        extent-exited (CountDownLatch. expected-extents)
         forks (atom [])
         bodies (atom 0)
         discards (atom [])
@@ -567,20 +568,22 @@
                     (fn [target owner f]
                       (try (owned-worker! target owner f)
                            (finally (.countDown extent-exited))))]
-        (let [task (d/imagine-conversation
-                    room
-                    (fn [_]
-                      (when (= 2 (swap! bodies inc))
-                        (deliver second-entered true))
-                      (deliver entered true)
-                      (.await gate)
-                      (sp/spin :shared)))
+        (let [new-task #(d/imagine-conversation
+                         room
+                         (fn [_]
+                           (when (= 2 (swap! bodies inc))
+                             (deliver second-entered true))
+                           (deliver entered true)
+                           (.await gate)
+                           (sp/spin :shared)))
+              task (new-task)
+              second-task (if shared-task? task (new-task))
               first-waiter (binding [ec/*execution-context* (:ctx room)]
                              (sp/spin (sp/await task)))
               second-waiter (binding [ec/*execution-context* (:ctx room)]
                               (sp/spin
                                (deliver second-awaiting true)
-                               (sp/await task)))]
+                               (sp/await second-task)))]
           (binding [ec/*execution-context* (:ctx room)]
             (sp/spawn! first-waiter {:on-success #(deliver first-result %)
                                      :on-error #(deliver first-result {:error %})}))
@@ -594,21 +597,24 @@
           (binding [ec/*execution-context* (:ctx room)]
             (sp/spawn! (sp/spin (deliver attached true))))
           (is (= true (deref attached 3000 ::timeout)))
-          ;; Ordinary Spins deliberately re-enter on a second uncached await
-          ;; (Spindel stale_run_test's sibling-awaiter regression). Both native
-          ;; evaluations must be admitted before either is allowed to finish.
-          (is (= true (deref second-entered 30000 ::timeout)))
+          (if shared-task?
+            (do
+              (is (= 1 @bodies) "both awaiters join one running computation")
+              (is (= 1 (count @forks))))
+            (do
+              (is (= true (deref second-entered 30000 ::timeout)))
+              (is (= 2 @bodies) "independent tasks own overlapping native extents")
+              (is (= 2 (count (set @forks))))))
           (.countDown gate)
           (let [a (deref first-result 30000 ::timeout)
                 b (deref second-result 30000 ::timeout)]
             (is (= :shared (:outcome a)))
             (is (= a b)))
-          ;; Both callbacks can receive the latest evaluation's result before
-          ;; the older native evaluation physically exits. Join both owned
-          ;; worker boundaries, whose return follows durable Run retirement.
+          ;; A result does not prove physical exit. Join every admitted owned
+          ;; worker boundary, whose return follows durable Run retirement.
           (is (.await extent-exited 30 java.util.concurrent.TimeUnit/SECONDS))
-          (is (= 2 (count @forks)))
-          (is (= 2 @bodies))
+          (is (= expected-extents (count @forks)))
+          (is (= expected-extents @bodies))
           (is (= (frequencies @forks) (frequencies @discards)))
           (is (every? #{1} (vals (frequencies @discards))))
           (is (empty? (d/log room)))
@@ -616,6 +622,12 @@
       (finally
         (.countDown gate)
         (d/close-room! room)))))
+
+(deftest concurrent-speculation-awaiters-share-one-native-extent
+  (check-concurrent-speculative-extents! true))
+
+(deftest independent-speculations-clean-every-overlapping-native-extent
+  (check-concurrent-speculative-extents! false))
 
 (deftest cancelled-speculation-retains-its-run-through-physical-child-cleanup
   (let [room (d/make-room {:id :cancelled-speculative-extent :store (memory/make)})

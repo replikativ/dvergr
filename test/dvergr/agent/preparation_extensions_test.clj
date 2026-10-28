@@ -221,7 +221,7 @@
             (let [retired (future (room-context/drop-ctx! room :agent {:if-absent? true}))]
               (is (= true (deref entered 3000 ::timeout)))
               (is (nil? (room-context/lookup (:id room) :agent)))
-              (is (= [:cleanup] (mapv :kind (vals (get @(:meta room) preparation/leases-key)))))
+              (is (= [:room-cleanup] (mapv :kind (vals (get @(:meta room) preparation/leases-key)))))
               (let [replacement (d/join room (d/participant {:id :agent :on-message (fn [_ _] (sp/spin nil))}))
                     fresh (prepare! room replacement #{:test/owned-a} nil)]
                 (is (not= (:capability-id original) (:capability-id fresh)))

@@ -39,6 +39,7 @@
             [org.replikativ.spindel.spin.sync :as sync]
             [org.replikativ.spindel.spin.combinators :as comb]
             [org.replikativ.spindel.yggdrasil :as ygg]
+            [org.replikativ.spindel.yggdrasil.construction :as construction]
             [is.simm.partial-cps.sequence :refer [anext]]
             [dvergr.runtime.bus :as bus]
             [dvergr.substrate.geschichte :as geschichte]
@@ -1473,7 +1474,52 @@
 ;; Forking — the substrate primitive enabling speculation
 ;; ============================================================================
 
-(defn fork-room
+(defn- rollback-fork-construction!
+  [{:keys [parent child handle recovery state published?]}]
+  (when-not @published?
+    (let [child @child handle @handle
+          phase! (fn [phase f]
+                   (when-not (contains? (:done @state) phase)
+                     (f)
+                     (swap! state update :done conj phase)))]
+      (phase! :partial-construction
+              #(when-let [owner @recovery] (construction/dispose! owner {:sync? true})))
+      (phase! :runs #(when child (drain-room-runs! child)))
+      (phase! :participants #(when child (leave-all! child)))
+      (phase! :preparation #(when child (preparation/drain-room! child)))
+      (phase! :timers #(when child (release-fork-timers! child)))
+      (phase! :projections
+              #(when child
+                 ((requiring-resolve 'dvergr.agent.room-context/drop-unpublished-room!) parent child)))
+      (phase! :registry
+              #(when child
+                 (binding [ec/*execution-context* (:ctx parent)]
+                   (when (rreg/lookup (:id child))
+                     (throw (ex-info "Constructor rollback refuses a published Room"
+                                     {:type ::published-construction :room-id (:id child)}))))))
+      ;; Capture before any native disposal, and retain across ambiguous ACKs.
+      (phase! :pending-grants
+              #(swap! state assoc :pending-grants
+                      (when handle
+                        (binding [ec/*execution-context* (:child-ctx handle)]
+                          (ec/get-state [:dvergr/pending-grants])))))
+      (phase! :discard
+              #(when handle
+                 (let [disposition (ygg/fork-disposition handle)]
+                   (case (:status disposition)
+                     :open (ygg/discard-fork! handle)
+                     :discarded nil
+                     (throw (ex-info "Constructor rollback needs native settlement recovery"
+                                     {:type ::construction-settlement-pending
+                                      :fork/descriptor (ygg/fork-descriptor handle)}))))))
+      (phase! :grants
+              #(doseq [{:keys [scope] :as grant} (:pending-grants @state)
+                       :when (not (contains? (:dropped-grants @state) scope))]
+                 (srooms/drop-fork-grant! grant)
+                 (swap! state update :dropped-grants (fnil conj #{}) scope)))))
+  nil)
+
+(defn- fork-room-locked
   "Create a sibling room with cloned participants.
 
    Two isolation modes:
@@ -1508,9 +1554,9 @@
    `:ctx` requires that subsequent operations on the fork (e.g.
    `(ask fork :agent …)` from outside the fork's body) bind
    `*execution-context*` to the fork's ctx — see `with-fork-ctx`."
-  ([room] (fork-room room {}))
+  ([room opts] (fork-room-locked room opts nil))
   ([room {:keys [isolation clone-participants? fork-opts]
-          :or {isolation :none clone-participants? true}}]
+          :or {isolation :none clone-participants? true}} acquisition]
    (with-room-lock room
      (ensure-room-work-admitted! room :fork-room)
      (preparation/assert-quiescent! room)
@@ -1522,11 +1568,18 @@
            new-id     (rstore/slug->room-id new-slug)
            parent-log (log room)
            room*       (volatile! nil)
+           _ (when acquisition
+               (vreset! (:key acquisition) new-id)
+               (vreset! (:lease acquisition)
+                        (preparation/retain-room-cleanup!
+                         room {new-id acquisition} rollback-fork-construction!)))
            fork-handle (when (= :ctx isolation)
                          (binding [ec/*execution-context* (:ctx room)]
-                           (ygg/fork! (merge {:purpose :workroom
-                                              :owner new-id}
-                                             fork-opts))))]
+                           (let [handle (ygg/fork! (merge {:purpose :workroom
+                                                           :owner new-id}
+                                                          fork-opts))]
+                             (when acquisition (vreset! (:handle acquisition) handle))
+                             handle)))]
        (try
          (let [child-ctx  (case isolation
                             :none (:ctx room)
@@ -1591,6 +1644,7 @@
        ;; admission without the global lifecycle lock avoids parent-meta ->
        ;; lifecycle lock inversion during concurrent parent teardown.
                _ (vreset! room* new-room)
+               _ (when acquisition (vreset! (:child acquisition) new-room))
                _ (agent-run/initialize-unpublished-room-admission! new-id child-ctx)]
      ;; (Fork-local persistence rides the bus's durable-append! hook now —
      ;; wired at child-bus construction above.)
@@ -1622,6 +1676,12 @@
                (if (= :ctx isolation)
                  (rreg/register-fork! new-room (:id room) (:fork-id fork-handle))
                  (rreg/register! new-room)))
+             (when acquisition
+               ;; The complete receiver now owns the child. Even if the receipt
+               ;; transfer reports an error, rollback must not destroy it.
+               (reset! (:published? acquisition) true)
+               (preparation/transfer-room-cleanup-entry!
+                @(:lease acquisition) new-id acquisition))
      ;; Control-plane: announce the fork on the peer-bus so dashboards,
      ;; audit logs, and oversight agents see it without subscribing to
      ;; the fork's bus directly.
@@ -1643,43 +1703,75 @@
                               :data {:room new-id :parent (:id room)}})))))
            new-room)
          (catch Throwable error
+           (if acquisition
+             ;; The outer HOST wrapper releases the parent monitor before
+             ;; joining this exact retained rollback chain.
+             (throw error)
+             (do
            ;; Construction owns the affine handle until successful return. Any
            ;; failure before then must settle it and retract every process-local
            ;; projection; otherwise the caller has no capability with which to
            ;; recover the unreachable branch.
-           (binding [ec/*execution-context* (:ctx room)]
-             (when-let [constructed @room*]
-               (try (leave-all! constructed)
-                    (catch Throwable cleanup-error
-                      (.addSuppressed error cleanup-error)))
-               (try
-                 (when-let [drop-room!
-                            (requiring-resolve 'dvergr.agent.room-context/drop-room!)]
-                   (drop-room! new-id))
-                 (catch Throwable cleanup-error
-                   (.addSuppressed error cleanup-error)))
-               (when (rreg/lookup new-id)
-                 (try
-                   (when fork-handle
-                     (rreg/untrack-fork! new-id (:fork-id fork-handle)))
-                   (catch Throwable cleanup-error
-                     (.addSuppressed error cleanup-error)))
-                 (rreg/unregister! new-id))))
-           (when fork-handle
-             (let [pending (try
-                             (binding [ec/*execution-context*
-                                       (or (some-> @room* :ctx)
-                                           (:child-ctx fork-handle))]
-                               (ec/get-state [:dvergr/pending-grants]))
-                             (catch Throwable cleanup-error
-                               (.addSuppressed error cleanup-error)
-                               nil))]
-               (try
-                 (ygg/discard-fork! fork-handle)
-                 (srooms/drop-fork-grants! pending)
-                 (catch Throwable cleanup-error
-                   (.addSuppressed error cleanup-error)))))
-           (throw error)))))))
+               (binding [ec/*execution-context* (:ctx room)]
+                 (when-let [constructed @room*]
+                   (try (leave-all! constructed)
+                        (catch Throwable cleanup-error
+                          (.addSuppressed error cleanup-error)))
+                   (try
+                     (when-let [drop-room!
+                                (requiring-resolve 'dvergr.agent.room-context/drop-room!)]
+                       (drop-room! new-id))
+                     (catch Throwable cleanup-error
+                       (.addSuppressed error cleanup-error)))
+                   (when (rreg/lookup new-id)
+                     (try
+                       (when fork-handle
+                         (rreg/untrack-fork! new-id (:fork-id fork-handle)))
+                       (catch Throwable cleanup-error
+                         (.addSuppressed error cleanup-error)))
+                     (rreg/unregister! new-id))))
+               (when fork-handle
+                 (let [pending (try
+                                 (binding [ec/*execution-context*
+                                           (or (some-> @room* :ctx)
+                                               (:child-ctx fork-handle))]
+                                   (ec/get-state [:dvergr/pending-grants]))
+                                 (catch Throwable cleanup-error
+                                   (.addSuppressed error cleanup-error)
+                                   nil))]
+                   (try
+                     (ygg/discard-fork! fork-handle)
+                     (srooms/drop-fork-grants! pending)
+                     (catch Throwable cleanup-error
+                       (.addSuppressed error cleanup-error)))))
+               (throw error)))))))))
+
+(defn fork-room
+  "Fork a Room. Participant cloning requires a HOST thread; reactive callers
+   use `org.replikativ.spindel.blocking/blocking` or an owned native worker.
+   Failed cloning retains the exact rollback chain in the parent Room until
+   child cleanup and native disposal acknowledge success. Run worlds with
+   `:clone-participants? false` retain their existing synchronous path."
+  ([room] (fork-room room {}))
+  ([room opts]
+   (if-not (get opts :clone-participants? true)
+     (fork-room-locked room opts)
+     (let [acquisition {:parent room :child (volatile! nil) :handle (volatile! nil)
+                        :recovery (volatile! nil) :key (volatile! nil) :lease (volatile! nil)
+                        :published? (atom false) :state (atom {:done #{}})}
+           outcome (try {:value (fork-room-locked room opts acquisition)}
+                        (catch Throwable error
+                          (when-let [owner (:construction/owner (ex-data error))]
+                            (vreset! (:recovery acquisition) owner))
+                          {:error error}))
+           cleanup-error (when-let [lease @(:lease acquisition)]
+                           (try ((:join! lease) 5000) nil
+                                (catch Throwable error error)))]
+       (if-let [error (or (:error outcome) cleanup-error)]
+         (do (when (and cleanup-error (not (identical? error cleanup-error)))
+               (.addSuppressed ^Throwable error cleanup-error))
+             (throw error))
+         (:value outcome))))))
 
 (defn fork-handle
   "Return an isolated Room fork's process-local canonical ForkHandle, or nil.
@@ -2774,9 +2866,9 @@
 
 (defn- speculative-extent [room f]
   (binding [ec/*execution-context* (:ctx room)]
-    ;; Preserve the ordinary public Spin shape. Like other ordinary Spins,
-    ;; awaiting it again before completion can re-enter its body; each such
-    ;; evaluation owns its own native extent, not a shared future.
+    ;; Preserve the ordinary public Spin shape: concurrent awaits join the
+    ;; current clean evaluation. Each actual evaluation owns its native extent,
+    ;; including any successor evaluation after reactive invalidation.
     (sp/spin
      (sp/await
       (blocking/blocking

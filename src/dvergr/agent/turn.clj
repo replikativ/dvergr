@@ -91,7 +91,7 @@
           (ns-io/add-process-ns! sci cctx boundary)
           ;; the AgentDef's own extensions (:sandbox), after the standard surface
           (when-let [ids (seq (or sandbox-extensions (:sandbox-extensions cctx)))]
-            (extensions/install! sci execution-ctx ids)))))
+            (chat-ctx/install-owned-extensions! cctx execution-ctx ids)))))
     cctx))
 
 (defn new-working-ctx
@@ -105,7 +105,8 @@
            room-runtime-id room-incarnation capability-id agent-program-ceiling
            durable? allowed-domains agent-id effects sandbox-extensions own-cleanup!]}]
   (binding [rtc/*execution-context* execution-ctx]
-    (let [capability-id (or capability-id (random-uuid))
+    (let [extension-plan (extensions/snapshot sandbox-extensions)
+          capability-id (or capability-id (random-uuid))
           cctx (assoc (cond-> (chat-ctx/create-chat-context
                                (cond-> {:budget-dollars (or budget-dollars 1.0)
                                         :db-conn        db-conn
@@ -122,7 +123,7 @@
                       :sandbox-extensions (set sandbox-extensions)
                       ;; every effect the sandbox performs, newest last
                       :receipts (effects/make-sink))
-          cctx (chat-ctx/reset-extension-owners cctx execution-ctx sandbox-extensions)
+          cctx (chat-ctx/reset-extension-owners cctx execution-ctx extension-plan)
           cleanup-transferred? (atom false)]
       ;; create-chat-context forks a sci-ctx but does NOT inject the ctx-bound
       ;; namespaces — do it here so clojure_eval has the room/kb/intake nses

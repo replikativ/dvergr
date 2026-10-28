@@ -74,17 +74,49 @@
 (defn extension-owner
   "One process-local extension acquisition, owned by exactly one world.
    This is a cleanup lease, not agent-visible/forkable semantic state."
-  [execution-context interpreter ids]
+  [execution-context interpreter plan]
   {:execution-context execution-context :interpreter interpreter
-   :ids (set ids) :released? (atom false)})
+   :extensions plan :pending (atom (set (keys plan)))})
+
+(defn install-extension-owner!
+  "Install the exact functions captured by an already retained HOST owner."
+  [{:keys [execution-context interpreter extensions]}]
+  (extensions/install-snapshot! interpreter execution-context extensions))
+
+(defn release-extension-owner!
+  "Acknowledge each captured extension only after its callback succeeds.
+   Failures retain that callback and interpreter for retry. This callback ACK
+   does not manufacture a physical join for work the extension started."
+  [{:keys [interpreter extensions pending]}]
+  (locking pending
+    (doseq [id (reverse (sort @pending))]
+      (when-let [release (get-in extensions [id :release])]
+        (release interpreter))
+      (swap! pending disj id)))
+  nil)
+
+(defn install-owned-extensions!
+  "Install requested extensions from this interpreter's captured acquisitions."
+  [chat-ctx execution-context ids]
+  (let [interpreter (sci-context-in chat-ctx execution-context)
+        plan (into (sorted-map)
+                   (mapcat :extensions)
+                   (filter #(and (identical? execution-context (:execution-context %))
+                                 (identical? interpreter (:interpreter %)))
+                           (:extension-owners chat-ctx)))
+        missing (remove #(contains? plan %) ids)]
+    (when (seq missing)
+      (throw (ex-info "Sandbox extensions have no acquisition owner"
+                      {:type ::unowned-extensions :extensions (set missing)})))
+    (extensions/install-snapshot! interpreter execution-context (select-keys plan ids))))
 
 (defn reset-extension-owners
   "Give a newly constructed/projected facade its own extension cleanup chain.
    A child facade must never inherit its parent's raw interpreter leases."
-  [chat-ctx execution-context ids]
+  [chat-ctx execution-context plan]
   (assoc chat-ctx :extension-owners
-         (if (seq ids)
-           [(extension-owner execution-context (sci-context-in chat-ctx execution-context) ids)]
+         (if (seq plan)
+           [(extension-owner execution-context (sci-context-in chat-ctx execution-context) plan)]
            [])))
 ;; ============================================================================
 ;; Signal Accessors (must be called with spindel context bound)
@@ -488,22 +520,18 @@
    This is idempotent and does not close the chat's durable connection. Forked
    room caches use it when a child world is discarded."
   [chat-ctx execution-context]
-  (try
+  (binding [rtc/*execution-context* execution-context]
     (if (contains? chat-ctx :extension-owners)
-      (doseq [{:keys [interpreter ids released?] owner-context :execution-context}
-              (:extension-owners chat-ctx)
-              :when (and (identical? execution-context owner-context)
-                         (compare-and-set! released? false true))]
-        (extensions/release! interpreter ids))
+      (doseq [{owner-context :execution-context :as owner}
+              (reverse (:extension-owners chat-ctx))
+              :when (identical? execution-context owner-context)]
+        (release-extension-owner! owner))
       (when-let [ids (seq (:sandbox-extensions chat-ctx))]
         (extensions/release! (sci-context-in chat-ctx execution-context) ids)))
     (sandbox/release-agent-resources! execution-context (:capability-id chat-ctx))
-    (finally
-      ;; Disposable-resource cleanup is best-effort with respect to component
-      ;; reachability: even an unexpected backend failure must not strand the
-      ;; interpreter in Spindel after its cache handle is removed.
-      (sandbox/release-spindel-sci-world!
-       execution-context (:sci-component chat-ctx)))))
+  ;; A failed resource callback must retain the selected heap, together with
+  ;; its exact extension chain, in the caller's existing cleanup lease.
+    (sandbox/release-spindel-sci-world! execution-context (:sci-component chat-ctx))))
 
 (defn close-chat!
   "Close chat and release resources."

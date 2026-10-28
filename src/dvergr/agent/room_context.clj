@@ -266,14 +266,21 @@
                             legacy-history?)))
           messages)))
 
-(defn- drop-entry! [room-id agent-id]
-  (when-let [{:keys [chat-ctx execution-ctx]}
-             (get @room-agent-ctxs [room-id agent-id])]
-    (when chat-ctx
-      (try (chat-ctx/release-sci-in! chat-ctx
-                                     (or execution-ctx (:spindel-ctx chat-ctx)))
-           (catch Throwable _ nil)))
-    (swap! room-agent-ctxs dissoc [room-id agent-id])))
+(defn- retain-entry-cleanup! [room key entry cleanups release!]
+  ;; Called under the Room monitor: retain the exact entry before detachment.
+  (let [lease (preparation/retain-room-cleanup! room {key entry} release! (second key))]
+    (swap! cleanups conj lease)
+    lease))
+
+(defn- release-entry! [{:keys [chat-ctx chat-ctx-ref execution-ctx]}]
+  (when-let [cctx (or chat-ctx (some-> chat-ctx-ref deref))]
+    (chat-ctx/release-sci-in! cctx (or execution-ctx (:spindel-ctx cctx)))))
+
+(defn- drop-entry! [room agent-id cleanups]
+  (let [key [(:id room) agent-id]]
+    (when-let [entry (get @room-agent-ctxs key)]
+      (retain-entry-cleanup! room key entry cleanups release-entry!)
+      (swap! room-agent-ctxs dissoc key))))
 
 (defn- with-extensions!
   "The cached working context of `k` for an agent naming the extensions
@@ -281,32 +288,37 @@
    takes the context as it is. More extensions are installed into it; fewer
    drop it, since an interpreter cannot give back what its code may already
    hold. Under the Room monitor."
-  [[room-id agent-id :as k] {:keys [chat-ctx sandbox-opts execution-ctx] :as entry} sandbox]
+  [room [_ agent-id :as k] {:keys [chat-ctx sandbox-opts execution-ctx] :as entry} sandbox cleanups]
+  (when (false? (:projection-ready? entry))
+    (throw (ex-info "Interpreter projection construction has not completed"
+                    {:type ::incomplete-projection :room-id (:id room) :agent-id agent-id})))
   (let [have (set (:sandbox-extensions chat-ctx))
         want (set sandbox)]
     (cond
       (or (nil? sandbox) (= have want)) chat-ctx
 
       (every? want have)
-      (let [cctx (assoc chat-ctx :sandbox-extensions want)]
+      (let [cctx (assoc chat-ctx :sandbox-extensions want)
+            plan (extensions/snapshot (remove have want))
+            owner (chat-ctx/extension-owner execution-ctx
+                                            (chat-ctx/sci-context-in cctx execution-ctx) plan)]
         ;; recorded before installing, so dropping the entry releases a
         ;; partial installation too (releasing what never installed is a
         ;; no-op)
         (swap! room-agent-ctxs assoc k
                (assoc entry :chat-ctx (update cctx :extension-owners (fnil conj [])
-                                              (chat-ctx/extension-owner execution-ctx
-                                                                        (chat-ctx/sci-context-in cctx execution-ctx)
-                                                                        (remove have want)))
+                                              owner)
                       :sandbox-opts (assoc sandbox-opts :sandbox-extensions want)))
         (try
-          (extensions/install! (chat-ctx/sci-context-in cctx execution-ctx) execution-ctx
-                               (remove have want))
+          (chat-ctx/install-extension-owner! owner)
           (:chat-ctx (get @room-agent-ctxs k))
           (catch Throwable error
-            (drop-entry! room-id agent-id)
+            (try (drop-entry! room agent-id cleanups)
+                 (catch Throwable cleanup-error
+                   (.addSuppressed error cleanup-error)))
             (throw error))))
 
-      :else (do (drop-entry! room-id agent-id) nil))))
+      :else (do (drop-entry! room agent-id cleanups) nil))))
 
 (defn- current-entry!
   "A cached interpreter belongs to its exact Room monitor and execution world.
@@ -339,19 +351,19 @@
         (and previous (every? want have))
         (let [old-cctx (:chat-ctx previous)
               old-interpreter (chat-ctx/sci-context-in old-cctx (:ctx room))
-              interpreter (sci/fork old-interpreter)
               added (set (remove have want))
-              owner (chat-ctx/extension-owner (:ctx room) interpreter added)
+              plan (extensions/snapshot added)
+              interpreter (sci/fork old-interpreter)
+              owner (chat-ctx/extension-owner (:ctx room) interpreter plan)
               published? (atom false)
               cctx (-> old-cctx
                        (assoc :sandbox-extensions want)
                        (update :extension-owners (fnil conj []) owner))]
           (own-cleanup!
            (fn []
-             (when (and (not @published?)
-                        (compare-and-set! (:released? owner) false true))
-               (extensions/release! interpreter added))))
-          (extensions/install! interpreter (:ctx room) added)
+             (when-not @published?
+               (chat-ctx/release-extension-owner! owner))))
+          (chat-ctx/install-extension-owner! owner)
           {:key k :previous previous :entry (-> previous
                                                 (assoc :chat-ctx cctx)
                                                 (assoc-in [:sandbox-opts :sandbox-extensions] want))
@@ -418,7 +430,7 @@
     (with-system-prompt! (:chat-ctx entry) system-prompt))
   (:chat-ctx entry))
 
-(defn ensure-ctx!
+(defn- ensure-ctx-locked!
   "Get-or-create the long-lived working chat-ctx for `agent-id` in `room`.
 
    On first call, create the ctx with a stable chat-id and seed its durable
@@ -429,7 +441,7 @@
    `:sandbox :participant` takes them from the agent's Participant in the
    room, read under the room monitor (none declared names none); for an
    agent that is not one, the context is taken as it is."
-  [room agent-id {:keys [system-prompt budget-dollars limit sandbox]}]
+  [room agent-id {:keys [system-prompt budget-dollars limit sandbox]} cleanups]
   (let [room-id (:id room)
         k       [room-id agent-id]]
     ;; Room forking and unregister hold the same monitor. Cache reads belong
@@ -449,7 +461,7 @@
                                    :room/incarnation (:incarnation room)})))
               _ (preparation/assert-agent-quiescent! room agent-id)]
           (or (when-let [entry (current-entry! room agent-id)]
-                (some-> (with-extensions! k entry sandbox)
+                (some-> (with-extensions! room k entry sandbox cleanups)
                         (with-system-prompt! system-prompt)))
               (let [;; The room's system-db UUID — the key the system resolvers
                 ;; (room-kb-conn / room-kbs / room-msgs) want; distinct from the
@@ -495,7 +507,18 @@
                      ;; with these opts (`fork-ctx!`)
                      :sandbox-extensions sandbox}
                     messages (hydration-messages! room agent-id limit)
-                    cctx (turn/new-working-ctx sandbox-opts)
+                    published? (atom false)
+                    acquired (volatile! nil)
+                    acquisition {:chat-ctx-ref acquired :execution-ctx (:ctx room)}
+                    ;; Reserve capacity BEFORE the constructor can allocate a
+                    ;; heap. Its callback only fills this retained anchor.
+                    acquisition-lease
+                    (retain-entry-cleanup!
+                     room k acquisition cleanups
+                     (fn [entry] (when-not @published? (release-entry! entry))))
+                    cctx (turn/new-working-ctx
+                          (assoc sandbox-opts :own-cleanup!
+                                 (fn [cctx] (vreset! acquired cctx) true)))
                     bound-sandbox-opts (assoc sandbox-opts
                                               :capability-id (:capability-id cctx))
                     seen (java.util.Collections/synchronizedSet (java.util.HashSet.))
@@ -527,13 +550,35 @@
                   ;; Publication is the commit point. Before this swap, no
                   ;; concurrent fast path can observe partially hydrated state.
                   (swap! room-agent-ctxs assoc k entry)
+                  (reset! published? true)
+                  (preparation/transfer-room-cleanup-entry! acquisition-lease k acquisition)
                   cctx
                   (catch Throwable error
-                    (try
-                      (chat-ctx/release-sci-in! cctx (:ctx room))
-                      (catch Throwable cleanup-error
-                        (.addSuppressed error cleanup-error)))
+                    ;; The retained acquisition above owns cleanup after this
+                    ;; constructor unwinds and the Room monitor is released.
                     (throw error))))))))))
+
+(defn- finish-cleanups! [cleanups]
+  (reduce (fn [errors lease]
+            (try ((:join! lease) 5000)
+                 errors
+                 (catch Throwable error (conj errors error))))
+          [] cleanups))
+
+(defn ensure-ctx!
+  "Get or create an agent's cached context. Cache decisions stay under the Room
+   monitor; exact detached/unpublished entries release through existing cleanup
+   leases after leaving it. Failed cleanup remains retained for a later drain."
+  [room agent-id opts]
+  (let [cleanups (atom [])
+        outcome (try {:value (ensure-ctx-locked! room agent-id opts cleanups)}
+                     (catch Throwable error {:error error}))
+        failures (finish-cleanups! @cleanups)]
+    (if-let [error (or (:error outcome) (first failures))]
+      (do (doseq [failure failures :when (not (identical? error failure))]
+            (.addSuppressed ^Throwable error failure))
+          (throw error))
+      (:value outcome))))
 
 (defn fork-ctx!
   "Project an existing parent room/agent working context into `child-room`.
@@ -543,43 +588,84 @@
    capabilities without reconstructing the interpreter or replaying history;
    provider admission remains exclusively controlled by attention."
   [parent-room child-room agent-id]
-  (let [parent-k [(:id parent-room) agent-id]
-        child-k [(:id child-room) agent-id]]
-    (when-let [{:keys [chat-ctx seen sandbox-opts]} (get @room-agent-ctxs parent-k)]
-      (or (:chat-ctx (get @room-agent-ctxs child-k))
-          (when (try
-                  (chat-ctx/sci-context-in chat-ctx (:ctx child-room))
-                  true
-                  (catch clojure.lang.ExceptionInfo _ false))
-            (let [room-uuid (binding [ec/*execution-context* (:ctx child-room)]
-                              (room-system-id child-room))
-                  child-opts (assoc sandbox-opts
-                                    :execution-ctx (:ctx child-room)
-                                    :db-conn (some-> child-room :store :conn)
-                                    :kb-conn (some-> room-uuid srooms/room-kb-conn)
-                                    :room-id room-uuid
-                                    :room-runtime-id (:id child-room)
-                                    :room-incarnation (:incarnation child-room)
-                                    :fork-projection? true
-                                    :capability-id (:capability-id chat-ctx))
-                  projected (chat-ctx/reset-extension-owners
-                             (assoc chat-ctx
-                                    :spindel-ctx (:ctx child-room)
-                                    :db-conn (some-> child-room :store :conn))
-                             (:ctx child-room) (:sandbox-extensions chat-ctx))
-                  _ (turn/rebind-working-ctx! projected child-opts)
-                  child-seen (java.util.Collections/synchronizedSet
-                              (locking seen
-                                (java.util.HashSet. ^java.util.Collection seen)))
-                  entry {:chat-ctx projected
-                         :seen child-seen
-                         :execution-ctx (:ctx child-room)
-                         :room-meta (:meta child-room)
-                         :sandbox-opts child-opts}]
-              (swap! room-agent-ctxs
-                     (fn [m]
-                       (if (contains? m child-k) m (assoc m child-k entry))))
-              (:chat-ctx (get @room-agent-ctxs child-k))))))))
+  (d/with-room-lock child-room
+    (let [parent-k [(:id parent-room) agent-id]
+          child-k [(:id child-room) agent-id]]
+      (when-let [{:keys [chat-ctx seen sandbox-opts]} (get @room-agent-ctxs parent-k)]
+        (or (when-let [entry (get @room-agent-ctxs child-k)]
+              (when (false? (:projection-ready? entry))
+                (throw (ex-info "Interpreter projection construction has not completed"
+                                {:type ::incomplete-projection :room-id (:id child-room)
+                                 :agent-id agent-id})))
+              (:chat-ctx entry))
+            (when (try
+                    (chat-ctx/sci-context-in chat-ctx (:ctx child-room))
+                    true
+                    (catch clojure.lang.ExceptionInfo _ false))
+              (let [room-uuid (binding [ec/*execution-context* (:ctx child-room)]
+                                (room-system-id child-room))
+                    child-opts (assoc sandbox-opts
+                                      :execution-ctx (:ctx child-room)
+                                      :db-conn (some-> child-room :store :conn)
+                                      :kb-conn (some-> room-uuid srooms/room-kb-conn)
+                                      :room-id room-uuid
+                                      :room-runtime-id (:id child-room)
+                                      :room-incarnation (:incarnation child-room)
+                                      :fork-projection? true
+                                      :capability-id (:capability-id chat-ctx))
+                    projected (chat-ctx/reset-extension-owners
+                               (assoc chat-ctx
+                                      :spindel-ctx (:ctx child-room)
+                                      :db-conn (some-> child-room :store :conn))
+                               (:ctx child-room) (extensions/snapshot (:sandbox-extensions chat-ctx)))
+                    child-seen (java.util.Collections/synchronizedSet
+                                (locking seen
+                                  (java.util.HashSet. ^java.util.Collection seen)))
+                    entry {:chat-ctx projected
+                           :seen child-seen
+                           :execution-ctx (:ctx child-room)
+                           :room-meta (:meta child-room)
+                           :projection-ready? false
+                           :sandbox-opts child-opts}]
+              ;; Retain the exact acquisition before fallible installation.
+              ;; The child monitor excludes readers until publication or error.
+                (swap! room-agent-ctxs assoc child-k entry)
+                (turn/rebind-working-ctx! projected child-opts)
+                (swap! room-agent-ctxs assoc child-k (assoc entry :projection-ready? true))
+                projected)))))))
+
+(defn drop-unpublished-room!
+  "HOST constructor rollback only. Keep exact projections in the existing cache
+   until release ACK. The parent receipt must retain the child and its substrate
+   throughout this operation; this helper never disposes that substrate."
+  [parent-room child-room]
+  (let [unpublished! (fn []
+                       (when (binding [ec/*execution-context* (:ctx parent-room)]
+                               (rreg/lookup (:id child-room)))
+                         (throw (ex-info "Constructor cleanup refuses a published Room"
+                                         {:type ::published-construction :room-id (:id child-room)}))))
+        entries (d/with-room-lock child-room
+                  (unpublished!)
+                  (let [entries (into {} (filter (fn [[[id _] _]] (= id (:id child-room))))
+                                      @room-agent-ctxs)]
+                    (doseq [[[_ agent-id] _] entries]
+                      (current-entry! child-room agent-id))
+                    entries))]
+    (doseq [[key entry] entries]
+      (locking entry
+        (when (d/with-room-lock child-room
+                (unpublished!)
+                (identical? entry (get @room-agent-ctxs key)))
+          (try
+            (release-entry! entry)
+            (catch Throwable error
+              (throw (ex-info "Unpublished interpreter cleanup is pending"
+                              {:type ::unpublished-cleanup-pending
+                               :room-id (:id child-room) :agent-id (second key)} error))))
+          (d/with-room-lock child-room
+            (swap! room-agent-ctxs
+                   #(if (identical? entry (get % key)) (dissoc % key) %))))))
+    nil))
 
 (defn drop-ctx!
   "Tear down a quiescent provider projection off-engine. Prefer the Room form
@@ -599,19 +685,26 @@
                    (when-not (and if-absent? room (contains? @(:participants room) agent-id))
                      (when room (preparation/assert-agent-quiescent! room agent-id))
                      (when-let [entry (get @room-agent-ctxs k)]
-                       (let [lease (when room (preparation/retain-cleanup! room agent-id entry))]
+                       ;; Without the exact Room owner, keep the cache anchor.
+                       ;; Detachment must never leave a failed release ownerless.
+                       (when-not room
+                         (throw (ex-info "Cached context has no Room cleanup owner"
+                                         {:type ::missing-cleanup-owner :room-id room-id
+                                          :agent-id agent-id})))
+                       (when-not (and (binding [ec/*execution-context* (:ctx room)]
+                                        (rreg/admitted-incarnation? room))
+                                      (nil? (:dvergr/fork-transfer-state @(:meta room))))
+                         (throw (ex-info "Context retirement admission is closed"
+                                         {:type ::preparation/admission-closed :room-id room-id})))
+                       (current-entry! room agent-id)
+                       (let [lease (preparation/retain-room-cleanup!
+                                    room {k entry} release-entry! agent-id)]
                          (swap! room-agent-ctxs dissoc k)
-                         [entry lease]))))
-         [entry lease] (if-let [room-meta (or (:meta room) (:room-meta cached))]
-                         (locking room-meta (detach!))
-                         (detach!))]
-     (when-let [cctx (:chat-ctx entry)]
-       (try
-         (chat-ctx/release-sci-in! cctx (or (:execution-ctx entry) (:spindel-ctx cctx)))
-         (when lease (preparation/complete-cleanup! lease nil))
-         (catch Throwable error
-           (when lease (preparation/complete-cleanup! lease error))
-           (throw error)))))
+                         lease))))
+         lease (if-let [room-meta (or (:meta room) (:room-meta cached))]
+                 (locking room-meta (detach!))
+                 (detach!))]
+     (when lease ((:join! lease) 5000)))
    nil))
 
 (defn drop-room!
