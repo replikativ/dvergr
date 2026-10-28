@@ -30,7 +30,10 @@
         ;; carries forkable interpreter worlds while sci#1084 is upstreamed;
         ;; replikativ.7 adds fork-local lazy realization, explicit retirement,
         ;; failed-fork cleanup recovery, and retirement-safe native imports.
-        org.replikativ/sci         {:mvn/version "0.15.59-replikativ.7"}
+        ;; Temporary immutable SCI#5 pin for full integration CI. Replace with
+        ;; the verified .8 artifact before landing this maintenance branch.
+        org.replikativ/sci         {:git/url "https://github.com/whilo/sci.git"
+                                   :git/sha "f7bc2081f03abe7d1e0a4d04cc71ba6638e1a5a3"}
 
         ;; Dvergr uses the async sequence/CPS namespaces directly; keep this a
         ;; direct dependency instead of relying on Spindel's implementation deps.
