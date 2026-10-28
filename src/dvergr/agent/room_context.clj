@@ -648,8 +648,8 @@
                                          {:type ::missing-cleanup-owner :room-id room-id
                                           :agent-id agent-id})))
                        (when-not (and (binding [ec/*execution-context* (:ctx room)]
-                                         (rreg/admitted-incarnation? room))
-                                       (nil? (:dvergr/fork-transfer-state @(:meta room))))
+                                        (rreg/admitted-incarnation? room))
+                                      (nil? (:dvergr/fork-transfer-state @(:meta room))))
                          (throw (ex-info "Context retirement admission is closed"
                                          {:type ::preparation/admission-closed :room-id room-id})))
                        (current-entry! room agent-id)
