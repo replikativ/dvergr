@@ -107,8 +107,9 @@
         ;; Historical savepoint forks own isolated workspaces; settlement joins
         ;; native overlay disposal. 0.1.148 adds exact native checkpoint
         ;; admission, construction recovery and reactive lifetime corrections.
-        ;; 0.1.149 retains failed SCI construction cleanup for retry.
-        org.replikativ/spindel     {:mvn/version "0.1.149"}
+        ;; 0.1.149 retains failed SCI construction cleanup for retry;
+        ;; 0.1.150 fixes await/mult lost wakeups and untap cancellation races.
+        org.replikativ/spindel     {:mvn/version "0.1.150"}
         ;; probabilistic inference in forkable worlds, split out of spindel:
         ;; the sandbox's infer/ and dist/ namespaces (foerster.core, .dist).
         ;; 0.1.45: savepoint inference throughout, resample-move, tempering,

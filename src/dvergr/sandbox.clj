@@ -201,14 +201,21 @@
       (doseq [s (vals @awaited)]
         (cancel-pending-spin! execution-ctx s)))))
 
-(def ^:private core-extras
+(defn- regex-result-snapshot
+  "Snapshot matches from one finite input; never export a native Matcher cursor."
+  [pattern text]
+  (some-> (re-seq pattern text) vec seq))
+
+(defn- core-extras
   "clojure.core 1.11/1.12 additions SCI's default set lacks. Copied from the REAL
    vars (docs + arglists intact) via `sci/copy-var` — the babashka approach (see
    `babashka.impl.clojure.core/core-extras`) — so the sandbox's clojure.core is
    reasonably complete, not a hand-rolled subset. Merged into BOTH the base ctx and
    the spindel-backed agent ctx (the spindel SCI starts fresh, so it needs these
    re-merged like the classes + clojure.test runners). Host is Clojure 1.12, so all
-   these resolve."
+   these resolve. Each interpreter gets fresh Var handles: retiring one world
+   must not poison the next interpreter through process-global imported Vars."
+  []
   {'random-uuid    (sci/copy-var random-uuid clojure-core-ns)
    'parse-uuid     (sci/copy-var parse-uuid clojure-core-ns)
    'parse-long     (sci/copy-var parse-long clojure-core-ns)
@@ -223,6 +230,9 @@
    'splitv-at      (sci/copy-var splitv-at clojure-core-ns)
    'partitionv     (sci/copy-var partitionv clojure-core-ns)
    'partitionv-all (sci/copy-var partitionv-all clojure-core-ns)
+   're-seq         (sci/new-var 're-seq regex-result-snapshot
+                                (assoc (select-keys (meta #'clojure.core/re-seq) [:doc :arglists])
+                                       :ns clojure-core-ns))
    'tap>           (sci/copy-var tap> clojure-core-ns)
    ;; add-tap/remove-tap are withheld: the tap set is JVM-global, so a sandbox
    ;; fn registered there would see every other sandbox's (and the host's) taps.
@@ -397,7 +407,7 @@
            ;; Clojure 1.11 core additions SCI's clojure.core lacks — agents reach for
            ;; `(random-uuid)`/`(parse-long …)` constantly, so provide equivalents
            ;; (pure, drop-in) rather than have them error with "Unable to resolve".
-          :namespaces {'clojure.core core-extras}
+          :namespaces {'clojure.core (core-extras)}
 
            ;; Features (for reader conditionals if needed)
           :features #{:clj}
@@ -466,7 +476,7 @@
     ;; bind clojure.test to this interpreter before any descendant forks it.
     (sci/merge-opts interpreter
                     {:classes base-classes
-                     :namespaces {'clojure.core core-extras}})
+                     :namespaces {'clojure.core (core-extras)}})
     (sci/merge-opts interpreter
                     {:namespaces
                      {'clojure.test
@@ -521,7 +531,7 @@
      ;; `(random-uuid)`/`(parse-long …)` in the real sandbox they actually run in).
      (when spindel-ctx
        (sci/merge-opts forked {:classes    base-classes
-                               :namespaces {'clojure.core core-extras}}))
+                               :namespaces {'clojure.core (core-extras)}}))
      ;; Re-bind high-level test runners to close over the forked ctx, not the base.
      ;; Without this, run-tests would look up vars in the base context and find none.
      (sci/merge-opts forked {:namespaces {'clojure.test (sci-test/ctx-aware-test-namespace forked)}})

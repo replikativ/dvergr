@@ -289,6 +289,9 @@
    drop it, since an interpreter cannot give back what its code may already
    hold. Under the Room monitor."
   [room [_ agent-id :as k] {:keys [chat-ctx sandbox-opts execution-ctx] :as entry} sandbox cleanups]
+  (when (false? (:projection-ready? entry))
+    (throw (ex-info "Interpreter projection construction has not completed"
+                    {:type ::incomplete-projection :room-id (:id room) :agent-id agent-id})))
   (let [have (set (:sandbox-extensions chat-ctx))
         want (set sandbox)]
     (cond
@@ -585,43 +588,84 @@
    capabilities without reconstructing the interpreter or replaying history;
    provider admission remains exclusively controlled by attention."
   [parent-room child-room agent-id]
-  (let [parent-k [(:id parent-room) agent-id]
-        child-k [(:id child-room) agent-id]]
-    (when-let [{:keys [chat-ctx seen sandbox-opts]} (get @room-agent-ctxs parent-k)]
-      (or (:chat-ctx (get @room-agent-ctxs child-k))
-          (when (try
-                  (chat-ctx/sci-context-in chat-ctx (:ctx child-room))
-                  true
-                  (catch clojure.lang.ExceptionInfo _ false))
-            (let [room-uuid (binding [ec/*execution-context* (:ctx child-room)]
-                              (room-system-id child-room))
-                  child-opts (assoc sandbox-opts
-                                    :execution-ctx (:ctx child-room)
-                                    :db-conn (some-> child-room :store :conn)
-                                    :kb-conn (some-> room-uuid srooms/room-kb-conn)
-                                    :room-id room-uuid
-                                    :room-runtime-id (:id child-room)
-                                    :room-incarnation (:incarnation child-room)
-                                    :fork-projection? true
-                                    :capability-id (:capability-id chat-ctx))
-                  projected (chat-ctx/reset-extension-owners
-                             (assoc chat-ctx
-                                    :spindel-ctx (:ctx child-room)
-                                    :db-conn (some-> child-room :store :conn))
-                             (:ctx child-room) (extensions/snapshot (:sandbox-extensions chat-ctx)))
-                  _ (turn/rebind-working-ctx! projected child-opts)
-                  child-seen (java.util.Collections/synchronizedSet
-                              (locking seen
-                                (java.util.HashSet. ^java.util.Collection seen)))
-                  entry {:chat-ctx projected
-                         :seen child-seen
-                         :execution-ctx (:ctx child-room)
-                         :room-meta (:meta child-room)
-                         :sandbox-opts child-opts}]
-              (swap! room-agent-ctxs
-                     (fn [m]
-                       (if (contains? m child-k) m (assoc m child-k entry))))
-              (:chat-ctx (get @room-agent-ctxs child-k))))))))
+  (d/with-room-lock child-room
+    (let [parent-k [(:id parent-room) agent-id]
+          child-k [(:id child-room) agent-id]]
+      (when-let [{:keys [chat-ctx seen sandbox-opts]} (get @room-agent-ctxs parent-k)]
+        (or (when-let [entry (get @room-agent-ctxs child-k)]
+              (when (false? (:projection-ready? entry))
+                (throw (ex-info "Interpreter projection construction has not completed"
+                                {:type ::incomplete-projection :room-id (:id child-room)
+                                 :agent-id agent-id})))
+              (:chat-ctx entry))
+            (when (try
+                    (chat-ctx/sci-context-in chat-ctx (:ctx child-room))
+                    true
+                    (catch clojure.lang.ExceptionInfo _ false))
+              (let [room-uuid (binding [ec/*execution-context* (:ctx child-room)]
+                                (room-system-id child-room))
+                    child-opts (assoc sandbox-opts
+                                      :execution-ctx (:ctx child-room)
+                                      :db-conn (some-> child-room :store :conn)
+                                      :kb-conn (some-> room-uuid srooms/room-kb-conn)
+                                      :room-id room-uuid
+                                      :room-runtime-id (:id child-room)
+                                      :room-incarnation (:incarnation child-room)
+                                      :fork-projection? true
+                                      :capability-id (:capability-id chat-ctx))
+                    projected (chat-ctx/reset-extension-owners
+                               (assoc chat-ctx
+                                      :spindel-ctx (:ctx child-room)
+                                      :db-conn (some-> child-room :store :conn))
+                               (:ctx child-room) (extensions/snapshot (:sandbox-extensions chat-ctx)))
+                    child-seen (java.util.Collections/synchronizedSet
+                                (locking seen
+                                  (java.util.HashSet. ^java.util.Collection seen)))
+                    entry {:chat-ctx projected
+                           :seen child-seen
+                           :execution-ctx (:ctx child-room)
+                           :room-meta (:meta child-room)
+                           :projection-ready? false
+                           :sandbox-opts child-opts}]
+              ;; Retain the exact acquisition before fallible installation.
+              ;; The child monitor excludes readers until publication or error.
+                (swap! room-agent-ctxs assoc child-k entry)
+                (turn/rebind-working-ctx! projected child-opts)
+                (swap! room-agent-ctxs assoc child-k (assoc entry :projection-ready? true))
+                projected)))))))
+
+(defn drop-unpublished-room!
+  "HOST constructor rollback only. Keep exact projections in the existing cache
+   until release ACK. The parent receipt must retain the child and its substrate
+   throughout this operation; this helper never disposes that substrate."
+  [parent-room child-room]
+  (let [unpublished! (fn []
+                       (when (binding [ec/*execution-context* (:ctx parent-room)]
+                               (rreg/lookup (:id child-room)))
+                         (throw (ex-info "Constructor cleanup refuses a published Room"
+                                         {:type ::published-construction :room-id (:id child-room)}))))
+        entries (d/with-room-lock child-room
+                  (unpublished!)
+                  (let [entries (into {} (filter (fn [[[id _] _]] (= id (:id child-room))))
+                                      @room-agent-ctxs)]
+                    (doseq [[[_ agent-id] _] entries]
+                      (current-entry! child-room agent-id))
+                    entries))]
+    (doseq [[key entry] entries]
+      (locking entry
+        (when (d/with-room-lock child-room
+                (unpublished!)
+                (identical? entry (get @room-agent-ctxs key)))
+          (try
+            (release-entry! entry)
+            (catch Throwable error
+              (throw (ex-info "Unpublished interpreter cleanup is pending"
+                              {:type ::unpublished-cleanup-pending
+                               :room-id (:id child-room) :agent-id (second key)} error))))
+          (d/with-room-lock child-room
+            (swap! room-agent-ctxs
+                   #(if (identical? entry (get % key)) (dissoc % key) %))))))
+    nil))
 
 (defn drop-ctx!
   "Tear down a quiescent provider projection off-engine. Prefer the Room form

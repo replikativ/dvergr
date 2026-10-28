@@ -135,11 +135,31 @@ successful releases individually, in reverse acquisition order. Scratch database
 cleanup selects the exact owning world and retains connection-release progress
 when database deletion fails.
 
+Participant-cloning forks reserve a parent Room cleanup receipt before acquiring
+the child. Publication transfers that ownership under the Room monitor. A failed
+constructor leaves both monitors before cleanup, retains partial projections
+before namespace installation, and releases those resources before discarding
+their workspace. Cleanup keeps per-phase and per-store acknowledgements; an
+incomplete affine operation stays retained for native recovery rather than being
+blindly replayed. Cloning is a synchronous HOST operation: reactive callers use
+an owned worker or `org.replikativ.spindel.blocking/blocking`. Run worlds with
+`:clone-participants? false` keep their existing construction path; its broader
+rollback integration remains separate.
+
 These receipts do not establish a general Spindel task-tree join or enable
 automatic SCI retirement. Extension callbacks remain responsible for joining
 their own native work. The separate Run/preparation supervisor currently records
 cleanup failure without retrying that callback; recovering that path is a further
 supervisor change, not a guarantee of these cache cleanup receipts.
+
+The SCI host adapters also distinguish immutable data from consuming cursors.
+Regex matches and entity attributes are finite snapshots. Datom streams remain
+lazy and sealed; a fork replays a cursor from the same immutable database
+snapshot and offset. Callback-filtered databases and unknown consuming results
+can be read locally but refuse cursor forks. Lazy backend errors retain no raw
+database/store values in their causes or data. Native test implementation Var
+identities are declared before first installation; ordinary imported Vars are
+fresh per interpreter, and retiring a user Var does not make it readable again.
 
 ### Owned native SCI invocations
 

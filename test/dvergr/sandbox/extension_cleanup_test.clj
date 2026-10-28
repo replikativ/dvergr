@@ -7,8 +7,11 @@
             [dvergr.room.store.memory :as memory]
             [dvergr.runtime.preparation :as preparation]
             [dvergr.sandbox.extensions :as extensions]
+            [dvergr.system.rooms :as rooms]
+            [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]
+            [org.replikativ.spindel.yggdrasil :as ygg]
             [org.replikativ.spindel.sci.world :as sci-world]))
 
 (defn- with-registry [f]
@@ -218,3 +221,201 @@
                           (catch Exception e (ex-data e)))))
                 (is (zero? @constructed))
                 (is (zero? @released))))))))))
+
+(defn- throwing-clone! [room]
+  (discourse/join room
+                  (discourse/participant
+                   {:id :agent :on-message (fn [_ _] nil)
+                    :factory (fn [_] (throw (ex-info "Clone factory refused" {:clone-failure true})))})))
+
+(deftest failed-cloning-releases-child-projection-before-discard-off-both-monitors
+  (with-registry
+    (fn []
+      (with-room
+        (fn [_ room]
+          (let [child (atom nil) events (atom []) parent-interpreter (atom nil)
+                project room-context/fork-ctx! discard ygg/discard-fork!]
+            (extensions/register! :test/a {:version 1 :install (fn [& _])
+                                           :release (fn [interpreter]
+                                                      (when-not (identical? interpreter @parent-interpreter)
+                                                        (swap! events conj :release)
+                                                        (is (not (Thread/holdsLock (:meta room))))
+                                                        (is (not (Thread/holdsLock (:meta @child))))))})
+            (let [parent (room-context/ensure-ctx! room :agent {:sandbox #{:test/a}})]
+              (reset! parent-interpreter (chat/sci-context parent))
+              (throwing-clone! room)
+              (with-redefs [room-context/fork-ctx! (fn [parent fork agent]
+                                                     (reset! child fork) (project parent fork agent))
+                            ygg/discard-fork! (fn [handle & [opts]]
+                                                (swap! events conj :discard) (discard handle (or opts {})))]
+                (is (:clone-failure
+                     (try (discourse/fork-room room {:isolation :ctx}) nil
+                          (catch Exception error (ex-data error))))))
+              (is (= [:release :discard] @events))
+              (is (nil? (room-context/lookup (:id @child) :agent)))
+              (is (identical? @parent-interpreter (chat/sci-context parent))))))))))
+
+(deftest failed-child-release-retains-native-substrate-until-parent-drain-retries
+  (with-registry
+    (fn []
+      (with-room
+        (fn [_ room]
+          (let [child (atom nil) fail? (atom true) events (atom []) parent-interpreter (atom nil)
+                project room-context/fork-ctx! discard ygg/discard-fork!]
+            (try
+              (extensions/register! :test/a {:version 1 :install (fn [& _])
+                                             :release (fn [interpreter]
+                                                        (when-not (identical? interpreter @parent-interpreter)
+                                                          (swap! events conj :release)
+                                                          (when @fail? (throw (ex-info "Child cleanup refused" {})))))})
+              (let [parent (room-context/ensure-ctx! room :agent {:sandbox #{:test/a}})]
+                (reset! parent-interpreter (chat/sci-context parent))
+                (throwing-clone! room)
+                (with-redefs [room-context/fork-ctx! (fn [parent fork agent]
+                                                       (reset! child fork) (project parent fork agent))
+                              ygg/discard-fork! (fn [handle & [opts]]
+                                                  (swap! events conj :discard) (discard handle (or opts {})))]
+                  (let [error (try (discourse/fork-room room {:isolation :ctx}) nil
+                                   (catch Exception error error))
+                        handle (discourse/fork-handle @child)]
+                    (is (:clone-failure (ex-data error)))
+                    (is (= 1 (count (.getSuppressed ^Throwable error))))
+                    (is (= [:release] @events))
+                    (is (some? (room-context/lookup (:id @child) :agent)))
+                    (is (= :open (:status (ygg/fork-disposition handle))))
+                    (reset! fail? false)
+                    (preparation/drain-room! room)
+                    (is (= [:release :release :discard] @events))
+                    (is (nil? (room-context/lookup (:id @child) :agent)))
+                    (is (= :discarded (:status (ygg/fork-disposition handle))))))
+                (is (identical? @parent-interpreter (chat/sci-context parent))))
+              (finally (reset! fail? false)))))))))
+
+(deftest failed-native-discard-does-not-replay-acknowledged-child-cleanup
+  (with-registry
+    (fn []
+      (with-room
+        (fn [_ room]
+          (let [fail? (atom true) releases (atom 0) discards (atom 0) parent-interpreter (atom nil)
+                discard ygg/discard-fork!]
+            (try
+              (extensions/register! :test/a {:version 1 :install (fn [& _])
+                                             :release (fn [interpreter]
+                                                        (when-not (identical? interpreter @parent-interpreter)
+                                                          (swap! releases inc)))})
+              (reset! parent-interpreter
+                      (chat/sci-context (room-context/ensure-ctx! room :agent {:sandbox #{:test/a}})))
+              (throwing-clone! room)
+              (with-redefs [ygg/discard-fork! (fn [handle & [opts]]
+                                                (swap! discards inc)
+                                                (when @fail? (throw (ex-info "Discard refused before mutation" {})))
+                                                (discard handle (or opts {})))]
+                (is (thrown? Exception (discourse/fork-room room {:isolation :ctx})))
+                (is (= 1 @releases @discards))
+                (reset! fail? false)
+                (preparation/drain-room! room)
+                (is (= 1 @releases))
+                (is (= 2 @discards)))
+              (finally (reset! fail? false)))))))))
+
+(deftest failed-projection-rebind-is-retained-before-installation
+  (with-registry
+    (fn []
+      (with-room
+        (fn [runtime room]
+          (let [child (atom nil) installs (atom 0) releases (atom 0)
+                project room-context/fork-ctx!]
+            (extensions/register! :test/a {:version 1
+                                           :install (fn [_ selected]
+                                                      (when-not (identical? selected runtime)
+                                                        (swap! installs inc)
+                                                        (throw (ex-info "Child installation refused" {:child-install true}))))
+                                           :release (fn [_] (swap! releases inc))})
+            (room-context/ensure-ctx! room :agent {:sandbox #{:test/a}})
+            (throwing-clone! room)
+            (with-redefs [room-context/fork-ctx! (fn [parent fork agent]
+                                                   (reset! child fork) (project parent fork agent))]
+              (is (:child-install
+                   (try (discourse/fork-room room {:isolation :ctx}) nil
+                        (catch Exception error (ex-data error))))))
+            (is (= 1 @installs @releases))
+            (is (nil? (room-context/lookup (:id @child) :agent)))))))))
+
+(deftest cloning-on-the-drain-refuses-before-fork-acquisition
+  (with-room
+    (fn [_ room]
+      (let [result (promise) forks (atom 0)]
+        (with-redefs [ygg/fork! (fn [& _] (swap! forks inc))]
+          (sp/spawn! (sp/spin
+                      (sp/await (sp/sleep 1))
+                      (deliver result
+                               (try (discourse/fork-room room) nil
+                                    (catch Exception error (:type (ex-data error)))))))
+          (is (= ::preparation/blocking-cleanup (deref result 5000 ::timeout)))
+          (is (zero? @forks)))))))
+
+(deftest unpublished-cleanup-refuses-a-registered-owner-before-release
+  (with-room
+    (fn [_ room]
+      (let [working (room-context/ensure-ctx! room :agent {:sandbox #{}})
+            interpreter (chat/sci-context working)]
+        (is (= ::room-context/published-construction
+               (try (room-context/drop-unpublished-room! room room) nil
+                    (catch Exception error (:type (ex-data error))))))
+        (is (identical? working (room-context/lookup (:id room) :agent)))
+        (is (identical? interpreter (chat/sci-context working)))))))
+
+(deftest incomplete-native-discard-is-retained-without-blind-replay
+  (with-registry
+    (fn []
+      (with-room
+        (fn [_ room]
+          (let [fail? (atom true) incomplete? (atom false) discards (atom 0)
+                discard ygg/discard-fork! disposition ygg/fork-disposition]
+            (try
+              (room-context/ensure-ctx! room :agent {:sandbox #{}})
+              (throwing-clone! room)
+              (with-redefs [ygg/discard-fork! (fn [handle & [opts]]
+                                                (swap! discards inc)
+                                                (when @fail? (throw (ex-info "Ambiguous disposal" {})))
+                                                (discard handle (or opts {})))
+                            ygg/fork-disposition (fn [handle]
+                                                   (if @incomplete? {:status :incomplete} (disposition handle)))]
+                (is (thrown? Exception (discourse/fork-room room {:isolation :ctx})))
+                (reset! fail? false)
+                (reset! incomplete? true)
+                (is (thrown? Exception (preparation/drain-room! room)))
+                (is (= 1 @discards))
+                (is (seq (get @(:meta room) preparation/leases-key)))
+                (reset! incomplete? false)
+                (preparation/drain-room! room)
+                (is (= 2 @discards)))
+              (finally (reset! fail? false) (reset! incomplete? false)))))))))
+
+(deftest failed-grant-deletion-retains-only-unacknowledged-scopes
+  (with-registry
+    (fn []
+      (with-room
+        (fn [_ room]
+          (let [fail? (atom true) deleted (atom []) discards (atom 0)
+                read-state ec/get-state discard ygg/discard-fork!
+                pending [{:scope :first-store} {:scope :second-store}]]
+            (try
+              (room-context/ensure-ctx! room :agent {:sandbox #{}})
+              (throwing-clone! room)
+              (with-redefs [ec/get-state (fn [& args]
+                                           (if (= [:dvergr/pending-grants] (first args))
+                                             pending (apply read-state args)))
+                            ygg/discard-fork! (fn [handle & [opts]]
+                                                (swap! discards inc) (discard handle (or opts {})))
+                            rooms/drop-fork-grant! (fn [{:keys [scope]}]
+                                                     (swap! deleted conj scope)
+                                                     (when (and (= scope :second-store) @fail?)
+                                                       (throw (ex-info "Deletion refused" {}))))]
+                (is (thrown? Exception (discourse/fork-room room {:isolation :ctx})))
+                (is (= [:first-store :second-store] @deleted))
+                (reset! fail? false)
+                (preparation/drain-room! room)
+                (is (= [:first-store :second-store :second-store] @deleted))
+                (is (= 1 @discards)))
+              (finally (reset! fail? false)))))))))

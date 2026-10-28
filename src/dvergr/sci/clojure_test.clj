@@ -5,7 +5,8 @@
    to work without babashka's infrastructure."
   (:require [dvergr.sci.impl.clojure-test :as t]
             [sci.core :as sci]
-            [sci.ctx-store :as sci-ctx-store]))
+            [sci.ctx-store :as sci-ctx-store]
+            [sci.impl.world :as sci-world]))
 
 ;; Create the test namespace object
 (def tns t/tns)
@@ -24,6 +25,17 @@
   (alter-meta! v assoc :sci.impl/fork-fn identity)
   v)
 
+(defn- native-implementation-table
+  "Declare only these process-owned native Var identities before installation.
+   The vendored functions reference the same handles for dynamic bindings, so
+   copying them would break the adapter. Per-world descriptors still select
+   values; a retired agent interpreter must never become their implicit home.
+   This does not alter metadata, fork policy or arbitrary user Vars."
+  [table]
+  (doseq [[_ value] table :when (instance? sci.lang.Var value)]
+    (sci-world/-mark-world-tracked! value nil))
+  table)
+
 ;; Base namespace map — everything except the high-level runners that need ctx.
 ;; Combine with ctx-aware-test-namespace (below) for full functionality.
 (def clojure-test-namespace
@@ -31,57 +43,58 @@
 
    The high-level runners (run-tests, test-ns, test-all-vars, run-all-tests)
    use dummy stubs here — use ctx-aware-test-namespace to get working versions."
-  {:obj tns
+  (native-implementation-table
+   {:obj tns
    ;; Dynamic vars
-   '*load-tests*             t/load-tests
-   '*stack-trace-depth*      t/stack-trace-depth
-   '*report-counters*        t/report-counters
-   '*initial-report-counters* t/initial-report-counters
-   '*testing-vars*           t/testing-vars
-   '*testing-contexts*       t/testing-contexts
-   '*test-out*               (shared-host-capability t/test-out)
+    '*load-tests*             t/load-tests
+    '*stack-trace-depth*      t/stack-trace-depth
+    '*report-counters*        t/report-counters
+    '*initial-report-counters* t/initial-report-counters
+    '*testing-vars*           t/testing-vars
+    '*testing-contexts*       t/testing-contexts
+    '*test-out*               (shared-host-capability t/test-out)
 
    ;; Utilities
-   'testing-vars-str    (sci/copy-var t/testing-vars-str tns)
-   'testing-contexts-str (sci/copy-var t/testing-contexts-str tns)
-   'inc-report-counter  (sci/copy-var t/inc-report-counter tns)
-   'report              (shared-host-capability t/report)
-   'do-report           (sci/copy-var t/do-report tns)
+    'testing-vars-str    (sci/copy-var t/testing-vars-str tns)
+    'testing-contexts-str (sci/copy-var t/testing-contexts-str tns)
+    'inc-report-counter  (sci/copy-var t/inc-report-counter tns)
+    'report              (shared-host-capability t/report)
+    'do-report           (sci/copy-var t/do-report tns)
 
    ;; Assertion utilities
-   'function?           (sci/copy-var t/function? tns)
-   'assert-predicate    (sci/copy-var t/assert-predicate tns)
-   'assert-any          (sci/copy-var t/assert-any tns)
+    'function?           (sci/copy-var t/function? tns)
+    'assert-predicate    (sci/copy-var t/assert-predicate tns)
+    'assert-any          (sci/copy-var t/assert-any tns)
 
    ;; Assertion methods
-   'assert-expr         (shared-host-capability
-                         (sci/copy-var t/assert-expr tns))
-   'try-expr            (sci/copy-var t/try-expr tns)
+    'assert-expr         (shared-host-capability
+                          (sci/copy-var t/assert-expr tns))
+    'try-expr            (sci/copy-var t/try-expr tns)
 
    ;; Assertion macros
-   'is                  (sci/copy-var t/is tns)
-   'are                 (sci/copy-var t/are tns)
-   'testing             (sci/copy-var t/testing tns)
+    'is                  (sci/copy-var t/is tns)
+    'are                 (sci/copy-var t/are tns)
+    'testing             (sci/copy-var t/testing tns)
 
    ;; Defining tests
-   'with-test           (sci/copy-var t/with-test tns)
-   'deftest             (sci/copy-var t/deftest tns)
-   'deftest-            (sci/copy-var t/deftest- tns)
-   'set-test            (sci/copy-var t/set-test tns)
+    'with-test           (sci/copy-var t/with-test tns)
+    'deftest             (sci/copy-var t/deftest tns)
+    'deftest-            (sci/copy-var t/deftest- tns)
+    'set-test            (sci/copy-var t/set-test tns)
 
    ;; Fixtures
-   'use-fixtures        (shared-host-capability
-                         (sci/copy-var t/use-fixtures tns))
-   'compose-fixtures    (sci/copy-var t/compose-fixtures tns)
-   'join-fixtures       (sci/copy-var t/join-fixtures tns)
+    'use-fixtures        (shared-host-capability
+                          (sci/copy-var t/use-fixtures tns))
+    'compose-fixtures    (sci/copy-var t/compose-fixtures tns)
+    'join-fixtures       (sci/copy-var t/join-fixtures tns)
 
    ;; Low-level runners (don't need ctx)
-   'test-var            t/test-var
-   'test-vars           (sci/copy-var t/test-vars tns)
-   'run-test-var        (sci/copy-var t/run-test-var tns)
-   'run-test            (sci/copy-var t/run-test tns)
-   'successful?         (sci/copy-var t/successful? tns)
-   'with-test-out       (sci/copy-var t/with-test-out tns)})
+    'test-var            t/test-var
+    'test-vars           (sci/copy-var t/test-vars tns)
+    'run-test-var        (sci/copy-var t/run-test-var tns)
+    'run-test            (sci/copy-var t/run-test tns)
+    'successful?         (sci/copy-var t/successful? tns)
+    'with-test-out       (sci/copy-var t/with-test-out tns)}))
 
 (defn ctx-aware-test-namespace
   "Build a clojure.test namespace map that resolves the active SCI ctx.

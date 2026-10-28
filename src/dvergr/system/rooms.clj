@@ -1181,14 +1181,28 @@
           :data {:room room-id :scope scope :error (.getMessage e)}}
          "Failed to commit a fork's deferred data-DB grant on merge")))))
 
+(defn drop-fork-grant!
+  "Delete one uncommitted fork store, acknowledging only confirmed removal.
+   Failures propagate so a retained rollback owner can retry this exact scope."
+  [{:keys [scope]}]
+  (when-not scope
+    (throw (ex-info "A pending fork grant must name its scope" {:type ::invalid-pending-grant})))
+  (let [cfg (data-cfg scope)]
+    (sdh/delete-database! cfg)
+    (when (or (d/database-exists? cfg)
+              (when-let [path (get-in cfg [:store :path])] (store-ids/store-exists? path)))
+      (throw (ex-info "Pending fork store deletion is incomplete"
+                      {:type ::fork-grant-cleanup-pending :scope scope}))))
+  nil)
+
 (defn drop-fork-grants!
   "Discard a rejected fork's PENDING data-DB grants: delete the on-disk stores the
    fork created (they were never granted, so nothing references them) and drop the
    pending list. Called from the `:on-discard` callback (P2) so a discarded fork's
    scratch DBs don't linger / resurrect."
   [pending-grants]
-  (doseq [{:keys [scope]} pending-grants]
-    (try (sdh/delete-database! (data-cfg scope)) (catch Throwable _))))
+  (doseq [grant pending-grants]
+    (try (drop-fork-grant! grant) (catch Throwable _))))
 
 (defn delete-room-db!
   "Remove an agent-created data DB `db-name` from the room: detach + retract the

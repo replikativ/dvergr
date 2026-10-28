@@ -227,7 +227,7 @@
            hit? (fn [nsn f] (or (nil? q)
                                 (some #(clojure.string/includes? (clojure.string/lower-case (str %)) q)
                                       [nsn (:name f) (:doc f)])))]
-       (->> (all-ns)
+       (->> (vec (all-ns))
             (map ns-name)
             (filter #(clojure.string/starts-with? (str %) \"dvergr\"))
             sort
