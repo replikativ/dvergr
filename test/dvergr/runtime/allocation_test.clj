@@ -78,3 +78,11 @@
       (.interrupt (Thread/currentThread))
       (is (= :thread-interrupt (:cause (failure policy))))
       (finally (Thread/interrupted)))))
+
+(deftest allocation-checkpoints-do-not-exhaust-the-backstop-themselves
+  ;; The guard must stay below 16 MiB for this otherwise allocation-light loop.
+  ;; A reflected ThreadLocal.get copied Java method arrays at each checkpoint,
+  ;; so metering alone exhausted the allowance long before 100,000 calls.
+  (let [policy (allocation/interrupt-policy limit)]
+    (is (nil? (allocation/call-with-scope
+               (fn [] (dotimes [_ 100000] (policy))))))))
