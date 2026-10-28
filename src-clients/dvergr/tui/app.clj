@@ -22,7 +22,7 @@
    The :tree view reads from `dvergr.rooms.tree`'s shared signal; an adapter
    spin keeps a spindel-tui tree-component state in sync with updates from the
    rooms-tree signal so the same data feeds both surfaces (this TUI + web)."
-  (:require [org.replikativ.spindel-tui.tui :as tui]
+  (:require [dvergr.runtime.allocation :as allocation] [org.replikativ.spindel-tui.tui :as tui]
             [org.replikativ.spindel-tui.style.core :as s]
             [org.replikativ.spindel-tui.components.text-input :as ti]
             [org.replikativ.spindel-tui.components.spinner :as spinner]
@@ -124,7 +124,7 @@
                          (swap! room-sandboxes assoc rid c)
                          c)))]
     (binding [ec/*execution-context* exec-ctx]
-      (sci/eval-string* sci-ctx code))))
+      (allocation/call-with-scope (fn [] (sci/eval-string* sci-ctx code))))))
 
 (defn- room-post!
   "Post user `text` into `room`, addressed by the canonical room rule

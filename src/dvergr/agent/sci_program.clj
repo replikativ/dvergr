@@ -3,6 +3,7 @@
    This host namespace is never injected into SCI."
   (:require [clojure.string :as str]
             [dvergr.sandbox :as sandbox]
+            [dvergr.runtime.allocation :as allocation]
             [sci.core :as sci]
             [sci.ctx-store :as ctx-store])
   (:import [java.io Writer]
@@ -101,25 +102,27 @@
   "Run in the caller's supervised worker and fork-local SCI interpreter.
    check-run! is sticky host cancellation/deadline authority, not SCI input."
   [interpreter {:keys [source entrypoint args] :as program} task check-run!]
-  (validate! program)
-  (let [failure (atom nil)
-        memory-check! (sandbox/make-resource-limits)
-        check! #(do (when-let [e @failure] (throw e)) (check-run!) (memory-check!))
-        out (diagnostic-writer failure)
-        err (diagnostic-writer failure)
-        interpreter (sci/merge-opts interpreter {:interrupt-fn check!})
-        task (portable-value! task)
-        args (portable-value! (or args []))
+  (allocation/call-with-scope
+   (fn []
+     (validate! program)
+     (let [failure (atom nil)
+           memory-check! (sandbox/make-resource-limits)
+           check! #(do (when-let [e @failure] (throw e)) (check-run!) (memory-check!))
+           out (diagnostic-writer failure)
+           err (diagnostic-writer failure)
+           interpreter (sci/merge-opts interpreter {:interrupt-fn check!})
+           task (portable-value! task)
+           args (portable-value! (or args []))
         ;; Inputs are data, never source text. Reader-delimiter symbols are
         ;; legal Clojure values; pr-str/reparse is NOT a safe quoting boundary.
-        invocation (list 'clojure.core/apply (with-meta entrypoint nil)
-                         (list 'quote task) (list 'quote args))]
-    (ctx-store/with-ctx interpreter
-      (sci/binding [sci/out (:writer out) sci/err (:writer err)]
-        (check!)
-        (sci/eval-string* interpreter source)
-        (check!)
-        (let [value (sci/eval-form interpreter invocation)
-              value (portable-value! value true check!)]
-          (check!)
-          {:value value :stdout ((:text out)) :stderr ((:text err))})))))
+           invocation (list 'clojure.core/apply (with-meta entrypoint nil)
+                            (list 'quote task) (list 'quote args))]
+       (ctx-store/with-ctx interpreter
+         (sci/binding [sci/out (:writer out) sci/err (:writer err)]
+           (check!)
+           (sci/eval-string* interpreter source)
+           (check!)
+           (let [value (sci/eval-form interpreter invocation)
+                 value (portable-value! value true check!)]
+             (check!)
+             {:value value :stdout ((:text out)) :stderr ((:text err))})))))))

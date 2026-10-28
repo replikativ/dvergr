@@ -1,7 +1,7 @@
 (ns dvergr.sandbox.ns.data
   "SCI injectors — spindel sync/combinators/signals,
    and probabilistic inference. Split out of dvergr.sandbox (Phase 4)."
-  (:require [dvergr.substrate.load :as load]
+  (:require [dvergr.runtime.allocation :as allocation] [dvergr.substrate.load :as load]
             [sci.core :as sci]
             [is.simm.partial-cps.sequence :as aseq]
             [dvergr.agent.roster :as roster]
@@ -183,13 +183,13 @@
                                             [:=> [:cat :any] :any]]
                                cancel!     [([controller]) "Stop admission and cooperatively cancel queued and active owned work."
                                             [:=> [:cat :any] :any]]}))
-       (sci/eval-string*
-        sci-ctx
-        "(ns spindel.work (:require [is.simm.partial-cps.async :as pcps-async]))
+       (allocation/call-with-scope (fn [] (sci/eval-string*
+                                           sci-ctx
+                                           "(ns spindel.work (:require [is.simm.partial-cps.async :as pcps-async]))
         (defmacro task
           \"Create reusable one-shot CPS work. The controller gives every submission fresh Spin identity and ownership.\"
           [& body]
-          `(pcps-async/async ~@body))")
+          `(pcps-async/async ~@body))")))
       ;; Signals — signal is a macro; wrap as a function using the underlying record
        (let [signal-ref-ctor (ns-resolve sig-ns '->SignalRef)
              addr-ns (do (load/require! 'org.replikativ.spindel.engine.addressing)
@@ -242,8 +242,8 @@
    qualified name) with breakpoints dispatching to foerster's effects, like
    their org.replikativ.foerster.effects names (`add-inference-ns!`)."
   [sci-ctx]
-  (sci/eval-string* sci-ctx
-                    "(in-ns 'infer)
+  (allocation/call-with-scope (fn [] (sci/eval-string* sci-ctx
+                                                       "(in-ns 'infer)
      (defn sample [& _] (throw (ex-info \"sample called outside spin context\" {})))
      (defn observe [& _] (throw (ex-info \"observe called outside spin context\" {})))
      (defn factor [& _] (throw (ex-info \"factor called outside spin context\" {})))
@@ -255,7 +255,7 @@
          'infer/observe       'is.simm.partial-cps.async/observe-bp
          'infer/factor        'is.simm.partial-cps.async/factor-bp
          'infer/deterministic 'is.simm.partial-cps.async/deterministic-bp))
-     (in-ns 'user)"))
+     (in-ns 'user)"))))
 
 (defn add-inference-ns!
   "Add probabilistic programming primitives to SCI context.
@@ -317,13 +317,13 @@
   ;; ioc/var-name relies on (meta (resolve sym)) to get the fully-qualified symbol
   ;; for breakpoint lookup — plain functions added via sci/add-namespace! lack
   ;; this metadata and are invisible to the CPS transformer.
-  (sci/eval-string* sci-ctx
-                    "(ns org.replikativ.foerster.effects)
+  (allocation/call-with-scope (fn [] (sci/eval-string* sci-ctx
+                                                       "(ns org.replikativ.foerster.effects)
      (defn choose [& _] (throw (ex-info \"choose called outside spin context\" {})))
      (defn sample [& _] (throw (ex-info \"sample called outside spin context\" {})))
      (defn observe [& _] (throw (ex-info \"observe called outside spin context\" {})))
      (defn factor [& _] (throw (ex-info \"factor called outside spin context\" {})))
-     (defn deterministic [& _] (throw (ex-info \"deterministic called outside spin context\" {})))")
+     (defn deterministic [& _] (throw (ex-info \"deterministic called outside spin context\" {})))")))
 
   ;; Extend pcps-async/breakpoints inside SCI so the spin macro CPS-transforms
   ;; calls to sample/observe/choose (mirrors how spindel's await was wired in macro.clj).
@@ -332,8 +332,8 @@
   ;; function values. invert-impl calls (resolve <value-from-breakpoints>) expecting
   ;; a symbol.  We define named handler fns (choose-bp, sample-bp, observe-bp) in
   ;; the is.simm.partial-cps.async namespace and store their symbols.
-  (sci/eval-string* sci-ctx
-                    "(in-ns 'is.simm.partial-cps.async)
+  (allocation/call-with-scope (fn [] (sci/eval-string* sci-ctx
+                                                       "(in-ns 'is.simm.partial-cps.async)
 
      (defn choose-bp [_ r e]
        (fn [args]
@@ -411,7 +411,7 @@
          'org.replikativ.foerster.effects/sample  'is.simm.partial-cps.async/sample-bp
          'org.replikativ.foerster.effects/observe 'is.simm.partial-cps.async/observe-bp
          'org.replikativ.foerster.effects/factor  'is.simm.partial-cps.async/factor-bp
-         'org.replikativ.foerster.effects/deterministic 'is.simm.partial-cps.async/deterministic-bp))")
+         'org.replikativ.foerster.effects/deterministic 'is.simm.partial-cps.async/deterministic-bp))")))
 
   ;; Distribution constructors (foerster.dist: raster's names and
   ;; parameterizations; gamma's second parameter is the scale)
