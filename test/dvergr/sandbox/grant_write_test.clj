@@ -278,6 +278,23 @@
         (is (not (srooms/storage-gc-enabled?))))
       (finally (srooms/enable-storage-gc! prev)))))
 
+(deftest a-host-gc-prohibition-also-applies-to-the-agent-sandbox
+  ;; A fresh policy is a test-only stand-in for a new HOST process. Neither
+  ;; the Room nor its SCI environment can remove the installed prohibition.
+  (with-redefs-fn
+    {#'srooms/storage-gc-homes (atom #{})
+     #'srooms/storage-gc-admission (atom {:ever-admitted? false :prohibited-by nil})}
+    (fn []
+      (srooms/prohibit-storage-gc! :test/retained-snapshots)
+      (let [constructed (atom 0)]
+        (with-redefs [yggdrasil.gc/gc-system!
+                      (fn [& _] (swap! constructed inc)
+                        (throw (AssertionError. "Collector constructed")))]
+          (doseq [code ["(room/gc!)" "(room/gc! {:dry-run? true})"]]
+            (is (re-find #"Storage GC is prohibited"
+                         (str (get-in (ev code) [:ok :error])))))
+          (is (zero? @constructed)))))))
+
 (deftest a-dead-gc-is-a-failure-not-zero
   (let [report #'srooms/gc-report]
     (is (:error (report nil)))

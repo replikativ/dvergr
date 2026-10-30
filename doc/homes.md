@@ -151,10 +151,38 @@ and the sweep deletes every other key of the store; that wiped a system DB on 20
 Until a datahike that fails closed (datahike#1117) is released and dvergr depends on it,
 deleting GC (`gc-stores!`, `dvergr.room/gc!` without `:dry-run?`) is refused unless the
 daemon enables it, for that daemon's home and while it runs; keep a backup when you do.
-A dry run is always allowed; it skips the system DB, whose GC has no dry run. A system-DB
+A dry run is allowed unless the HOST boot prohibition below is installed; it skips
+the system DB, whose GC has no dry run. A system-DB
 GC that returns nothing or times out is logged as a failure (`:rooms/gc-failed`), not as
 `:reclaimed 0`; a room's reports come from the yggdrasil adapters, which still report a
 dead collection as zero reclaimed.
+
+An embedding HOST that needs to establish durable snapshot roots without any
+concurrent managed collector can install a stronger, process-wide boot policy:
+
+```clojure
+(require '[dvergr.system.rooms :as rooms])
+(rooms/prohibit-storage-gc! :my-host/retained-snapshots)
+```
+
+Use a fresh HOST process running this admission instrumentation from startup;
+hot-loading it cannot discover collections admitted by an older implementation.
+Install this before exposing the dependent service. Every home must have deleting
+GC disabled, and no managed collection may have been admitted in this process,
+including a dry run, an empty/failed attempt or work whose caller timed out.
+Admission and installation share a monitor: either installation wins and collection
+is refused before construction, or admission wins and installation refuses.
+The same namespaced reason can be installed repeatedly; another reason cannot
+replace it. Disabling GC, stopping/restarting a daemon and ordinary namespace
+reload do not remove the prohibition or its admission history. There is no
+uninstallation API; changing this profile requires a fresh HOST process.
+
+The policy blocks both `gc-stores!` and `gc-room!`, including dry runs, and refuses
+later attempts to enable deleting GC in any home. It is HOST configuration, not
+forkable Room state or a replacement settlement authority. Adapters still need
+durable roots identifying the retained snapshots. Raw operator/REPL collectors and
+independently collecting processes sharing these stores are outside this profile;
+the policy is not a distributed GC barrier.
 
 With `:retention-days` nil, the sweep keeps every snapshot and reclaims only what no snapshot
 or branch head reaches. With a number, snapshots older than that are collapsed:
