@@ -1091,6 +1091,37 @@
   ;; the homes (state roots) whose daemon enabled deleting GC
   (atom #{}))
 
+(defonce ^:private storage-gc-admission
+  ;; Process-owned HOST configuration, never copied into a Room/world. The
+  ;; atom is also the admission monitor. No stop/reload/uninstall clears it.
+  (atom {:ever-admitted? false :prohibited-by nil}))
+
+(defn prohibit-storage-gc!
+  "Permanently prohibit managed collection in this HOST process. Install at
+   boot, before exposing operations that depend on retained storage snapshots.
+   Every home must have deleting GC disabled and no collection (including dry
+   runs) may have been admitted. Repeated installation by the same namespaced
+   reason is idempotent; there is no hot removal or replacement operation.
+
+   This protects only Dvergr's managed collector entrances. Raw operator or
+   external-process collectors are outside this operational profile. It does
+   not itself retain or identify a snapshot: adapters still need durable roots."
+  [reason]
+  (when-not (qualified-keyword? reason)
+    (throw (ex-info "Storage GC prohibition needs a namespaced reason"
+                    {:type ::invalid-gc-prohibition})))
+  (locking storage-gc-admission
+    (let [{:keys [prohibited-by ever-admitted?]} @storage-gc-admission]
+      (cond
+        (= reason prohibited-by) true
+        prohibited-by (throw (ex-info "A different storage GC prohibition is already installed"
+                                      {:type ::storage-gc-prohibited :reason prohibited-by}))
+        (seq @storage-gc-homes) (throw (ex-info "Disable deleting GC before installing the boot prohibition"
+                                                {:type ::storage-gc-already-enabled}))
+        ever-admitted? (throw (ex-info "Collection was already admitted; install the prohibition in a fresh HOST process"
+                                       {:type ::storage-gc-already-admitted}))
+        :else (do (swap! storage-gc-admission assoc :prohibited-by reason) true)))))
+
 (defn enable-storage-gc!
   "Allow storage GC that deletes (`gc-stores!`, `gc-room!` without
    `:dry-run?`). Off by default: datahike's `gc-storage` fails open (an
@@ -1100,9 +1131,13 @@
    (datahike#1117) and a backup. The daemon turns it on for `:gc {:enabled?
    true}`, for its home only, and revokes it when it stops."
   [on?]
-  (let [home (str (paths/home))]
-    (swap! storage-gc-homes (if on? #(conj % home) #(disj % home)))
-    (boolean on?)))
+  (locking storage-gc-admission
+    (when-let [reason (and on? (:prohibited-by @storage-gc-admission))]
+      (throw (ex-info "Storage GC is prohibited for this HOST process"
+                      {:type ::storage-gc-prohibited :reason reason})))
+    (let [home (str (paths/home))]
+      (swap! storage-gc-homes (if on? #(conj % home) #(disj % home)))
+      (boolean on?))))
 
 (defn storage-gc-enabled?
   "Whether deleting GC is enabled for the current home."
@@ -1110,11 +1145,18 @@
   (contains? @storage-gc-homes (str (paths/home))))
 
 (defn- refuse-gc-unless-enabled! [opts]
-  (when-not (or (:dry-run? opts) (storage-gc-enabled?))
-    (throw (ex-info (str "Storage GC is off: datahike's gc-storage can delete a whole store when its "
-                         "mark is incomplete (datahike#1117). A dry run ({:dry-run? true}) is allowed; "
-                         "enable deleting GC with the daemon's :gc {:enabled? true}.")
-                    {:type ::storage-gc-disabled}))))
+  (locking storage-gc-admission
+    (when-let [reason (:prohibited-by @storage-gc-admission)]
+      (throw (ex-info "Storage GC is prohibited for this HOST process, including dry runs"
+                      {:type ::storage-gc-prohibited :reason reason})))
+    (when-not (or (:dry-run? opts) (storage-gc-enabled?))
+      (throw (ex-info (str "Storage GC is off: datahike's gc-storage can delete a whole store when its "
+                           "mark is incomplete (datahike#1117). A dry run ({:dry-run? true}) is allowed; "
+                           "enable deleting GC with the daemon's :gc {:enabled? true}.")
+                      {:type ::storage-gc-disabled})))
+    ;; Record before constructing/invoking any collector. Even an empty,
+    ;; failed, timed-out or still-running admission prevents later installation.
+    (swap! storage-gc-admission assoc :ever-admitted? true)))
 
 (defn- gc-report
   "A system DB GC result as a report: a dead or empty result is a failure,
