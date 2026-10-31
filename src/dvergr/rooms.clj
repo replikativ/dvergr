@@ -16,6 +16,7 @@
             [clojure.string :as str]
             [dvergr.chat.schema :as schema]
             [dvergr.substrate.config :as config]
+            [dvergr.substrate.repository-profile :as repository-profile]
             [dvergr.discourse :as d]
             [dvergr.room.store :as rstore]
             [dvergr.system.rooms :as srooms]
@@ -67,6 +68,49 @@
 ;; Process-native constructor coordination, never forkable application state.
 (defonce ^:private prepared-registration-lock (Object.))
 
+(defn registration-ready?
+  "HOST-only readiness observation, not authorization or a lease. A trusted
+   profile may attest a legacy nil/nil Room against immutable control and actual
+   prepared repository snapshots. Its synchronous predicate must be read-only;
+   only literal true admits. Ordinary legacy and ready/v1 semantics are retained.
+   Caller excludes root teardown/hydration. No authored-file parse is required."
+  [control room-id {:keys [repository-profiles]}]
+  (when (or (simple/on-drain-thread?) (not (ec/execution-context-bound?))
+            (not (identical? (ec/current-execution-context) (rctx/current-root))))
+    (throw (ex-info "Room readiness requires a bound host root" {:type ::requires-host-root})))
+  (let [row (when (uuid? room-id)
+              (dh/pull control '[:room/id :room/slug :room/archived-at
+                                 :room/provisioning-state :room/provisioning-version
+                                 {:room/default-repository [:system/repository-profile]}] [:room/id room-id]))
+        state (:room/provisioning-state row) version (:room/provisioning-version row)
+        profile (get-in row [:room/default-repository :system/repository-profile])]
+    (boolean
+     (and (:room/id row) (string? (:room/slug row)) (not (str/blank? (:room/slug row)))
+          (nil? (:room/archived-at row))
+          (or (and (= 1 version) (= :ready state))
+              (and (nil? state) (nil? version)
+                   (or (nil? profile)
+                       (when (get-in repository-profiles [profile :legacy-room-ready?])
+                         (let [hooks (repository-profile/resolve! repository-profiles profile)
+                               ctx (srooms/room-ctx-for room-id)
+                               _ (when-not (and ctx (not (identical? ctx (rctx/current-root)))
+                                                (identical? (rctx/current-root) (rctx/root-ctx ctx)))
+                                   (throw (ex-info "Canonical prepared Room context required"
+                                                   {:type ::not-prepared :room/id room-id})))
+                               workspace (srooms/default-workspace control room-id)
+                               conn (:conn workspace)
+                               repository @conn
+                               ready? ((:legacy-room-ready? hooks) control room-id repository)
+                               current-repository @conn
+                               current @(sdb/get-conn)]
+                           (and (true? ready?)
+                                (= (dh/commit-id control) (dh/commit-id current))
+                                (= (:max-tx control) (:max-tx current))
+                                (= (dh/commit-id repository) (dh/commit-id current-repository))
+                                (= (:max-tx repository) (:max-tx current-repository))
+                                (identical? ctx (srooms/room-ctx-for room-id))
+                                (identical? conn (:conn (srooms/default-workspace current room-id)))))))))))))
+
 (defn register-prepared-room!
   "HOST ONLY: register ONE already-prepared persistent Room, without provisioning
    or rewriting control metadata. Returns its live Room. Reuses only an exact
@@ -77,63 +121,62 @@
    Run admission. A failed fence remains explicitly uncertain; no automatic
    retry, drain or compensating teardown. Not a
    transport/authorization or migration API."
-  [room-id]
-  (when (or (simple/on-drain-thread?) (not (ec/execution-context-bound?))
-            (not (identical? (ec/current-execution-context) (rctx/current-root))))
-    (throw (ex-info "Prepared Room registration requires a bound host root" {:type ::requires-host-root})))
-  (when-not (uuid? room-id) (throw (ex-info "Persistent Room UUID required" {:type ::invalid-room-id})))
-  (locking prepared-registration-lock
-    (let [control @(sdb/get-conn)
-          eid (dh/q '[:find ?room . :in $ ?id :where [?room :room/id ?id]] control room-id)
-          agents (when eid (vec (take 257 (dh/datoms control :eavt eid :room/agent-ids))))
-          _ (when (> (count agents) 256)
-              (throw (ex-info "Prepared Room has too many configured agents" {:type ::too-many-agents :room/id room-id})))
-          row (when eid (assoc (dh/pull control
-                                        '[:room/id :room/slug :room/name :room/type :room/archived-at
-                                          :room/provisioning-state :room/provisioning-version
-                                          :room/parent-slug :room/telegram-chat-id
-                                          {:room/default-repository [:system/repository-profile]}] eid)
-                               :room/agent-ids (mapv :v agents)))
-          slug (:room/slug row)
-          profiled? (some? (get-in row [:room/default-repository :system/repository-profile]))
-          _ (when-not (and row (string? slug) (not (str/blank? slug)) (nil? (:room/archived-at row))
-                           (or (and (not profiled?) (nil? (:room/provisioning-state row))
-                                    (nil? (:room/provisioning-version row)))
-                               (and (= 1 (:room/provisioning-version row)) (= :ready (:room/provisioning-state row)))))
-              (throw (ex-info "Persistent Room is not ready for registration" {:type ::not-ready :room/id room-id})))
-          ctx (srooms/room-ctx-for room-id)
-          _ (when-not (and ctx (not (identical? ctx (rctx/current-root)))
-                           (identical? (rctx/current-root) (rctx/root-ctx ctx)))
-              (throw (ex-info "Canonical prepared Room context required" {:type ::not-prepared :room/id room-id})))
-          conn (binding [ec/*execution-context* ctx] (srooms/room-msgs-conn room-id))
+  ([room-id] (register-prepared-room! room-id {}))
+  ([room-id options]
+   (when-not (and (map? options) (every? #{:repository-profiles} (keys options)))
+     (throw (ex-info "Invalid host registration options" {:type ::invalid-registration-options})))
+   (when (or (simple/on-drain-thread?) (not (ec/execution-context-bound?))
+             (not (identical? (ec/current-execution-context) (rctx/current-root))))
+     (throw (ex-info "Prepared Room registration requires a bound host root" {:type ::requires-host-root})))
+   (when-not (uuid? room-id) (throw (ex-info "Persistent Room UUID required" {:type ::invalid-room-id})))
+   (locking prepared-registration-lock
+     (let [control @(sdb/get-conn)
+           eid (dh/q '[:find ?room . :in $ ?id :where [?room :room/id ?id]] control room-id)
+           agents (when eid (vec (take 257 (dh/datoms control :eavt eid :room/agent-ids))))
+           _ (when (> (count agents) 256)
+               (throw (ex-info "Prepared Room has too many configured agents" {:type ::too-many-agents :room/id room-id})))
+           row (when eid (assoc (dh/pull control
+                                         '[:room/id :room/slug :room/name :room/type :room/archived-at
+                                           :room/provisioning-state :room/provisioning-version
+                                           :room/parent-slug :room/telegram-chat-id
+                                           {:room/default-repository [:system/repository-profile]}] eid)
+                                :room/agent-ids (mapv :v agents)))
+           slug (:room/slug row)
+           _ (when-not (registration-ready? control room-id options)
+               (throw (ex-info "Persistent Room is not ready for registration" {:type ::not-ready :room/id room-id})))
+           ctx (srooms/room-ctx-for room-id)
+           _ (when-not (and ctx (not (identical? ctx (rctx/current-root)))
+                            (identical? (rctx/current-root) (rctx/root-ctx ctx)))
+               (throw (ex-info "Canonical prepared Room context required" {:type ::not-prepared :room/id room-id})))
+           conn (binding [ec/*execution-context* ctx] (srooms/room-msgs-conn room-id))
           ;; Independently verify seeded durable identity: make-room's store
           ;; metadata writer currently logs/swallow failures, not an ACK proof.
-          snapshot (when conn @conn)
-          _ (when-not (and snapshot (srooms/canonical-messages-identity? snapshot slug))
-              (throw (ex-info "Prepared messages identity is unavailable" {:type ::invalid-messages :room/id room-id})))
-          id (rstore/slug->room-id slug)
-          same? (fn [room]
-                  (and (= id (:id room)) (= slug (:slug room)) (identical? ctx (:ctx room))
-                       (identical? conn (get-in room [:store :conn]))
-                       (instance? clojure.lang.IDeref (:meta room))
-                       (= (srooms/msgs-chat-id slug) (:chat-id @(:meta room)))))]
-      (if-let [existing (rreg/lookup id)]
-        (if (same? existing) (srooms/bind-runtime-room! room-id existing)
-            (throw (ex-info "Another Room incarnation is already registered" {:type ::foreign-registration :room/id room-id})))
-        (try
-          (let [room (register-live-room!
-                      {:slug slug :title (:room/name row) :type (:room/type row)
-                       :parent-id (some-> (:room/parent-slug row) rstore/slug->room-id)
-                       :telegram-chat-id (:room/telegram-chat-id row) :agent-ids (:room/agent-ids row)} ctx)]
-            (when-not (and (same? room) (identical? room (rreg/lookup id))
-                           (identical? ctx (srooms/room-ctx-for room-id)))
-              (throw (ex-info "Room registration did not preserve its canonical owner" {:type ::registration-mismatch})))
-            (srooms/bind-runtime-room! room-id room))
-          (catch Throwable error
-            (let [held (srooms/retain-room-registration-failure! room-id ctx error)]
-              (try (agent-run/close-room-admission! {:id id :ctx ctx})
-                   (catch Throwable fence-error (.addSuppressed held fence-error)))
-              (throw held))))))))
+           snapshot (when conn @conn)
+           _ (when-not (and snapshot (srooms/canonical-messages-identity? snapshot slug))
+               (throw (ex-info "Prepared messages identity is unavailable" {:type ::invalid-messages :room/id room-id})))
+           id (rstore/slug->room-id slug)
+           same? (fn [room]
+                   (and (= id (:id room)) (= slug (:slug room)) (identical? ctx (:ctx room))
+                        (identical? conn (get-in room [:store :conn]))
+                        (instance? clojure.lang.IDeref (:meta room))
+                        (= (srooms/msgs-chat-id slug) (:chat-id @(:meta room)))))]
+       (if-let [existing (rreg/lookup id)]
+         (if (same? existing) (srooms/bind-runtime-room! room-id existing)
+             (throw (ex-info "Another Room incarnation is already registered" {:type ::foreign-registration :room/id room-id})))
+         (try
+           (let [room (register-live-room!
+                       {:slug slug :title (:room/name row) :type (:room/type row)
+                        :parent-id (some-> (:room/parent-slug row) rstore/slug->room-id)
+                        :telegram-chat-id (:room/telegram-chat-id row) :agent-ids (:room/agent-ids row)} ctx)]
+             (when-not (and (same? room) (identical? room (rreg/lookup id))
+                            (identical? ctx (srooms/room-ctx-for room-id)))
+               (throw (ex-info "Room registration did not preserve its canonical owner" {:type ::registration-mismatch})))
+             (srooms/bind-runtime-room! room-id room))
+           (catch Throwable error
+             (let [held (srooms/retain-room-registration-failure! room-id ctx error)]
+               (try (agent-run/close-room-admission! {:id id :ctx ctx})
+                    (catch Throwable fence-error (.addSuppressed held fence-error)))
+               (throw held)))))))))
 
 (defn create-room!
   "Create a new room: Datahike entity AND discourse.Room registration.
@@ -237,58 +280,74 @@
    backed by its OWN per-room messages store and register it. Idempotent —
    re-running just refreshes registry entries. Call once at daemon startup,
    AFTER `srooms/hydrate-rooms!` has rebuilt each room's ctx + systems."
-  [ctx]
-  (binding [ec/*execution-context* ctx]
-    (let [rooms (sdb/all-rooms)]
-      (doseq [{:room/keys [slug name type telegram-chat-id agent-ids parent-slug]} rooms]
-        (let [id (rstore/slug->room-id slug)]
-          (when-not (rreg/lookup id)
+  ([ctx] (hydrate-registry! ctx {}))
+  ([ctx options]
+   (when-not (and (map? options) (every? #{:repository-profiles} (keys options)))
+     (throw (ex-info "Invalid host registration options" {:type ::invalid-registration-options})))
+   (binding [ec/*execution-context* ctx]
+     (let [rooms (sdb/all-rooms)]
+       (doseq [{:room/keys [slug name type telegram-chat-id agent-ids parent-slug]} rooms]
+         (let [id (rstore/slug->room-id slug)]
+           (when-not (rreg/lookup id)
             ;; Ensure the room's systems (msgs/KB/repo) exist on its OWN ctx
             ;; (idempotent — returns the existing room-ctx for hydrated rooms).
             ;; A room whose hydration failed stays unloaded: a stand-in on the
             ;; daemon ctx without its messages store would register, run and
             ;; lose everything it was told.
-            (let [[prov error] (try [(srooms/provision-room! {:slug slug :name name}) nil]
-                                    (catch Throwable t [nil t]))
-                  room-ctx (:room-ctx prov)
-                  store    (when room-ctx
-                             (binding [ec/*execution-context* room-ctx] (room-store slug)))]
-              (if-not store
-                (tel/log! {:level :error :id :rooms/not-loaded
-                           :data {:slug slug :error (some-> error ex-message)
-                                  :room-ctx? (some? room-ctx)}}
-                          "Room not loaded: its context or messages store is unavailable")
-                (binding [ec/*execution-context* room-ctx]
-                  (let [room (d/make-room {:id        id
-                                           :slug      slug
-                                           :title     (or name slug)
-                                           :parent-id (some-> parent-slug rstore/slug->room-id)
-                                           :ctx       room-ctx
-                                           :store     store
-                                           :meta      (cond-> {:chat-id (srooms/msgs-chat-id slug)}
-                                                        type             (assoc :type type)
-                                                        (seq agent-ids)  (assoc :agent-ids (set agent-ids))
-                                                        telegram-chat-id (assoc :telegram-chat-id telegram-chat-id))})
+             (let [[prov error] (try
+                                  (let [prepared (srooms/provision-room! {:slug slug :name name})
+                                        room-id (:room/id (sdb/room-by-slug slug))
+                                        prepared-ctx (:room-ctx prepared)
+                                        canonical (srooms/room-ctx-for room-id)]
+                                    (when-not (and prepared-ctx (identical? prepared-ctx canonical)
+                                                   (not (identical? prepared-ctx (rctx/current-root)))
+                                                   (identical? (rctx/current-root) (rctx/root-ctx prepared-ctx)))
+                                      (throw (ex-info "Canonical prepared Room context required"
+                                                      {:type ::not-prepared :room/id room-id})))
+                                    (when-not (registration-ready? @(sdb/get-conn) room-id options)
+                                      (throw (ex-info "Persistent Room is not ready for registration"
+                                                      {:type ::not-ready :room/id room-id})))
+                                    [prepared nil])
+                                  (catch Throwable t [nil t]))
+                   room-ctx (:room-ctx prov)
+                   store    (when room-ctx
+                              (binding [ec/*execution-context* room-ctx] (room-store slug)))]
+               (if-not store
+                 (tel/log! {:level :error :id :rooms/not-loaded
+                            :data {:slug slug :error (some-> error ex-message)
+                                   :room-ctx? (some? room-ctx)}}
+                           "Room not loaded: its context or messages store is unavailable")
+                 (binding [ec/*execution-context* room-ctx]
+                   (let [room (d/make-room {:id        id
+                                            :slug      slug
+                                            :title     (or name slug)
+                                            :parent-id (some-> parent-slug rstore/slug->room-id)
+                                            :ctx       room-ctx
+                                            :store     store
+                                            :meta      (cond-> {:chat-id (srooms/msgs-chat-id slug)}
+                                                         type             (assoc :type type)
+                                                         (seq agent-ids)  (assoc :agent-ids (set agent-ids))
+                                                         telegram-chat-id (assoc :telegram-chat-id telegram-chat-id))})
                       ;; A Run the previous daemon left running has no owner
                       ;; now; mark it before the room admits new work.
-                        _ (try (some-> (srooms/msgs-conn-for-slug slug)
-                                       (chat-schema/close-orphaned-tool-calls!))
-                               (catch Throwable t
-                                 (tel/log! {:level :warn :id :rooms/reconcile-tool-calls-failed
-                                            :data {:slug slug :error (ex-message t)}}
-                                           "Could not close orphaned tool calls")))
-                        orphans (try (agent-run/reconcile-orphaned-runs! room)
-                                     (catch Throwable t
-                                       (tel/log! {:level :warn :id :rooms/reconcile-failed
-                                                  :data {:slug slug :error (ex-message t)}}
-                                                 "Could not reconcile orphaned Runs")
-                                       []))]
-                    (when (seq orphans)
-                      (tel/log! {:level :info :id :rooms/orphaned-runs
-                                 :data {:slug slug :runs (count orphans)}}
-                                "Failed Runs the previous process left running")))))))))
-      (tel/log! {:id :rooms/registry-hydrated :data {:count (count rooms)}}
-                "Hydrated room registry"))))
+                         _ (try (some-> (srooms/msgs-conn-for-slug slug)
+                                        (chat-schema/close-orphaned-tool-calls!))
+                                (catch Throwable t
+                                  (tel/log! {:level :warn :id :rooms/reconcile-tool-calls-failed
+                                             :data {:slug slug :error (ex-message t)}}
+                                            "Could not close orphaned tool calls")))
+                         orphans (try (agent-run/reconcile-orphaned-runs! room)
+                                      (catch Throwable t
+                                        (tel/log! {:level :warn :id :rooms/reconcile-failed
+                                                   :data {:slug slug :error (ex-message t)}}
+                                                  "Could not reconcile orphaned Runs")
+                                        []))]
+                     (when (seq orphans)
+                       (tel/log! {:level :info :id :rooms/orphaned-runs
+                                  :data {:slug slug :runs (count orphans)}}
+                                 "Failed Runs the previous process left running")))))))))
+       (tel/log! {:id :rooms/registry-hydrated :data {:count (count rooms)}}
+                 "Hydrated room registry")))))
 
 (defn get-room-by-slug
   "Registry row for `slug` from system-db (RF5 S4), or nil."
