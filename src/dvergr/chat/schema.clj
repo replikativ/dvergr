@@ -293,6 +293,11 @@
     :db/cardinality :db.cardinality/one
     :db/doc "If true, this message has been compacted (content replaced with summary)"}
 
+   {:db/ident :message/compacted-message-ids
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/many
+    :db/doc "Exact original message identities covered by this compaction summary"}
+
    ;; Tool uses (for assistant messages)
    {:db/ident :message/tool-uses
     :db/valueType :db.type/ref
@@ -1771,7 +1776,7 @@
 
    Tool-uses are stored as component entities with input serialized to EDN.
    The :message/tool-uses key references the tool-use entities."
-  [registry {:keys [chat-id role content reasoning tokens important? compacted? reply-to-id tool-uses tool-use-id turn-number]}]
+  [registry {:keys [chat-id role content reasoning tokens important? compacted? compacted-message-ids reply-to-id tool-uses tool-use-id turn-number]}]
   (cond-> {:message/id (random-uuid)
            :message/chat [:chat/id chat-id]
            :message/role (or role :user)
@@ -1782,6 +1787,7 @@
     tokens (assoc :message/tokens (long tokens))
     important? (assoc :message/important? true)
     compacted? (assoc :message/compacted? true)
+    (seq compacted-message-ids) (assoc :message/compacted-message-ids (vec compacted-message-ids))
     reply-to-id (assoc :message/reply-to [:message/id reply-to-id])
     (seq tool-uses) (assoc :message/tool-uses
                            (mapv (partial serialize-tool-use registry) tool-uses))

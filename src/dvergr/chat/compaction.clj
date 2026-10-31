@@ -10,9 +10,8 @@
    6. Inserts summary message as compression point
    7. Original messages preserved (immutable history)
 
-   The compaction point divides history:
-   - Before: Full messages stored but not sent to LLM
-   - After: Messages sent to LLM in API calls
+   Each summary records the exact original message identities it covers.
+   Originals remain stored; uncovered messages and prior summaries stay active.
 
    Key differences from simple truncation:
    - Important messages always preserved
@@ -22,6 +21,7 @@
   (:require [dvergr.chat.context :as chat-ctx]
             [dvergr.model.chat :as model-chat]
             [clojure.string :as str]
+            [clojure.set :as set]
             [datahike.api :as dh]
             [taoensso.telemere :as tel])
   (:import))
@@ -175,10 +175,13 @@
                   (= :tool-result (:message/role msg))
                   (not (:message/pruned? msg))
                   (> (message-tokens msg) prune-threshold-tokens))
-           (let [orig-tokens (message-tokens msg)]
-             (swap! tokens-recovered + (- orig-tokens 20)) ;; marker is ~20 tokens
+           (let [orig-tokens (message-tokens msg)
+                 content (str "[tool output pruned — was " orig-tokens " tokens]")
+                 remaining (estimate-tokens content)]
+             (swap! tokens-recovered + (- orig-tokens remaining))
              (assoc msg
-                    :message/content (str "[tool output pruned — was " orig-tokens " tokens]")
+                    :message/content content
+                    :message/tokens remaining
                     :message/pruned? true
                     :message/original-tokens orig-tokens))
            msg))
@@ -288,69 +291,61 @@
        (not (:message/important? msg))
        (not (:message/compacted? msg))))
 
+(defn- selection-groups
+  "Keep an assistant's tool calls and their result messages in one selection unit.
+   Reused tool IDs conservatively connect overlapping groups, so protection and
+   token accounting apply once to the entire connected component."
+  [messages]
+  (let [indexed (vec (map-indexed vector messages))
+        tool-groups
+        (for [[idx msg] indexed
+              :let [ids (set (keep :tool-use/id (:message/tool-uses msg)))]
+              :when (and (= :assistant (:message/role msg)) (seq ids))]
+          (into #{idx}
+                (keep (fn [[result-idx result]]
+                        (when (and (= :tool-result (:message/role result))
+                                   (contains? ids (:message/tool-use-id result)))
+                          result-idx)))
+                indexed))
+        components
+        (reduce (fn [components group]
+                  (let [overlaps? #(seq (set/intersection group %))
+                        joined (reduce set/union group (filter overlaps? components))]
+                    (conj (vec (remove overlaps? components)) joined)))
+                [] tool-groups)
+        grouped (apply set/union #{} components)]
+    (concat components
+            (for [[idx _] indexed :when (not (contains? grouped idx))] #{idx}))))
+
 (defn select-for-compaction
-  "Select messages to compact to achieve target token reduction.
-
-   Strategy (following OpenCode):
-   1. Protect last N turns (user + assistant + tool results)
-   2. Protect system and important messages
-   3. Stop at previous compaction point
-   4. Select from older messages, preferring tool-result (verbose)"
+  "Select older active messages, protecting recent turns and tool call/result groups.
+   Noncontiguous selection is intentional; only the selected identities are covered.
+   Results are returned in source order, regardless of selection priority."
   [messages tokens-to-remove]
-  (let [n (count messages)
-        ;; Protect last N turns (not just N messages)
-        protected-from-end (count-turns-from-end messages protected-turns)
-        protected-end-start (max 0 (- n protected-from-end))
-
-        ;; Find previous compaction point (stop there)
-        compaction-idx (->> messages
-                            (map-indexed vector)
-                            (filter (fn [[_ msg]]
-                                      (and (= :system (:message/role msg))
-                                           (:message/compacted? msg))))
-                            last
-                            first)
-
-        ;; Compactable range: after last compaction, before protected turns
-        start-idx (if compaction-idx (inc compaction-idx) 0)
-        end-idx protected-end-start
-
-        ;; Score messages for compaction priority
-        ;; Higher score = more likely to compact
-        score-message (fn [idx msg]
-                        (cond
-                          ;; Outside compactable range
-                          (< idx start-idx) -1000
-                          (>= idx end-idx) -1000
-                          ;; Not compactable (system, important, already compacted)
-                          (not (message-compactable? msg)) -1000
-                          ;; Tool results are verbose - prioritize for compaction
-                          (= :tool-result (:message/role msg)) 100
-                          ;; Assistant messages next
-                          (= :assistant (:message/role msg)) 50
-                          ;; User messages last
-                          :else 10))
-
-        scored (->> messages
-                    (map-indexed (fn [idx msg]
-                                   {:idx idx
-                                    :msg msg
-                                    :score (score-message idx msg)
-                                    :tokens (message-tokens msg)}))
-                    (filter #(pos? (:score %)))
-                    (sort-by :score >))]
-
-    ;; Greedily select until we have enough tokens
-    (loop [selected []
-           remaining scored
-           tokens-selected 0]
-      (if (or (>= tokens-selected tokens-to-remove)
-              (empty? remaining))
-        selected
-        (let [next-msg (first remaining)]
-          (recur (conj selected next-msg)
-                 (rest remaining)
-                 (+ tokens-selected (:tokens next-msg))))))))
+  (let [messages (vec messages)
+        protected-start (- (count messages) (count-turns-from-end messages protected-turns))
+        eligible? (fn [idx]
+                    (and (< idx protected-start)
+                         (message-compactable? (messages idx))))
+        score (fn [idx]
+                (case (:message/role (messages idx))
+                  :tool-result 100
+                  :assistant 50
+                  10))
+        candidates (->> (selection-groups messages)
+                        (filter #(every? eligible? %))
+                        (map (fn [indices]
+                               {:indices indices
+                                :score (apply max (map score indices))
+                                :tokens (reduce + (map #(message-tokens (messages %)) indices))}))
+                        (sort-by (juxt (comp - :score) (comp #(apply min %) :indices))))]
+    (loop [selected #{} remaining candidates tokens-selected 0]
+      (if (or (>= tokens-selected tokens-to-remove) (empty? remaining))
+        (mapv (fn [idx] {:idx idx :msg (messages idx)
+                        :tokens (message-tokens (messages idx))})
+              (sort selected))
+        (let [{:keys [indices tokens]} (first remaining)]
+          (recur (into selected indices) (rest remaining) (+ tokens-selected tokens)))))))
 
 ;; ============================================================================
 ;; Wiki-Link Extraction
@@ -483,9 +478,12 @@ Summary:")
 (defn create-compaction-message
   "Create a compaction summary message.
 
-   This message marks the compaction point in history.
-   Messages before this are stored but not sent to LLM."
+   Only these exact message identities are archived from the active projection.
+   The summary does not imply coverage of any other earlier message."
   [summary wiki-links compacted-message-ids]
+  (when-not (and (seq compacted-message-ids) (every? uuid? compacted-message-ids))
+    (throw (ex-info "Compaction requires exact original message identities"
+                    {:type ::invalid-coverage})))
   {:message/id (random-uuid)
    :message/role :system
    :message/content (str "=== Context Summary ===\n\n"
@@ -496,8 +494,9 @@ Summary:")
    :message/compacted? true
    :message/important? true  ; Never compact the compaction message
    :message/summary summary
+   :message/compacted-message-ids (vec compacted-message-ids)
    :message/created-at (java.util.Date.)
-   :db/doc "Compaction point - messages before this are archived"})
+   :db/doc "Summary covering exactly :message/compacted-message-ids"})
 
 (defn compact!
   "Execute compaction on chat context.
@@ -524,7 +523,7 @@ Summary:")
                :or {model "accounts/fireworks/models/minimax-m3"
                     provider :fireworks
                     context-window 128000}}]
-  (let [messages (chat-ctx/get-messages chat-ctx)
+  (let [messages (get-active-messages chat-ctx)
         tokens-to-remove (compaction-needed-tokens chat-ctx :context-window context-window)
 
         ;; Select messages to compact
@@ -538,7 +537,6 @@ Summary:")
 
       (let [;; Get the actual messages to compact
             compact-messages (mapv :msg to-compact)
-            compact-indices (set (map :idx to-compact))
 
             ;; Generate summary (use custom summarizer if provided)
             summary (if summarizer
@@ -591,14 +589,14 @@ Summary:")
                 (dh/transact conn [{:db/id [:message/id msg-id]
                                     :message/compacted? true}])))))
 
-        ;; Add compaction message to chat
-        ;; IMPORTANT: :compacted? true marks this as the compaction point
-        ;; so get-active-messages knows to filter messages before this
+        ;; Add a summary with exact coverage. Its position does not archive the
+        ;; protected recent tail or any unselected earlier messages.
         (chat-ctx/add-message! chat-ctx
                                {:role :system
                                 :content (:message/content compaction-msg)
                                 :important? true
-                                :compacted? true})
+                                :compacted? true
+                                :compacted-message-ids compacted-ids})
 
         ;; Call wiki-links callback if provided
         (when (and on-wiki-links (seq all-links))
@@ -623,7 +621,7 @@ Summary:")
 
    Returns nil if no compaction needed, compaction result otherwise."
   [chat-ctx & opts]
-  (when (should-compact? chat-ctx)
+  (when (apply should-compact? chat-ctx opts)
     ;; Phase 1: Try pruning tool outputs first (free, no LLM call)
     (let [messages (chat-ctx/get-messages chat-ctx)
           [pruned-msgs tokens-recovered] (prune-tool-outputs messages)]
@@ -635,7 +633,7 @@ Summary:")
         (chat-ctx/replace-messages! chat-ctx pruned-msgs))
 
       ;; Phase 2: Check if pruning was enough
-      (if (should-compact? chat-ctx)
+      (if (apply should-compact? chat-ctx opts)
         (do
           (tel/log! {:level :info :id :compaction/triggered}
                     "Pruning insufficient, running full compaction")
@@ -658,36 +656,21 @@ Summary:")
 ;; ============================================================================
 
 (defn get-active-messages
-  "Get messages to send to LLM, filtering out compacted ones.
+  "Project only messages not explicitly covered by a summary.
 
-   Returns messages from the most recent compaction point onwards,
-   plus any important messages from before."
+   Summaries and uncovered originals remain in source order. Markers without exact
+   coverage cannot archive any originals: retain those originals and expose their
+   marker identities in result metadata instead of silently losing context."
   [chat-ctx]
   (let [messages (chat-ctx/get-messages chat-ctx)
-
-        ;; Find the most recent compaction point (system message with :compacted? true)
-        compaction-idx (->> messages
-                            (map-indexed vector)
-                            (filter (fn [[_ msg]]
-                                      (and (= :system (:message/role msg))
-                                           (:message/compacted? msg))))
-                            last
-                            first)]
-
-    ;; If no compaction point, return all messages
-    (if-not compaction-idx
-      messages
-      (let [;; Get messages after compaction point
-            after-compaction (subvec (vec messages) compaction-idx)
-
-            ;; Get important messages from before compaction (but not too many)
-            before-compaction (subvec (vec messages) 0 compaction-idx)
-            important-before (->> before-compaction
-                                  (filter :message/important?)
-                                  (take 5))]
-
-        ;; Combine: important-before + after-compaction
-        (vec (concat important-before after-compaction))))))
+        summaries (filter #(and (= :system (:message/role %))
+                                (:message/compacted? %)) messages)
+        covered (into #{} (mapcat :message/compacted-message-ids) summaries)
+        unknown (into [] (comp (remove #(seq (:message/compacted-message-ids %)))
+                              (map :message/id)) summaries)]
+    (with-meta
+      (filterv #(not (contains? covered (:message/id %))) messages)
+      (when (seq unknown) {:compaction/coverage-unavailable-ids unknown}))))
 
 ;; ============================================================================
 ;; Manual Compaction Tool (for agents)
