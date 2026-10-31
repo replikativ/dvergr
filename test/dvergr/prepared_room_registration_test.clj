@@ -9,6 +9,7 @@
             [dvergr.room.store :as store]
             [dvergr.room.store.memory :as memory]
             [dvergr.rooms :as rooms]
+            [dvergr.substrate.repository-profile :as profile]
             [dvergr.system.db :as db]
             [dvergr.system.room-preparation :as preparation]
             [dvergr.system.rooms :as systems]
@@ -54,6 +55,106 @@
                     (throw error)))))))))
 
 (defn- attempt [f] (try (f) nil (catch Throwable error error)))
+
+(defn- legacy! [control id]
+  (swap! control dh/db-with [[:db/retract [:room/id id] :room/provisioning-state :ready]
+                             [:db/retract [:room/id id] :room/provisioning-version 1]]))
+
+(defn- host-policy [validator]
+  {:repository-profiles
+   {:fixture/knowledge {:initialize! (fn [& _]) :prepare-open! (fn [& _]) :abort-create! (fn [& _])
+                        :legacy-room-ready? validator}}})
+
+(deftest profile-registration-extension-is-closed-and-optional
+  (let [hooks (get-in (host-policy (constantly true)) [:repository-profiles :fixture/knowledge])]
+    (is (= hooks (profile/resolve! {:fixture/knowledge hooks} :fixture/knowledge)))
+    (is (= (dissoc hooks :legacy-room-ready?)
+           (profile/resolve! {:fixture/knowledge (dissoc hooks :legacy-room-ready?)} :fixture/knowledge)))
+    (doseq [invalid [(assoc hooks :allow-legacy? true) (assoc hooks :legacy-room-ready? true)
+                     (dissoc hooks :prepare-open!)]]
+      (is (thrown? clojure.lang.ExceptionInfo (profile/resolve! {:fixture/knowledge invalid} :fixture/knowledge))))))
+
+(deftest legacy-profile-attestation-preserves-flags-and-allows-later-source-edits
+  (fixture
+   (fn [{:keys [id control messages makes]}]
+     (legacy! control id)
+     (let [before @control repository (atom @messages) seen (atom [])
+           options (host-policy (fn [db room-id repository-db]
+                                  (swap! seen conj [db room-id repository-db])
+                                  (and (identical? before db) (= id room-id) (identical? @repository repository-db))))]
+       (with-redefs [systems/default-workspace (fn [& _] {:conn repository})]
+         (let [room (rooms/register-prepared-room! id options)]
+           (is (= 1 @makes (count @seen)))
+           (is (= before @control) "Attestation does not stamp historical provisioning fields")
+           (swap! repository dh/db-with [{:chat/id (random-uuid) :chat/title "Legitimate later source edit"}])
+           (is (identical? room (rooms/register-prepared-room! id options)))
+           (is (= 1 @makes))
+           (is (= 2 (count @seen)))))))))
+
+(deftest legacy-attestation-refuses-missing-nonboolean-stale-and-foreign-inputs
+  (fixture
+   (fn [{:keys [id control messages makes ctx]}]
+     (legacy! control id)
+     (let [before @control repository (atom @messages)]
+       (with-redefs [systems/default-workspace (fn [& _] {:conn repository})]
+         (doseq [options [{} (host-policy (constantly nil)) (host-policy (constantly false))
+                          (host-policy (constantly :ready))]]
+           (is (= ::rooms/not-ready (:type (ex-data (attempt #(rooms/register-prepared-room! id options)))))))
+         (with-redefs [systems/default-workspace (fn [& _] (throw (AssertionError. "No source read for foreign root")))]
+           (is (= ::rooms/requires-host-root
+                  (:type (ex-data (binding [ec/*execution-context* ctx]
+                                    (attempt #(rooms/register-prepared-room! id (host-policy (constantly true))))))))))
+         (with-redefs [systems/default-workspace (fn [& _] {:conn repository})]
+           (let [options (host-policy (fn [& _] (swap! control dh/db-with [{:room/id id :room/name "Changed while reading"}]) true))]
+             (is (= ::rooms/not-ready (:type (ex-data (attempt #(rooms/register-prepared-room! id options)))))))
+           (reset! control before))
+         (let [calls (atom 0)]
+           (with-redefs [systems/default-workspace (fn [& _] {:conn (if (= 1 (swap! calls inc)) repository (atom @repository))})]
+             (is (= ::rooms/not-ready (:type (ex-data (attempt #(rooms/register-prepared-room! id (host-policy (constantly true))))))))))
+         (with-redefs [systems/default-workspace (fn [& _] {:conn repository})]
+           (is (= ::rooms/not-ready
+                  (:type (ex-data
+                          (attempt #(rooms/register-prepared-room!
+                                     id (host-policy (fn [& _]
+                                                       (swap! repository dh/db-with [{:chat/id (random-uuid) :chat/title "Changed during validation"}])
+                                                       true)))))))))
+         (let [seen (atom 0) options (host-policy (fn [& _] (swap! seen inc) true))]
+           (doseq [tx [[[:db/add [:room/id id] :room/provisioning-state :pending]]
+                       [[:db/add [:room/id id] :room/provisioning-version 1]]
+                       [[:db/add [:room/id id] :room/archived-at (java.util.Date.)]]]]
+             (reset! control (dh/db-with before tx))
+             (is (= ::rooms/not-ready (:type (ex-data (attempt #(rooms/register-prepared-room! id options)))))))
+           (is (zero? @seen)))
+         (is (zero? @makes)))))))
+
+(deftest eager-hydration-obeys-the-same-legacy-profile-attestation
+  (fixture
+   (fn [{:keys [id root ctx control messages makes]}]
+     (legacy! control id)
+     (let [repository (atom @messages) before @control]
+       (with-redefs [db/all-rooms (fn [] [(dh/pull @control '[*] [:room/id id])])
+                     db/room-by-slug (fn [_] (dh/pull @control '[*] [:room/id id]))
+                     systems/provision-room! (fn [_] {:room-ctx ctx})
+                     systems/default-workspace (fn [& _] {:conn repository})
+                     run/reconcile-orphaned-runs! (fn [_] [])
+                     systems/msgs-conn-for-slug (fn [_] nil)]
+         (rooms/hydrate-registry! root)
+         (is (zero? @makes) "Missing host attestation leaves a profiled legacy Room unloaded")
+         (rooms/hydrate-registry! root (host-policy (constantly true)))
+         (is (= 1 @makes))
+         (is (= before @control)))))))
+
+(deftest eager-attestation-cannot-construct-on-a-foreign-preparation-context
+  (fixture
+   (fn [{:keys [id root control makes]}]
+     (legacy! control id)
+     (with-redefs [db/all-rooms (fn [] [(dh/pull @control '[*] [:room/id id])])
+                   db/room-by-slug (fn [_] (dh/pull @control '[*] [:room/id id]))
+                   systems/provision-room! (fn [_] {:room-ctx root})
+                   systems/default-workspace (fn [& _] (throw (AssertionError. "No foreign source IO")))
+                   rooms/room-store (fn [& _] (throw (AssertionError. "No foreign messages IO")))]
+       (rooms/hydrate-registry! root (host-policy (fn [& _] (throw (AssertionError. "No foreign attestation")))))
+       (is (zero? @makes))))))
 
 (deftest one-targeted-registration-reuses-the-canonical-live-room-without-control-writes
   (fixture
