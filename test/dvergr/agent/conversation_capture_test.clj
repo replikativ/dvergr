@@ -66,17 +66,19 @@
         chat-id (random-uuid)
         messages (with-redefs-fn
                    {#'schema/get-tool-registry-atom (constantly registry)}
-                   #(vector
-                     (schema/create-message-entity
-                      {:chat-id chat-id :role :assistant :content "" :reasoning "retained reasoning"
-                       :tool-uses [{:tool-use/id "nested-1" :tool-use/name "capture_nested"
-                                    :tool-use/input {:request {:code "(+ 1 2)"}
-                                                     :items [{:value 7}]}}]})
-                     (assoc (schema/create-message-entity
-                             {:chat-id chat-id :role :tool-result :tool-use-id "nested-1"
-                              :content (apply str (repeat 30000 "large tool output "))})
-                            :message/turn-number 0)
-                     (compaction/create-compaction-message "summary" [] [])))
+                   #(let [originals
+                          [(schema/create-message-entity
+                            {:chat-id chat-id :role :assistant :content "" :reasoning "retained reasoning"
+                             :tool-uses [{:tool-use/id "nested-1" :tool-use/name "capture_nested"
+                                          :tool-use/input {:request {:code "(+ 1 2)"}
+                                                           :items [{:value 7}]}}]})
+                           (assoc (schema/create-message-entity
+                                   {:chat-id chat-id :role :tool-result :tool-use-id "nested-1"
+                                    :content (apply str (repeat 30000 "large tool output "))})
+                                  :message/turn-number 0)]]
+                      (conj originals
+                            (compaction/create-compaction-message
+                             "summary" [] (mapv :message/id originals)))))
         ;; Exercise the actual working-vector pruning transformation, not
         ;; manually invented marker fields. The completed tool boundary stays.
         [messages recovered] (compaction/prune-tool-outputs messages :n-protected-turns 0)
@@ -84,6 +86,8 @@
     (is (pos? recovered))
     (is (true? (:message/pruned? (second messages))))
     (is (= "summary" (:message/summary (last messages))))
+    (is (= (mapv :message/id (subvec messages 0 2))
+           (:message/compacted-message-ids (last messages))))
     (with-store
       (fn [{:keys [artifacts]}]
         (artifact/publish-value! artifacts (:value prepared)
@@ -95,6 +99,37 @@
     (is (not= (:ref prepared) (:ref (capture/prepare (assoc-in messages [2 :message/content] "another summary")
                                                      @registry))))))
 
+(deftest pulled-compaction-coverage-survives-conversation-capture
+  (with-store
+    (fn [{:keys [conn artifacts]}]
+      (let [chat-id (random-uuid)
+            originals (mapv #(schema/create-message-entity
+                              {:chat-id chat-id :role :user :content %})
+                            ["first original" "second original"])
+            ids (mapv :message/id originals)
+            summary (schema/create-message-entity
+                     {:chat-id chat-id :role :system :content "checkpoint" :compacted? true
+                      :compacted-message-ids ids})]
+        (d/transact conn [{:chat/id chat-id}])
+        (d/transact conn (conj originals summary))
+        ;; Pull only portable fields: Datahike-local entity references are
+        ;; deliberately excluded from the conversation capture contract.
+        (let [eid (d/q '[:find ?message . :in $ ?id :where [?message :message/id ?id]]
+                       @conn (:message/id summary))
+              pulled (d/pull @conn '[:message/id :message/role :message/content
+                                     :message/created-at :message/compacted?
+                                     :message/compacted-message-ids] eid)
+              native-coverage (:message/compacted-message-ids pulled)]
+          (is (= (set ids) (set native-coverage)))
+          (doseq [coverage [native-coverage (set native-coverage)]]
+            (let [messages (conj originals (assoc pulled :message/compacted-message-ids coverage))
+                  prepared (capture/prepare messages)]
+              (artifact/publish-value! artifacts (:value prepared)
+                                       (fn [ref] (is (= ref (:ref prepared)))))
+              (let [restored (capture/restore artifacts (capture/manifest prepared))]
+                (is (= messages restored))
+                (is (= (set ids) (set (:message/compacted-message-ids (peek restored)))))))))))))
+
 (deftest capture-refuses-opaque-and-over-limit-values-before-encoding
   (doseq [bad [(assoc (message :user "x") :message/attachment-store-ref (random-uuid))
                (assoc (message :user "x") :unknown/blob (random-uuid))
@@ -103,6 +138,12 @@
                (assoc (message :user "x") :message/reply-to {:db/id 42})
                (assoc (message :user "x") :message/reasoning {:opaque/ref 42})
                (assoc (message :user "x") :message/summary true)
+               (assoc (message :system "checkpoint") :message/compacted-message-ids [])
+               (assoc (message :system "checkpoint") :message/compacted-message-ids [nil])
+               (assoc (message :system "checkpoint") :message/compacted-message-ids ["invented-id"])
+               (let [id (random-uuid)]
+                 (assoc (message :system "checkpoint") :message/compacted-message-ids [id id]))
+               (assoc (message :system "checkpoint") :message/compacted-message-ids (list (random-uuid)))
                (assoc (message :user "x") :message/created-at 42)
                (assoc (message :user "x") :message/summary (keyword (apply str (repeat 400000 "k"))))
                (assoc (message :user "x") :message/tokens (bigint (.shiftLeft java.math.BigInteger/ONE 10000)))]]

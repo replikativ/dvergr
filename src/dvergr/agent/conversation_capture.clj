@@ -46,7 +46,7 @@
 (def ^:private message-keys
   #{:message/id :message/chat :message/role :message/content :message/created-at
     :message/compacted? :message/reasoning :message/tokens :message/important?
-    :message/summary :message/tool-uses :message/tool-use-id :message/turn-number
+    :message/summary :message/compacted-message-ids :message/tool-uses :message/tool-use-id :message/turn-number
     :message/pruned? :message/original-tokens :message/reply-to :db/doc})
 
 (defn- stable-lookup? [attribute value]
@@ -63,6 +63,8 @@
            :message/created-at inst?
            :message/reasoning string?
            :message/summary string?
+           :message/compacted-message-ids #(and (or (vector? %) (set? %)) (seq %)
+                                                (every? uuid? %) (= (count %) (count (set %))))
            :message/tool-use-id string?
            :message/compacted? boolean?
            :message/important? boolean?
