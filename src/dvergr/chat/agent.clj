@@ -253,7 +253,7 @@
                                             "accounts/fireworks/models/minimax-m3")
                                  :provider (or provider :fireworks)
                                  :context-window (or (model-registry/context-window
-                                                       (model-registry/resolve-alias model))
+                                                      (model-registry/resolve-alias model))
                                                      128000)))
 
     (let [model (model-registry/resolve-alias model)

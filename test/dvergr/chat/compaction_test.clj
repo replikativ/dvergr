@@ -147,7 +147,6 @@
                         (:message/compacted? %))
                   active))))))
 
-
 ;; These regressions use a plain message store and a deterministic summarizer.
 ;; They neither create an execution world nor invoke a provider.
 (defn- fixture-message [role content tokens]
@@ -197,8 +196,8 @@
       (compaction/compact! {} :summarizer (fn [_ _] "first checkpoint"))
       (let [first-summary (peek @messages)]
         (compaction/compact! {} :summarizer (fn [selected _]
-                                             (is (= [old-answer] selected))
-                                             "second checkpoint"))
+                                              (is (= [old-answer] selected))
+                                              "second checkpoint"))
         (let [second-summary (peek @messages)
               active (compaction/get-active-messages {})]
           (is (= [(:message/id old-result)] (:message/compacted-message-ids first-summary)))
@@ -228,11 +227,11 @@
         "Priority selection is restored to chronological order")
     (is (= [earlier-user]
            (mapv :msg (compaction/select-for-compaction
-                        (assoc messages 1 (assoc assistant :message/important? true)) 1)))
+                       (assoc messages 1 (assoc assistant :message/important? true)) 1)))
         "An important call also protects its results")
     (is (empty? (compaction/select-for-compaction
-                  [assistant (fixture-message :user "recent 1" 1) result
-                   (fixture-message :user "recent 2" 1)] 1))
+                 [assistant (fixture-message :user "recent 1" 1) result
+                  (fixture-message :user "recent 2" 1)] 1))
         "A group crossing the protected boundary remains intact")))
 
 (deftest pruning-recomputes-active-token-count-test
@@ -253,16 +252,16 @@
   (let [ids [(random-uuid) (random-uuid)]
         summary (compaction/create-compaction-message "summary" [] ids)
         entity (schema/create-message-entity {:chat-id (random-uuid)
-                                             :role (:message/role summary)
-                                             :content (:message/content summary)
-                                             :compacted? true
-                                             :compacted-message-ids ids})]
+                                              :role (:message/role summary)
+                                              :content (:message/content summary)
+                                              :compacted? true
+                                              :compacted-message-ids ids})]
     (is (= ids (:message/compacted-message-ids summary)))
     (is (= ids (:message/compacted-message-ids entity)))
     (is (= :db.type/uuid (:db/valueType (first (filter #(= :message/compacted-message-ids (:db/ident %))
-                                                               schema/message-schema)))))
+                                                       schema/message-schema)))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exact original message identities"
-                         (compaction/create-compaction-message "summary" [] [nil])))))
+                          (compaction/create-compaction-message "summary" [] [nil])))))
 
 (deftest missing-coverage-does-not-discard-history-test
   (let [original (fixture-message :user "still required" 1)
@@ -281,10 +280,9 @@
       (is (not (compaction/should-compact? {})))
       (is (compaction/should-compact? {} :context-window 40000))
       (is (pos? (:compacted-count
-                  (compaction/maybe-compact! {} :context-window 40000
-                    :summarizer (fn [selected _] (swap! seen conj selected) "checkpoint")))))
+                 (compaction/maybe-compact! {} :context-window 40000
+                                            :summarizer (fn [selected _] (swap! seen conj selected) "checkpoint")))))
       (is (= 1 (count @seen))))))
-
 
 (deftest overlapping-tool-groups-share-protection-and-token-accounting-test
   (let [call (fn [ids]
@@ -301,17 +299,17 @@
         tail [(fixture-message :user "recent 1" 1)
               (fixture-message :user "recent 2" 1)]]
     (is (empty? (compaction/select-for-compaction
-                  (into [first-call bridging-call protected-call result-x result-y] tail) 1))
+                 (into [first-call bridging-call protected-call result-x result-y] tail) 1))
         "Transitive shared-result groups inherit important-message protection")
     (is (empty? (compaction/select-for-compaction
-                  [first-call bridging-call result-x
-                   (fixture-message :user "recent 1" 1) (call ["shared-y"]) result-y
-                   (fixture-message :user "recent 2" 1)] 1))
+                 [first-call bridging-call result-x
+                  (fixture-message :user "recent 1" 1) (call ["shared-y"]) result-y
+                  (fixture-message :user "recent 2" 1)] 1))
         "A recent call protects every group connected through a reused ID")
     (let [second-call (call ["shared-x"])
           additional (fixture-message :assistant "additional older answer" 100)
           selected (compaction/select-for-compaction
-                     (into [first-call second-call result-x additional] tail) 150)]
+                    (into [first-call second-call result-x additional] tail) 150)]
       (is (= [first-call second-call result-x additional] (mapv :msg selected))
           "A shared result counts once; another message is needed to reach the target")
       (is (= 202 (reduce + (map :tokens selected)))))))
@@ -325,8 +323,8 @@
                         ["first original" "second original"])
         covered-ids (mapv :message/id originals)
         summary (schema/create-message-entity
-                  {:chat-id chat-id :role :system :content "checkpoint"
-                   :important? true :compacted? true :compacted-message-ids covered-ids})]
+                 {:chat-id chat-id :role :system :content "checkpoint"
+                  :important? true :compacted? true :compacted-message-ids covered-ids})]
     (dh/create-database config)
     (try
       (let [conn (dh/connect config)]
@@ -347,6 +345,6 @@
             (with-redefs [chat-ctx/get-messages (fn [_] restored)]
               (is (= [restored-summary] (compaction/get-active-messages {})))
               (is (nil? (:compaction/coverage-unavailable-ids
-                          (meta (compaction/get-active-messages {})))))))
+                         (meta (compaction/get-active-messages {})))))))
           (finally (dh/release conn))))
       (finally (dh/delete-database config)))))

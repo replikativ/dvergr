@@ -342,7 +342,7 @@
     (loop [selected #{} remaining candidates tokens-selected 0]
       (if (or (>= tokens-selected tokens-to-remove) (empty? remaining))
         (mapv (fn [idx] {:idx idx :msg (messages idx)
-                        :tokens (message-tokens (messages idx))})
+                         :tokens (message-tokens (messages idx))})
               (sort selected))
         (let [{:keys [indices tokens]} (first remaining)]
           (recur (into selected indices) (rest remaining) (+ tokens-selected tokens)))))))
@@ -667,7 +667,7 @@ Summary:")
                                 (:message/compacted? %)) messages)
         covered (into #{} (mapcat :message/compacted-message-ids) summaries)
         unknown (into [] (comp (remove #(seq (:message/compacted-message-ids %)))
-                              (map :message/id)) summaries)]
+                               (map :message/id)) summaries)]
     (with-meta
       (filterv #(not (contains? covered (:message/id %))) messages)
       (when (seq unknown) {:compaction/coverage-unavailable-ids unknown}))))
