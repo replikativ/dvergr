@@ -8,6 +8,7 @@
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
             [dvergr.agent.subexperiment :as subexperiment]
+            [dvergr.agent.invocations :as invocations]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.discourse :as d]
             [dvergr.model.chat :as chat]
@@ -217,3 +218,56 @@
       (finally
         (run/finish! parent :completed)
         (#'fixtures/close-resource-test-room! room conn)))))
+
+(deftest host-clean-parent-keeps-accounting-and-result-in-the-caller
+  (let [[control conn] (#'fixtures/resource-test-room :clean-parent-control)
+        [clean clean-conn] (#'fixtures/resource-test-room :clean-parent-fixture)
+        parent (:run/id (run/start! control :parent (random-uuid) nil))
+        grant {"microUSD" 20M}
+        seen (atom [])
+        setup (evaluation/make-world-setup
+               {:id :test/clean :version 1 :basis :clean-origin
+                :prepare (fn [{:keys [room]}]
+                           (swap! seen conj (:parent-id room))
+                           {:parent (:parent-id room)})})
+        scorer (evaluation/make-evaluator
+                {:id :test/clean :version 1
+                 :observe (fn [{:keys [default setup/evidence]}] (assoc default :clean-parent (:parent evidence)))
+                 :verify (fn [_ observed] {:checks {:clean? (= (:id clean) (:clean-parent observed))}
+                                           :reward (if (= (:id clean) (:clean-parent observed)) 1.0 0.0)})})
+        team (roster/make-agent (roster/make-roster) {:id :candidate :program {:kind :echo}})
+        env (environment/make-environment
+             {:id :test/clean :task "clean-parent test" :verifier {:id :test/clean :version 1}
+              :world {:isolation :ctx :settlement :discard :setup (evaluation/world-setup-ref setup)
+                      :resources {"microUSD" 10M}}})
+        definition (experiment/make-experiment
+                    {:id :test/clean :dataset (experiment/make-dataset {:id :test/clean :environments [env]})
+                     :candidates [(roster/agent team :candidate)]})
+        scope {:evaluators {(evaluation/evaluator-ref scorer) scorer}
+               :world-setups {(evaluation/world-setup-ref setup) setup}}
+        offer {:invocation/id :test/clean-benchmark :invocation/version 1 :invocation/basis :fixture}
+        handler (fn [{:keys [control-room work-room authority]} team opts]
+                  (subexperiment/start! control-room work-room team definition opts
+                                        (assoc authority :experiment-capabilities scope)
+                                        {:world-parent clean}))
+        authority {:parent-run parent :experiment-capabilities (assoc scope :invocations {offer handler})}]
+    (try
+      (binding [ec/*execution-context* (:ctx control)] (registry/register! control))
+      (binding [ec/*execution-context* (:ctx clean)] (registry/register! clean))
+      (resource/mint! control {:id (random-uuid) :resources grant})
+      (resource/allocate-run! control parent nil grant)
+      (binding [ec/*execution-context* (:ctx control)]
+        (let [result @(invocations/invoke! control control authority offer team {:resources grant})]
+          (is (= :completed (:status result)))
+          (is (= [(:id clean)] @seen))
+          (is (= 1.0 (get-in result [:scorecard :scorecard/entries 0 :reward])))
+          (is (= parent (:run/parent (run/run control (:job result)))))
+          (is (= grant (resource/run-balance control parent)))
+          (is (empty? (run/runs clean)))
+          (is (= {} (resource/balance clean)))))
+      (is (thrown? Exception (subexperiment/start! control control team definition {} authority {:world-parent nil})))
+      (finally
+        (resource/return! control parent nil (resource/run-balance control parent))
+        (run/finish! parent :completed)
+        (#'fixtures/close-resource-test-room! clean clean-conn)
+        (#'fixtures/close-resource-test-room! control conn)))))

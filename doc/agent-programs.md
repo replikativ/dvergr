@@ -882,3 +882,31 @@ ChatContext spending ceiling, but does not pretend those are an affine resource
 split. The opt-in native dispatch allowance above makes one resource coordinate
 executable at the gateway; token/cost reservation and reconciliation are still
 required before scopes can delegate paid model work to child Runs.
+
+
+## Fixed host experiment invocations
+
+A host may add `:invocations {ref handler}` to its existing
+`:experiment-capabilities` scope. A reference is closed portable data:
+`{:invocation/id :host/benchmark :invocation/version 1 :invocation/basis ...}`.
+The non-nil basis follows the ordinary portable AgentDef data convention.
+Handlers never enter SCI, Run inputs or `agent/offered`; only exact references
+do. Offers follow the existing child authority and have no global fallback.
+Changing a handler's admitted semantics requires a new reference/basis.
+
+`(agent/invoke-experiment! ref roster opts)` dispatches that exact offer with
+the current host-issued control room, caller world and ambient Run authority.
+The trusted handler must validate a closed options schema, enforce its fixed
+dataset/evaluator/setup, apply candidate restrictions, and use native child
+ownership before starting work. The generic bridge does not interpret `opts`
+as authority. Fixed benchmark handlers must not expose their verifier/setup
+capabilities through arbitrary agent-built EnvironmentDefs.
+
+The HOST-only extra arity of `subexperiment/start!` accepts
+`{:world-parent clean-fixture-room}` separately from the caller world. This
+selects candidate ancestry without moving Run records or grants out of the
+control room; the result Spin still belongs to the caller world. Ordinary SCI
+`run-experiment!` cannot select this argument. The host retains the exact
+fixture and any physical checker capacity until descendant cleanup joins;
+deleting author files alone does not hide their Git history. Neither API
+mints money or provider admissions.

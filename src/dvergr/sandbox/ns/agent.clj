@@ -521,6 +521,7 @@
         run-balance*   (requiring-resolve 'dvergr.resource/run-balance)
         room-lookup*   (requiring-resolve 'dvergr.room.registry/lookup)
         start-experiment* (requiring-resolve 'dvergr.agent.subexperiment/start!)
+        invoke-experiment* (requiring-resolve 'dvergr.agent.invocations/invoke!)
         offered*       (requiring-resolve 'dvergr.agent.evaluators/offered)
         selected-ctx   #(runtime-ctx/selected-context spindel-ctx)
         current-room-id #(or (when binding-resolver
@@ -599,6 +600,12 @@
                  control-room (control-room! work-room)]
              (binding [ec/*execution-context* (:ctx work-room)]
                (start-experiment* control-room work-room roster experiment opts agent-program-ceiling)))))
+        invoke-experiment-fn
+        (fn [ref roster opts]
+          (let [work-room (room!)
+                control-room (control-room! work-room)]
+            (binding [ec/*execution-context* (:ctx work-room)]
+              (invoke-experiment* control-room work-room agent-program-ceiling ref roster opts))))
         observe-fn     (fn [handle-or-id]
                          (let [work-room (room!)
                                control-room (control-room! work-room)]
@@ -705,6 +712,9 @@
                                            :result-of (constantly nil)
                                            :resource {:experiment (str (or (:id experiment) (:experiment/id experiment)))}})
                                 run-experiment-fn)
+        'invoke-experiment! (gated effects (fn [ref & _]
+                                             {:effect :run/start :result-of (constantly nil)
+                                              :resource {:invocation ref}}) invoke-experiment-fn)
         'offered      (fn [] (if (contains? agent-program-ceiling :experiment-capabilities)
                                (offered* (:experiment-capabilities agent-program-ceiling))
                                (offered*)))
@@ -739,6 +749,7 @@
            room-id      [([]) "Return the live identity of the current Room/world. In an isolated fork this is the child Room, not its parent."]
            hire!        [([roster agent-ref opts]) "Durably start one owned AgentDef in the current Room: (dvergr.agent/hire! team :a {:task value :resources {\"microUSD\" 1000}}). Returns a RunHandle. The current Run remains responsible for the child even if the handle is ignored. opts: :task (required); :from (a keyword sender); :settlement (:automatic, :review or :discard); :resources, a MAP of resource coordinate → positive amount (e.g. {\"microUSD\" 1000}) split from the current Run/Room's conserved balance; :limits {:max-model-steps n :budget-dollars x}, which can only TIGHTEN the agent's own limits for this Run; :parent-run, the parent Run's uuid (defaults to the current Run and, when one is ambient, must equal it); :role, a keyword naming the part the child plays (:candidate, :judge, ...), which its spend is summed under (see `split`). Unknown keys are rejected."]
            run-experiment! [([roster experiment] [roster experiment opts]) "Run a child experiment in forks of the current world, using only offered verifiers/setups. Returns a Spin of {:job uuid :status keyword :scorecard ScorecardDef (when completed) :error string}. A hired parent owns it even when ignored; cancellation joins cleanup before returning resources. opts: :parallelism (default 1), :resources (explicit aggregate grant covering every candidate/case/repetition). Paid cells require funded per-cell native-provider grants; CLI/relay execution is not admitted. Verifier scope follows recursive hires; an empty scope offers nothing."]
+           invoke-experiment! [([ref roster opts]) "Invoke one exact host-offered experiment with bounded candidate revisions. The host fixes dataset, evaluator, setup and clean origin; opts cannot confer authority. Returns the native owned result Spin. No global fallback; an ambient Run and exact offered invocation ref are required."]
            offered      [([]) "The verifier and world-setup refs this host offers to experiments: {:evaluators [ref ...] :world-setups [ref ...]}."]
            delegation-policy [([]) "The host's portable child delegation bounds, or nil for a trusted host caller. :tools bounds tools, :sandboxes enumerates exact extension combinations, :providers permits LLM transports. Optional :program-kinds bounds interpreters (omitted: :echo/:scripted/:llm only; :sci requires opt-in). :max-attempts/:max-parallelism bound child experiments. Children cannot override this policy."]
            current-run-id [([]) "The ambient consumer Run UUID, or nil outside a hired Run. This is host-issued scope, not a caller-selected Run identity."]
@@ -768,6 +779,7 @@
           'room-id         [:=> [:cat] :keyword]
           'hire!           [:=> [:cat Roster AgentIdOrRef HireOpts] RunHandle]
           'run-experiment! [:function [:=> [:cat Roster :map] :any] [:=> [:cat Roster :map :map] :any]]
+          'invoke-experiment! [:=> [:cat :map Roster :map] :any]
           'offered         [:=> [:cat] :map]
           'delegation-policy [:=> [:cat] [:maybe :map]]
           'current-run-id   [:=> [:cat] [:maybe :uuid]]

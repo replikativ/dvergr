@@ -15,6 +15,7 @@
             [dvergr.agent.roster :as roster]
             [dvergr.agent.sci-program :as sci-program]
             [dvergr.agent.authority :as delegation]
+            [dvergr.agent.invocations :as invocations]
             [dvergr.sandbox.extensions :as extensions]
             [dvergr.agent.prompt :as prompt]
             [dvergr.agent.room-context :as room-context]
@@ -940,8 +941,11 @@
   (cond-> inputs
     (and inputs (contains? host-options :experiment-capabilities))
     (assoc :experiment-capabilities
-           (into {} (for [kind [:evaluators :world-setups]]
-                      [kind (set (keys (get-in host-options [:experiment-capabilities kind])))])))
+           (into {} (for [kind (cond-> [:evaluators :world-setups]
+                                 (contains? (:experiment-capabilities host-options) :invocations) (conj :invocations))]
+                      [kind (if (= :invocations kind)
+                              (invocations/refs (:experiment-capabilities host-options))
+                              (set (keys (get-in host-options [:experiment-capabilities kind]))))])))
     (and inputs (contains? host-options :delegation-policy))
     (assoc :delegation-policy (delegation/inputs (:delegation-policy host-options)))))
 
