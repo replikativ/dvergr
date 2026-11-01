@@ -152,6 +152,7 @@
   ([execution-ctx worker-ctx]
    {:execution-ctx execution-ctx
     :worker-ctx worker-ctx
+    :dispatch-owner (resource/make-dispatch-owner)
     :state (atom {:cancelled? false
                   :sealed? false
                   ;; Sealing closes admission. It does not prove that the
@@ -1374,7 +1375,8 @@
                                       (resource/spending [:llm-step run-id model-step]))
                               resource/*model-scope*
                               (some-> (resource/model-scope control-room run-id)
-                                      (assoc :cancel? #(cancelled-or-expired? supervisor run-id)))]
+                                      (assoc :cancel? #(cancelled-or-expired? supervisor run-id)
+                                             :dispatch-owner (:dispatch-owner supervisor)))]
                       (let [outcome (with-model-entry-checked supervisor run-id model-inputs [model-spec compaction]
                                       (chat-agent/run-agent-turn!
                                        chat-ctx
@@ -1573,7 +1575,8 @@
                     supervisor
                     (constantly {:inputs-id (inputs-id inputs)}))
                    (let [scope (some-> (resource/model-scope control-room run-id)
-                                       (assoc :cancel? #(cancelled-or-expired? supervisor run-id)))]
+                                       (assoc :cancel? #(cancelled-or-expired? supervisor run-id)
+                                              :dispatch-owner (:dispatch-owner supervisor)))]
                      (binding [resource/*model-scope* scope
                                ;; the protocol's model calls, the candidate's
                                ;; and its driver's, are paid from the Run's
@@ -1973,6 +1976,7 @@
          ;; racy with graph cleanup and is not a compositional completion edge.
          @execution-terminal
          (await-supervisor! supervisor)
+         (resource/reconcile-dispatch-owner! (:dispatch-owner supervisor))
          (return-unused-resources! control-room id (get outcome ::return-to parent-run)
                                    allocation-state)
          (let [{:keys [cleanup-error llm-metrics]} @(:state supervisor)
@@ -2292,6 +2296,11 @@
              (catch Throwable _ nil))
         (throw t)))
     (run/register-child-owner! id #(with-owned-child! supervisor %))
+    (run/register-settlement-observer!
+     control-room id
+     #(assoc (resource/dispatch-accounting-state (:dispatch-owner supervisor))
+             :workers-quiesced? (:quiesced? @(:state supervisor))
+             :supervisor-admission-sealed? (:sealed? @(:state supervisor))))
     (run/register-cancel-hook! id ::native-worker
                                #(cancel-supervisor! supervisor))
     ;; The trigger is the Run's durable causal input, not candidate execution.

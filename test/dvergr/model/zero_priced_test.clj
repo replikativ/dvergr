@@ -45,7 +45,7 @@
             (dotimes [_ 2] (is (= 200 (:status (gateway/request! request)))))
             (is (thrown? clojure.lang.ExceptionInfo (gateway/request! request)))
             (is (= 2 @calls))
-            (is (empty? @resource/*dispatches*) "No fictional positive-dollar reservation")
+            (is (not-any? :reserve-command @resource/*dispatches*) "Admissions have identities without a fictional monetary reservation")
             (resource/settle-dispatches! 0M)
             (is (= {resource/microdollars 10000M} (resource/run-balance room id))))))))
 

@@ -77,6 +77,290 @@
 
 (defn- left [room run-id] (resource/wallet-microdollars room run-id))
 
+(defn- with-transfer-fault [room fault f]
+  (let [st (:store room)
+        wrapped (reify store/PResourceStore
+                  (-open-resource-wallet! [_ spec] (store/-open-resource-wallet! st spec))
+                  (-install-resource-unit! [_ spec] (store/-install-resource-unit! st spec))
+                  (-allocate-resource-wallet! [_ wallet transfer] (store/-allocate-resource-wallet! st wallet transfer))
+                  (-resource-balance [_ account] (store/-resource-balance st account))
+                  (-resource-receipt [_ id] (store/-resource-receipt st id))
+                  (-transfer-resources! [_ command] (fault #(store/-transfer-resources! st command) command)))]
+    ;; Protocol calls compile to interface dispatch; redefining their Vars
+    ;; would silently leave the real implementation uninstrumented.
+    (with-redefs-fn {(ns-resolve 'dvergr.resource 'resource-store!) (constantly wrapped)} f)))
+
+(deftest settlement-lost-ack-retains-the-original-ledger-commands
+  (with-funded-run
+    4M 50000M
+    (fn [room run-id]
+      (doseq [kind [:grant :return]]
+        (binding [gateway/*request-fn* (constantly {:status 200})
+                  resource/*dispatches* (atom [])
+                  resource/*dispatch-bound* 5000M]
+          (gateway/request! request)
+          (let [fail? (atom true) commands (atom [])]
+            (with-transfer-fault room
+              (fn [commit! command]
+                (swap! commands conj command)
+                (let [result (commit!)]
+                  (when (and (= kind (:kind command)) (compare-and-set! fail? true false))
+                    (throw (IOException. "Committed; acknowledgement lost")))
+                  result))
+              (fn []
+                (is (thrown? clojure.lang.ExceptionInfo (resource/settle-dispatches! 1200M)))
+                (is (seq @resource/*dispatches*) "Unacknowledged settlement stays reachable")
+                (resource/settle-dispatches! 1200M)
+                (doseq [[_ attempts] (group-by :id @commands)]
+                  (is (apply = attempts) "Replay keeps the exact command, including audit timestamps")))))))
+      (is (= 47600M (left room run-id))))))
+
+(deftest reserve-lost-ack-is-retained-and-does-not-become-provider-spend
+  (with-funded-run
+    1M 10000M
+    (fn [room run-id]
+      (binding [resource/*dispatches* (atom []) resource/*dispatch-bound* 5000M]
+        (let [fail? (atom true) entered (atom 0)]
+          (with-transfer-fault room
+            (fn [commit! _command]
+              (let [result (commit!)]
+                (when (compare-and-set! fail? true false)
+                  (throw (IOException. "Reserve committed; acknowledgement lost")))
+                result))
+            (fn []
+              (binding [gateway/*request-fn* (fn [_] (swap! entered inc) {:status 200})]
+                (is (thrown? clojure.lang.ExceptionInfo (gateway/request! request))))
+              (is (zero? @entered))
+              (is (seq @resource/*dispatches*))
+              (resource/settle-dispatches! nil)
+              (is (= 10000M (left room run-id)))
+              (is (= 1M (get (resource/run-balance room run-id) resource/model-dispatches))))))))))
+
+(deftest original-owner-retains-a-call-after-unwind-and-seals-admission
+  (with-funded-run
+    3M 10000M
+    (fn [room run-id]
+      (let [owner (resource/make-dispatch-owner) fail? (atom true) commands (atom [])]
+        (binding [resource/*model-scope* (assoc resource/*model-scope* :dispatch-owner owner)
+                  resource/*dispatch-bound* 5000M
+                  gateway/*request-fn* (constantly {:status 200})]
+          (with-transfer-fault
+            room
+            (fn [commit! command]
+              (swap! commands conj command)
+              (let [result (commit!)]
+                (when (and @fail? (= :grant (:kind command))
+                           (= (resource/hold-wallet-id run-id) (second (:destination command))))
+                  (throw (IOException. "Hold committed; acknowledgement unavailable")))
+                result))
+            (fn []
+              (is (thrown? clojure.lang.ExceptionInfo
+                           (resource/with-dispatch-accounting
+                             (gateway/request! request)
+                             (resource/settle-dispatches! 1200M))))
+              (is (= :pending (:reservation-reconciliation (resource/dispatch-accounting-state owner))))
+              (is (= [:exited] (mapv :phase (:calls (resource/dispatch-accounting-state owner)))))
+              (reset! fail? false)
+              (let [a (future (resource/reconcile-dispatch-owner! owner) :done)
+                    b (future (resource/reconcile-dispatch-owner! owner) :done)]
+                (is (= :done (deref a 5000 :timeout)))
+                (is (= :done (deref b 5000 :timeout))))
+              (is (= :complete (:reservation-reconciliation (resource/dispatch-accounting-state owner))))
+              (is (= :not-established (:usage-consumption (resource/dispatch-accounting-state owner))))
+              (is (= 1 (count (:hold-transfers (resource/dispatch-accounting-state owner)))))
+              (is (= 8800M (left room run-id)))
+              (is (thrown? clojure.lang.ExceptionInfo (gateway/request! request)))
+              (doseq [[_ attempts] (group-by :id @commands)] (is (apply = attempts))))))))))
+
+(deftest admission-only-ack-loss-retains-identity-without-ever-entering-http
+  (with-funded-run
+    1M 1000M
+    (fn [room run-id]
+      (let [owner (resource/make-dispatch-owner) fail? (atom true) entered (atom 0)]
+        (binding [resource/*model-scope* (assoc resource/*model-scope* :dispatch-owner owner)
+                  resource/*spend-wallet* nil
+                  gateway/*request-fn* (fn [_] (swap! entered inc) {:status 200})]
+          (with-transfer-fault
+            room
+            (fn [commit! command]
+              (let [result (commit!)]
+                (when (and @fail? (contains? (:resources command) resource/model-dispatches))
+                  (throw (IOException. "Admission committed; acknowledgement unavailable")))
+                result))
+            (fn []
+              (is (thrown? clojure.lang.ExceptionInfo (gateway/request! request)))
+              (is (zero? @entered))
+              (is (= :pending (:reservation-reconciliation (resource/dispatch-accounting-state owner))))
+              (reset! fail? false)
+              (resource/reconcile-dispatch-owner! owner)
+              (is (= :complete (:reservation-reconciliation (resource/dispatch-accounting-state owner))))
+              (is (= {resource/microdollars 1000M} (resource/run-balance room run-id)))
+              (is (zero? @entered)))))))))
+
+(deftest refusal-refund-failure-closes-the-untransferred-response
+  (with-funded-run
+    1M 10000M
+    (fn [room run-id]
+      (let [owner (resource/make-dispatch-owner) fail? (atom true) closed? (atom false)
+            body (proxy [ByteArrayInputStream] [(byte-array 0)]
+                   (close [] (reset! closed? true)))]
+        (binding [resource/*model-scope* (assoc resource/*model-scope* :dispatch-owner owner)
+                  resource/*dispatch-bound* 5000M
+                  gateway/*request-fn* (constantly {:status 400 :body body})]
+          (with-transfer-fault
+            room
+            (fn [commit! command]
+              (let [result (commit!)]
+                (when (and @fail? (= :return (:kind command)))
+                  (throw (IOException. "Refund committed; acknowledgement unavailable")))
+                result))
+            (fn []
+              (let [error (try (gateway/request! request) nil (catch Exception e e))]
+                (is (= :dvergr.resource/dispatch-accounting-failed (:type (ex-data error))))
+                (is (false? (@#'chat/retryable-error? error))))
+              (is @closed?)
+              (reset! fail? false)
+              (resource/reconcile-dispatch-owner! owner)
+              (is (= 10000M (left room run-id)))
+              (is (empty? (:hold-transfers (resource/dispatch-accounting-state owner)))))))))))
+
+(deftest active-call-is-not-physical-return-and-sealed-scope-cannot-admit
+  (let [owner (resource/make-dispatch-owner) entered (promise) release (promise)
+        worker (future
+                 (binding [resource/*model-scope* {:dispatch-owner owner}]
+                   (resource/with-dispatch-accounting
+                     (deliver entered true) @release)))
+        finalizer (atom nil)]
+    (try
+      (is (= true (deref entered 5000 :timeout)))
+      (reset! finalizer (future (resource/reconcile-dispatch-owner! owner) :returned))
+      (loop [remaining 100]
+        (when (and (pos? remaining) (not (:sealed? @owner)))
+          (Thread/sleep 5) (recur (dec remaining))))
+      (is (:sealed? @owner))
+      (is (= :waiting (deref @finalizer 20 :waiting)))
+      (binding [resource/*model-scope* {:dispatch-owner owner}]
+        (is (thrown? clojure.lang.ExceptionInfo (resource/with-dispatch-accounting :late))))
+      (finally (deliver release :exited) (deref worker 5000 nil)
+               (when @finalizer (is (= :returned (deref @finalizer 5000 :timeout))))))))
+
+(deftest nested-model-calls-have-independent-settlement-plans
+  (with-funded-run
+    2M 10000M
+    (fn [room run-id]
+      (let [owner (resource/make-dispatch-owner)]
+        (binding [resource/*model-scope* (assoc resource/*model-scope* :dispatch-owner owner)
+                  gateway/*request-fn* (constantly {:status 200})]
+          (resource/with-dispatch-accounting
+            (binding [resource/*dispatch-bound* 5000M] (gateway/request! request))
+            (let [outer resource/*dispatches*]
+              (resource/with-dispatch-accounting
+                (is (not (identical? outer resource/*dispatches*)))
+                (binding [resource/*dispatch-bound* 2000M] (gateway/request! request))
+                (resource/settle-dispatches! 100M)))
+            (resource/settle-dispatches! 1000M))
+          (is (= 8900M (left room run-id)))
+          (is (= 2 (count (:hold-transfers (resource/dispatch-accounting-state owner)))))
+          (is (= :complete (:reservation-reconciliation (resource/dispatch-accounting-state owner)))))))))
+
+(deftest a-refused-settlement-command-remains-an-outstanding-obligation
+  (with-funded-run
+    1M 10000M
+    (fn [room run-id]
+      (let [owner (resource/make-dispatch-owner) fail? (atom true)]
+        (binding [resource/*model-scope* (assoc resource/*model-scope* :dispatch-owner owner)
+                  resource/*dispatch-bound* 5000M gateway/*request-fn* (constantly {:status 200})]
+          (with-transfer-fault
+            room
+            (fn [commit! command]
+              (if (and @fail? (= :return (:kind command)))
+                (throw (ex-info "Settlement refused" {:type :kontor.resource/insufficient}))
+                (commit!)))
+            (fn []
+              (is (thrown? clojure.lang.ExceptionInfo
+                           (resource/with-dispatch-accounting
+                             (gateway/request! request) (resource/settle-dispatches! 1200M))))
+              (is (= :pending (:reservation-reconciliation (resource/dispatch-accounting-state owner))))
+              (is (= :submitted (-> (resource/dispatch-accounting-state owner) :calls first :dispatches first :release-command-state)))
+              (reset! fail? false)
+              (resource/reconcile-dispatch-owner! owner)
+              (is (= 8800M (left room run-id)))
+              (is (= :complete (:reservation-reconciliation (resource/dispatch-accounting-state owner)))))))))))
+
+(deftest raw-success-response-closes-if-its-final-accounting-loses-acknowledgement
+  (with-funded-run
+    1M 10000M
+    (fn [room run-id]
+      (let [owner (resource/make-dispatch-owner) fail? (atom true) closed? (atom false)
+            body (proxy [ByteArrayInputStream] [(byte-array 0)] (close [] (reset! closed? true)))]
+        (binding [resource/*model-scope* (assoc resource/*model-scope* :dispatch-owner owner)
+                  resource/*dispatch-bound* 5000M gateway/*request-fn* (constantly {:status 200 :body body})]
+          (with-transfer-fault
+            room
+            (fn [commit! command]
+              (let [result (commit!)]
+                (when (and @fail? (= :consume (:kind command))
+                           (contains? (:resources command) resource/microdollars))
+                  (throw (IOException. "Forfeit committed; acknowledgement unavailable")))
+                result))
+            (fn []
+              (is (thrown? clojure.lang.ExceptionInfo (gateway/request! request)))
+              (is @closed?)
+              (is (= :pending (:reservation-reconciliation (resource/dispatch-accounting-state owner))))
+              (reset! fail? false)
+              (resource/reconcile-dispatch-owner! owner)
+              (is (= 5000M (left room run-id)))
+              (is (= :complete (:reservation-reconciliation (resource/dispatch-accounting-state owner)))))))))))
+
+(deftest original-cleanup-hands-off-only-after-it-stops-touching-the-call
+  (let [owner (resource/make-dispatch-owner) entered (promise) release (promise)
+        worker (atom nil) finalizer (atom nil)]
+    (try
+      (with-redefs [resource/settle-dispatches! (fn [_] (deliver entered true) @release)]
+        (reset! worker (future
+                         (binding [resource/*model-scope* {:dispatch-owner owner}]
+                           (try (resource/with-dispatch-accounting (throw (ex-info "Original failure" {})))
+                                (catch Exception _ :failed)))))
+        (is (= true (deref entered 5000 :timeout)))
+        (is (= [:active] (mapv :phase (:calls (resource/dispatch-accounting-state owner)))))
+        (reset! finalizer (future (resource/reconcile-dispatch-owner! owner) :done))
+        (is (= :waiting (deref @finalizer 20 :waiting)))
+        (deliver release true)
+        (is (= :failed (deref @worker 5000 :timeout)))
+        (is (= :done (deref @finalizer 5000 :timeout)))
+        (is (empty? (:calls @owner))))
+      (finally (deliver release true)
+               (when @worker (deref @worker 5000 nil))
+               (when @finalizer (deref @finalizer 5000 nil))))))
+
+(deftest conveyed-gateway-calls-cannot-reuse-a-different-threads-call-record
+  (with-funded-run
+    2M 10000M
+    (fn [_ _]
+      (doseq [start-before-exit? [true false]]
+        (let [owner (resource/make-dispatch-owner) start (promise) entered (promise) release (promise)
+              child (atom nil)]
+          (try
+            (binding [resource/*model-scope* (assoc resource/*model-scope* :dispatch-owner owner)
+                      resource/*dispatch-bound* 0M
+                      gateway/*request-fn* (fn [_] (deliver entered true) @release {:status 200})]
+              (resource/with-dispatch-accounting
+                (reset! child (future @start (gateway/request! request)))
+                (when start-before-exit?
+                  (deliver start true)
+                  (is (= true (deref entered 5000 :timeout)))))
+              (deliver start true)
+              (is (= true (deref entered 5000 :timeout)))
+              (let [state (resource/dispatch-accounting-state owner)]
+                (is (= :pending (:reservation-reconciliation state)))
+                (is (= 1 (count (:calls state)))))
+              (deliver release true)
+              (is (= 200 (:status (deref @child 5000 nil))))
+              (resource/reconcile-dispatch-owner! owner)
+              (is (= :complete (:reservation-reconciliation (resource/dispatch-accounting-state owner)))))
+            (finally (deliver start true) (deliver release true)
+                     (when @child (deref @child 5000 nil)))))))))
+
 (deftest the-answer-settles-its-reservation-and-the-charge-draws-on-it
   (with-funded-run
     2M 1000000M

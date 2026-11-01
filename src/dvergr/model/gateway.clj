@@ -88,19 +88,45 @@
                     (assoc :headers (merge headers (:headers auth))))
        :auth auth})))
 
-(defn- dispatch! [request]
+(defn- dispatch-accounted! [request]
   ;; a funded dispatch reserves its bound first, then spends its admission;
   ;; both are refused before anything leaves (doc/design/runs-as-worlds.md)
-  (resource/reserve-dispatch!)
-  (try (resource/admit-model-dispatch!)
-       (catch Throwable e (resource/dispatch-status! :refused) (throw e)))
-  (let [response (*request-fn* request)
-        _ (resource/dispatch-status! (:status response))]
-    (when (and resource/*model-scope* (<= 300 (:status response) 399))
-      (close-body! response)
-      (throw (ex-info "Governed model dispatch does not follow redirects"
-                      {:type ::redirect-not-supported :status (:status response)})))
-    response))
+  (let [dispatch (resource/reserve-dispatch!)]
+    (binding [resource/*dispatch-id* (:id dispatch)]
+      (try (resource/admit-model-dispatch!)
+           (catch Throwable e
+             (try (resource/dispatch-status! :refused)
+                  (catch Throwable cleanup (.addSuppressed e cleanup)))
+             (throw e)))
+      (resource/dispatch-entered!)
+      (let [response (*request-fn* request)
+            _ (try (resource/dispatch-status! (:status response))
+                   (catch Throwable error
+                     (try (close-body! response)
+                          (catch Throwable cleanup (.addSuppressed error cleanup)))
+                     (throw error)))]
+        (when (and resource/*model-scope* (<= 300 (:status response) 399))
+          (close-body! response)
+          (throw (ex-info "Governed model dispatch does not follow redirects"
+                          {:type ::redirect-not-supported :status (:status response)})))
+        response))))
+
+(defn- dispatch! [request]
+  (if (and (:dispatch-owner resource/*model-scope*) (not (resource/reusable-dispatch-call?)))
+    (let [response (volatile! nil)]
+      (try
+        (resource/with-dispatch-accounting
+          (let [value (dispatch-accounted! request)]
+            (vreset! response value)
+            value))
+        (catch Throwable error
+          ;; A raw gateway call may fail its final accounting after receiving
+          ;; a successful response, before ownership reaches its consumer.
+          (when-let [value @response]
+            (try (close-body! value)
+                 (catch Throwable cleanup (.addSuppressed error cleanup))))
+          (throw error))))
+    (dispatch-accounted! request)))
 
 (defn- governed-client [request]
   (if-not resource/*model-scope*
