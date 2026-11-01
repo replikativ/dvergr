@@ -3,6 +3,7 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [dvergr.agent.run :as run]
+            [dvergr.agent.invocations :as invocations]
             [dvergr.sandbox.extensions :as extensions]))
 
 (def host-option-keys [:experiment-capabilities :delegation-policy])
@@ -30,6 +31,8 @@
   "Check before any Run, world or wallet admission. Missing policy preserves
    trusted legacy callers; an explicit policy must enumerate all three grants."
   [agent host-options]
+  (when (contains? host-options :experiment-capabilities)
+    (invocations/refs (:experiment-capabilities host-options)))
   (when (contains? host-options :delegation-policy)
     (let [{:keys [tools sandboxes providers] :as policy}
           (validate-policy! (:delegation-policy host-options))]

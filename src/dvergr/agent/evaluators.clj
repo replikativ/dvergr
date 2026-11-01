@@ -8,7 +8,8 @@
    registered here (the wiki benchmark sets' checkers and fixtures,
    `dvergr.catalog`; the workflow completion check, `dvergr.agent.workflow`),
    and one naming anything else is refused before any Run starts."
-  (:require [dvergr.agent.evaluation :as evaluation]))
+  (:require [dvergr.agent.evaluation :as evaluation]
+            [dvergr.agent.invocations :as invocations]))
 
 (defonce ^:private registry (atom {:evaluators {} :world-setups {}}))
 
@@ -32,8 +33,9 @@
    ordinary host catalog for existing callers."
   ([] (offered @registry))
   ([scope]
-   {:evaluators (vec (keys (:evaluators scope)))
-    :world-setups (vec (keys (:world-setups scope)))}))
+   (cond-> {:evaluators (vec (keys (:evaluators scope)))
+            :world-setups (vec (keys (:world-setups scope)))}
+     (contains? scope :invocations) (assoc :invocations (vec (invocations/refs scope))))))
 (defn world-setup [ref] (get-in @registry [:world-setups ref]))
 
 (defn- environments [experiment]
