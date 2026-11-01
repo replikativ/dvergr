@@ -80,7 +80,7 @@
                                             (instance? Throwable value) (assoc :error (ex-message value)))))
                       (finally (deliver settled true)))))]
              {:run/id (:id job)
-              ::program/on-settled! (fn [acknowledge!] (threads/future @settled (acknowledge!)))
+              ::program/on-settled! (fn [acknowledge!] (threads/native-future @settled (acknowledge!)))
               ::program/cancel! #(run/cancel-room-run! (:id control-room) (:id job))}))
          handle (if-let [own! (:own-child! authority)] (own! admit!) (admit!))
          id (:run/id handle)]

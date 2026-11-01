@@ -941,3 +941,44 @@
           other (first (remove #{r} rooms))]
       (is (= w (:review/world (store/-load-review st r id))) "the winner's Review, in the winner's room")
       (is (nil? (store/-load-review st other id)) "not moved to another room"))))
+
+(deftest family-return-witness-contract
+  (let [[conn st] (mem-store)]
+    (try (contract/assert-family-return-witness! st :family-datahike)
+         (finally (dh/release conn)))))
+
+(deftest serialized-run-validation-refuses-a-delayed-admission-after-terminal-fence
+  (let [[conn st] (mem-store)
+        room-id :delayed-start now (java.util.Date. 1000)
+        base {:run/id (random-uuid) :run/kind :agent-task :run/room room-id :run/actor :test
+              :run/trigger (random-uuid) :run/status :running
+              :run/created-at now :run/started-at now :run/updated-at now}]
+    (try
+      (store/-store-room! st room-id {:slug "delayed-start"})
+      (store/-store-run! st room-id base)
+      (let [chat-id (dh/q '[:find ?id . :where [?c :room/slug "delayed-start"] [?c :chat/id ?id]] @conn)
+            ;; This is the exact admission command already constructed before
+            ;; a later terminal fence, deliberately bypassing client pre-reads.
+            delayed [[:db.fn/call @#'dhs/store-run-tx chat-id base now]]
+            terminal (assoc base :run/status :failed :run/ended-at now :run/reason :admission-failed)]
+        (store/-store-run! st room-id terminal)
+        (is (thrown? Exception (dh/transact conn delayed)))
+        (is (= terminal (store/-load-run st room-id (:run/id base)))))
+      (finally (dh/release conn)))))
+
+(deftest serialized-run-validation-refuses-another-conversations-identity
+  (let [[conn st] (mem-store) now (java.util.Date. 1000)
+        base {:run/id (random-uuid) :run/kind :agent-task :run/room :identity-origin :run/actor :test
+              :run/trigger (random-uuid) :run/status :running
+              :run/created-at now :run/started-at now :run/updated-at now}]
+    (try
+      (store/-store-room! st :identity-origin {:slug "identity-origin"})
+      (store/-store-room! st :identity-other {:slug "identity-other"})
+      (store/-store-run! st :identity-origin base)
+      (let [other-chat (dh/q '[:find ?id . :where [?c :room/slug "identity-other"] [?c :chat/id ?id]] @conn)]
+        (is (thrown? Exception
+                     (dh/transact conn [[:db.fn/call @#'dhs/store-run-tx other-chat
+                                         (assoc base :run/room :identity-other) now]])))
+        (is (= base (store/-load-run st :identity-origin (:run/id base))))
+        (is (nil? (store/-load-run st :identity-other (:run/id base)))))
+      (finally (dh/release conn)))))

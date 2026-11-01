@@ -6,6 +6,8 @@
    by snapshots, lifecycle events, or the Room store."
   (:require [clojure.edn]
             [dvergr.chat.context :as chat-ctx]
+            [dvergr.agent.run.family :as family]
+            [org.replikativ.spindel.engine.impl.simple :as simple]
             [dvergr.room.store :as store]
             [org.replikativ.spindel.engine.core :as ec]
             [taoensso.telemere :as tel]))
@@ -210,7 +212,234 @@
         (ec/swap-state! (admission-path (:id room)) (constantly :open)))
       true)))
 
-(defn start!
+;; Child admissions belong to this existing Run registry. Their semantic
+;; transitions are pure; native references and callbacks never enter Room state.
+(def ^:dynamic *child-admission* nil)
+
+(declare cancel-room-run! with-owned-child! start!)
+
+(defn- family-entry! [room parent]
+  (let [entry (get @active parent)]
+    (when-not (and entry (= (:id room) (get-in entry [:run :run/room]))
+                   (identical? (:ctx room) (:execution-context entry)))
+      (throw (ex-info "Parent Run has no original live family owner"
+                      {:type ::family-owner-unavailable :run/id parent})))
+    entry))
+
+(defn- change-family! [parent owner f]
+  (locking lifecycle-lock
+    (let [entry (get @active parent)]
+      (when-not (and entry (identical? owner (:native-owner entry)))
+        (throw (ex-info "Child admission owner changed" {:type ::family-owner-unavailable :run/id parent})))
+      (let [changed (f (:family entry))
+            ;; Native leases without an adapter hook release with bookkeeping
+            ;; alone. No arbitrary callback executes under this frontier.
+            next (reduce (fn [state [token value]]
+                           (if (and (family/releasable? value) (nil? (:on-release value)))
+                             (-> state (family/releasing token) (family/released token)) state))
+                         changed (:leases changed))
+            signal (:family-signal entry)]
+        (swap! active update parent assoc :family next :family-signal (promise))
+        (deliver signal true)
+        next))))
+
+(defn- current-admission? [room parent]
+  (locking lifecycle-lock
+    (let [entry (get @active parent) marker *child-admission*]
+      (and marker entry (= parent (:parent marker))
+           (identical? (:ctx room) (:execution-context entry))
+           (identical? (:ctx room) (:context marker))
+           (identical? (:owner marker) (:native-owner entry))
+           (contains? (get-in entry [:family :leases]) (:token marker))))))
+
+(defn seal-family!
+  "Close new child admission without waiting. Existing reservations remain
+   owned; this is a native Run-family fence, not a Spindel world fence."
+  [room parent]
+  (let [owner (locking lifecycle-lock (:native-owner (family-entry! room parent)))]
+    (change-family! parent owner family/seal))
+  nil)
+
+(defn- family-guard! [entry]
+  (when-not (family/quiescent? (:family entry))
+    (throw (ex-info "Run still owns child admissions or executions"
+                    {:type ::family-pending :run/id (get-in entry [:run :run/id])}))))
+
+(defn- claim-child! [room parent child-id]
+  (when-not (current-admission? room parent)
+    (throw (ex-info "Structural child has no original admission lease"
+                    {:type ::child-admission-required :run/id child-id :parent parent})))
+  (let [{:keys [owner token]} *child-admission*]
+    (change-family! parent owner #(family/claim % token child-id))))
+
+(defn call-with-child-admission!
+  "Acquire/consume an original parent lease BEFORE a child creates a world,
+   moves a grant, or constructs work. An inherited consumed marker cannot
+   admit a second child. `f` receives this admission's fixed child UUID."
+  [room parent child-id f]
+  (if-not parent
+    (binding [*child-admission* nil] (f child-id))
+    (if (and (current-admission? room parent)
+             (= :reserved (get-in @active [parent :family :leases (:token *child-admission*) :phase]))
+             (not (get-in @active [parent :family :leases (:token *child-admission*) :callback-exited?])))
+      (do (claim-child! room parent child-id) (f child-id))
+      (with-owned-child! room parent
+        #(do (claim-child! room parent child-id) (f child-id))))))
+
+(defn child-preparation-entered!
+  "Retain preparation ownership before creating a child's native work plane."
+  []
+  (when-let [{:keys [parent owner token]} *child-admission*]
+    (change-family! parent owner #(family/preparation-entered % token))))
+
+(defn retain-child-preparation!
+  "Retain the original idempotent constructor cleanup before native effects.
+   Only failed pre-admission HOST recovery may invoke this private callback."
+  [cleanup!]
+  (when-let [{:keys [parent owner token]} *child-admission*]
+    (change-family! parent owner
+                    #(do (when-not (= :preparing (:phase (family/lease % token)))
+                           (throw (ex-info "Preparation no longer owns construction" {:type ::stale-preparation})))
+                         (assoc-in % [:leases token :preparation-cleanup!] cleanup!)))))
+
+(defn child-preparation-cleaned!
+  "Acknowledge successful physical cleanup of a failed pre-admission plane."
+  []
+  (when-let [{:keys [parent owner token]} *child-admission*]
+    (change-family! parent owner #(family/preparation-cleaned % token))))
+
+(defn- begin-child-start! [room parent child-id command]
+  (when parent
+    (when-not (current-admission? room parent)
+      (throw (ex-info "Structural child requires a live original admission lease"
+                      {:type ::child-admission-required :run/id child-id :parent parent})))
+    (let [{:keys [owner token]} *child-admission*]
+      ;; Direct native Run creation can consume a reserved lease here. Public
+      ;; programming boundaries consume it earlier, before native preparation.
+      (change-family! parent owner
+                      #(let [value (family/lease % token)
+                             claimed (if (= :reserved (:phase value)) (family/claim % token child-id) %)]
+                         (-> (family/starting claimed token child-id)
+                             (assoc-in [:leases token :start-command] command)
+                             (assoc-in [:leases token :start-fence]
+                                       (assoc command :run/status :failed
+                                              :run/ended-at (:run/updated-at command)
+                                              :run/reason :admission-failed))))))))
+
+(defn- child-started! [room parent child-id]
+  (when parent
+    (let [{:keys [owner token]} *child-admission*
+          key [::child-family owner token]]
+      (change-family! parent owner #(family/admitted % token child-id))
+      ;; Snapshot + notifications share the lifecycle frontier. The callback
+      ;; performs bookkeeping only; adapter hooks run on an external joiner.
+      (watch-runs!
+       key
+       (fn [{:keys [type runs run]}]
+         (when (or (and (= :runs/snapshot type) (not-any? #(= child-id (:run/id %)) runs))
+                   (and (= :run/finished type) (= child-id (:run/id run))))
+           (change-family! parent owner #(family/child-returned % token child-id))
+           (unwatch-runs! key)))))))
+
+(defn- replay-child-cancellation! [room parent child-id]
+  (when parent
+    (when (get-in @active [parent :family :leases (:token *child-admission*) :cancelled?])
+      (cancel-room-run! (:id room) child-id))))
+
+(defn cancel-family!
+  "Seal the original family and forward sticky cancellation outside its lock."
+  [room parent]
+  (when-let [owner (locking lifecycle-lock
+                     (when (get @active parent) (:native-owner (family-entry! room parent))))]
+    (let [state (change-family! parent owner family/cancel)]
+      (doseq [[_ value] (:leases state)
+              :when (= :admitted (:phase value))]
+        (cancel-room-run! (:id room) (:child-id value)))))
+  nil)
+
+(defn require-child-publication!
+  "Register an optional publication edge before the admission callback exits."
+  []
+  (let [{:keys [parent owner token]} *child-admission*]
+    (change-family! parent owner #(family/require-publication % token))
+    (fn []
+      (locking lifecycle-lock
+        (when (and (identical? owner (:native-owner (get @active parent)))
+                   (get-in @active [parent :family :leases token]))
+          (change-family! parent owner #(family/publication-acknowledged % token)))))))
+
+(defn with-family-admission!
+  "Original native owner implementation, shared by program and Job adapters.
+   Native release hooks must be idempotent bookkeeping, with no external effect.
+   Hooks execute only on a HOST joiner, outside all lifecycle/Run/Room locks."
+  [room parent f & [{:keys [on-reserve on-release]}]]
+  (let [token (random-uuid)
+        owner (locking lifecycle-lock
+                (let [entry (family-entry! room parent)]
+                  (when (or @(:cancelled? entry) (finish-statuses (get-in entry [:run :run/status])))
+                    (throw (ex-info "Parent Run is no longer admitting children" {:type ::family-sealed :run/id parent})))
+                  (:native-owner entry)))
+        marker {:parent parent :owner owner :token token :context (:ctx room)}]
+    (change-family! parent owner
+                    #(-> (family/reserve % token)
+                         (assoc-in [:leases token :on-release] on-release)))
+    (binding [*child-admission* marker]
+      (try
+        (when on-reserve (on-reserve token))
+        (f)
+        (catch Throwable error
+          (change-family! parent owner
+                          #(-> % (assoc-in [:leases token :admission-error] error)
+                               (assoc-in [:leases token :recovery-revision] (random-uuid))))
+          (throw error))
+        (finally
+          ;; No return-value inference: run/start! recorded the actual child.
+          ;; A callback exception after admission still owns that child.
+          (change-family! parent owner #(family/callback-exited % token)))))))
+
+(defn await-family!
+  "HOST join of the original native Run family. Seals admission, then waits
+   for callback/preparation and child release, driving only native bookkeeping
+   hooks. Never call while holding an engine drain or any Run/Room/owner lock."
+  [room parent]
+  (when (or (simple/on-drain-thread?) (.get held-run) (Thread/holdsLock lifecycle-lock)
+            (pos? (.getReadHoldCount (room-lock (:id room))))
+            (.isWriteLockedByCurrentThread (room-lock (:id room))))
+    (throw (ex-info "Run family join requires an external unlocked HOST thread" {:type ::family-join-under-lock})))
+  (let [owner (locking lifecycle-lock (:native-owner (family-entry! room parent)))]
+    (change-family! parent owner family/seal)
+    (loop []
+      (let [{:keys [done? claim signal]}
+            (locking lifecycle-lock
+              (let [entry (family-entry! room parent)
+                    state (:family entry)
+                    ready (some (fn [[token value]] (when (family/releasable? value) [token value])) (:leases state))]
+                (cond
+                  (family/quiescent? state) {:done? true}
+                  ready
+                  (let [[token value] ready]
+                    (change-family! parent owner #(family/releasing % token))
+                    {:claim [token value]})
+                  :else {:signal (:family-signal entry)})))]
+        (cond
+          done? nil
+          claim
+          (let [[token value] claim
+                error (try (when-let [release! (:on-release value)] (release! token)) nil
+                           (catch Throwable t t))]
+            (if error
+              (do
+                ;; Only idempotent native reference-release adapters are retried;
+                ;; no provider, world, publication or money operation lives here.
+                (change-family! parent owner
+                                #(-> % (assoc-in [:leases token :phase] (:phase value))
+                                     (assoc-in [:leases token :release-error] error)))
+                (try (Thread/sleep 25) (catch InterruptedException _)))
+              (change-family! parent owner #(family/released % token)))
+            (recur))
+          :else (do @signal (recur)))))))
+
+(defn- start-unowned!
   "Persist and publish one live Run before execution begins.
 
    `trigger` is the precise triggering message (or its UUID). `:parent` is
@@ -220,7 +449,7 @@
    admission. Returns the public Run map."
   ([room actor trigger live-chat-ctx]
    (start! room actor trigger live-chat-ctx {}))
-  ([room actor trigger live-chat-ctx {:keys [id kind parent caused-by now provenance]
+  ([room actor trigger live-chat-ctx {:keys [id kind parent caused-by now provenance native-controls]
                                       :or {kind :agent-turn}}]
    (when-let [unknown (seq (remove provenance-keys (keys provenance)))]
      (throw (ex-info "Run provenance may not override causal identity"
@@ -245,6 +474,9 @@
                       provenance))
          entry      {:run run
                      :execution-context (:ctx room)
+                     :native-owner (Object.)
+                     :family (family/empty-family)
+                     :family-signal (promise)
                      :chat-ctx live-chat-ctx
                      ;; Explicitly process-local control state. Durable meaning
                      ;; is the Room-store Run projection; this live owner map
@@ -254,7 +486,10 @@
                      ;; Process-local callbacks let an interpreter abort native
                      ;; workers as soon as cancellation is requested. They are
                      ;; control capabilities, never durable Run state.
-                     :cancel-hooks {}
+                     :cancel-hooks (or (:cancel-hooks native-controls) {})
+                     :own-child! (:own-child! native-controls)
+                     :settlement-observer (:settlement-observer native-controls)
+                     :settlement-reconciler (:settlement-reconciler native-controls)
                      :store (:store room)
                      :store-room-id (store/conversation-id room)}]
      (call-with-run-lock (:run/room run) (:run/id run) (fn []
@@ -266,6 +501,7 @@
                                                                            {:type ::room-admission-closed
                                                                             :run/id (:run/id run)
                                                                             :run/room (:id room)})))
+                                                         (begin-child-start! room parent (:run/id run) run)
        ;; Persistence is inside the same admission critical section as the
        ;; fence check: teardown can see either no Run or the fully admitted Run,
        ;; never a durable-but-unowned half-admission.
@@ -277,8 +513,27 @@
                                                                               :run/room (:id room)}))))
                                                          (locking lifecycle-lock
                                                            (swap! active assoc (:run/id run) entry)
-                                                           (notify! {:type :run/started :run run}))))
+                                                           (notify! {:type :run/started :run run})
+                                                           (child-started! room parent (:run/id run)))))
+     (replay-child-cancellation! room parent (:run/id run))
      run)))
+
+(defn start!
+  "Admit one native Run. Direct structural children acquire the same original
+   family lease as programming/Job boundaries; closed parents fail before IO."
+  ([room actor trigger live-chat-ctx] (start! room actor trigger live-chat-ctx {}))
+  ([room actor trigger live-chat-ctx opts]
+   (let [id (or (:id opts) (random-uuid)) parent (:parent opts)
+         current? (and parent (current-admission? room parent)
+                       (#{:reserved :preparing}
+                        (get-in @active [parent :family :leases (:token *child-admission*) :phase])))]
+     (if (or (nil? parent) current?)
+       (if parent
+         (start-unowned! room actor trigger live-chat-ctx (assoc opts :id id))
+         (binding [*child-admission* nil]
+           (start-unowned! room actor trigger live-chat-ctx (assoc opts :id id))))
+       (call-with-child-admission!
+        room parent id #(start-unowned! room actor trigger live-chat-ctx (assoc opts :id %)))))))
 
 (defn record-cause!
   "Durably add `cause-run-id` to the causal inputs observed by a live Run.
@@ -327,10 +582,15 @@
                      {:type ::invalid-finish-status :status status :run-id run-id})))
    (with-run-lock run-id
      (when-let [entry (get @active run-id)]
+       (let [owner (:native-owner entry)]
+         (change-family! run-id owner family/seal)
+         (family-guard! (get @active run-id)))
        (let [now (or now (java.util.Date.))
              run (cond-> (assoc (:run entry)
                                 :run/status status
                                 :run/updated-at now)
+                   (:store entry)
+                   (assoc :run/family-return-ack (store/family-return-ack-id run-id))
                    (contains? store/terminal-run-statuses status)
                    (assoc :run/ended-at now)
                    reason (assoc :run/reason reason)
@@ -385,7 +645,11 @@
                 "Run finish refused; retrying off the caller's thread")
       (retry-in-background! (str "dvergr-run-finish-" run-id)
                             #(contains? @active run-id)
-                            #(finish! run-id status opts)
+                            #(do
+                               (when-let [entry (get @active run-id)]
+                                 (await-family! {:id (get-in entry [:run :run/room])
+                                                 :ctx (:execution-context entry)} run-id))
+                               (finish! run-id status opts))
                             {:run/id run-id :run/status status})
       nil)))
 
@@ -417,6 +681,9 @@
                      {:type ::invalid-finish-status :status status :run-id run-id})))
    (with-run-lock run-id
      (when-let [entry (get @active run-id)]
+       (let [owner (:native-owner entry)]
+         (change-family! run-id owner family/seal)
+         (family-guard! (get @active run-id)))
        ;; Exactly one settlement path owns result publication. A graph callback
        ;; racing the normal Spin sees this retained terminal state and yields.
        (when-not (contains? finish-statuses (get-in entry [:run :run/status]))
@@ -424,6 +691,8 @@
                run (cond-> (assoc (:run entry)
                                   :run/status status
                                   :run/updated-at now)
+                     (:store entry)
+                     (assoc :run/family-return-ack (store/family-return-ack-id run-id))
                      (contains? store/terminal-run-statuses status)
                      (assoc :run/ended-at now)
                      reason (assoc :run/reason reason)
@@ -445,6 +714,7 @@
   [run-id]
   (with-run-lock run-id
     (when-let [entry (get @active run-id)]
+      (family-guard! entry)
       (let [run (:run entry)]
         (when-not (contains? finish-statuses (:run/status run))
           (throw (ex-info "Cannot release a non-finished Run"
@@ -463,6 +733,7 @@
   [run-id publish! result]
   (with-run-lock run-id
     (when-let [entry (get @active run-id)]
+      (family-guard! entry)
       (let [run (:run entry)]
         (when-not (contains? finish-statuses (:run/status run))
           (throw (ex-info "Cannot publish a non-finished Run"
@@ -516,7 +787,9 @@
    and synchronizes the live projection without replaying cleanup."
   [room run-id stage]
   (let [attribute (get store/job-cleanup-attributes stage)
-        ack (store/job-cleanup-ack-id run-id stage)]
+        ack (store/job-cleanup-ack-id run-id stage)
+        attributes {attribute ack :run/family-return-ack (store/family-return-ack-id run-id)}
+        confirmed? (fn [value] (= attributes (select-keys value (keys attributes))))]
     (with-run-lock run-id
       (let [entry (get @active run-id)]
         (when-not (and entry (= (:id room) (get-in entry [:run :run/room]))
@@ -524,17 +797,19 @@
                        (identical? (:store room) (:store entry)))
           (throw (ex-info "Job cleanup acknowledgement has no original live owner"
                           {:type ::cleanup-owner-unavailable :run/id run-id})))
+        (change-family! run-id (:native-owner entry) family/seal)
+        (family-guard! (get @active run-id))
         (binding [ec/*execution-context* (:ctx room)]
           (let [st (:store entry) conversation (:store-room-id entry)
                 durable (store/-load-run st conversation run-id)]
             (when-not durable
               (throw (ex-info "Job cleanup owner is not durable" {:type ::run-not-found :run/id run-id})))
-            (when-not (store/job-cleanup-acknowledged? durable stage)
-              (when-not (store/-store-run! st conversation (assoc durable attribute ack :run/updated-at (java.util.Date.)))
+            (when-not (confirmed? durable)
+              (when-not (store/-store-run! st conversation (merge durable attributes {:run/updated-at (java.util.Date.)}))
                 (throw (ex-info "Job cleanup acknowledgement was not durable"
                                 {:type ::cleanup-ack-unconfirmed :run/id run-id :stage stage}))))
             (let [confirmed (store/-load-run st conversation run-id)]
-              (when-not (store/job-cleanup-acknowledged? confirmed stage)
+              (when-not (confirmed? confirmed)
                 (throw (ex-info "Job cleanup acknowledgement was not confirmed"
                                 {:type ::cleanup-ack-unconfirmed :run/id run-id :stage stage})))
               (locking lifecycle-lock
@@ -542,7 +817,7 @@
                 ;; this Run's persistence lock. Repair only the confirmed ACK
                 ;; fields; never replace a concurrent :cancelling projection.
                 (swap! active update-in [run-id :run]
-                       merge (select-keys confirmed (vals store/job-cleanup-attributes))))
+                       merge (select-keys confirmed store/native-run-ack-attributes)))
               ack)))))))
 
 (defn record-savepoint!
@@ -867,6 +1142,8 @@
                   (swap! active assoc run-id entry')
                   (notify! {:type :run/cancel-requested :run (public-entry entry')})
                   entry')))))]
+    (when entry
+      (cancel-family! {:id (get-in entry [:run :run/room]) :ctx (:execution-context entry)} run-id))
     ;; Never invoke interpreter code under lifecycle-lock: a hook may settle the
     ;; Run, which takes the same lock. Repeated requests re-invoke idempotent
     ;; hooks so a worker registered concurrently with the first request is not
@@ -894,37 +1171,108 @@
 (defn register-settlement-observer!
   "Attach read-only facts from the original native owner. Private callbacks
    are never persisted, forked, or returned by Run snapshots."
-  [room run-id observe]
+  [room run-id observe & [reconcile]]
   (locking lifecycle-lock
     (when-let [entry (get @active run-id)]
       (when (and (= (:id room) (get-in entry [:run :run/room]))
                  (identical? (:ctx room) (:execution-context entry)))
-        (swap! active assoc-in [run-id :settlement-observer] observe)
+        (swap! active update run-id assoc :settlement-observer observe :settlement-reconciler reconcile)
         true))))
 
 (defn observe-settlement
-  "HOST read-only native facts for this exact live Room incarnation. Absence
-   of a process-local owner is unknown, not a durable completion witness."
+  "HOST read-only facts for this exact live Room incarnation. Missing native
+   owner is unknown, not a durable acknowledgement of any family obligation."
   [room run-id]
-  (let [observe (locking lifecycle-lock
-                  (let [entry (get @active run-id)]
-                    (when (and (= (:id room) (get-in entry [:run :run/room]))
-                               (identical? (:ctx room) (:execution-context entry)))
-                      (:settlement-observer entry))))]
-    (if observe (observe)
-        {:reservation-reconciliation :unknown :usage-consumption :not-established})))
+  (let [entry (locking lifecycle-lock
+                (let [value (get @active run-id)]
+                  (when (and (= (:id room) (get-in value [:run :run/room]))
+                             (identical? (:ctx room) (:execution-context value))) value)))
+        facts (if-let [observe (:settlement-observer entry)] (observe)
+                      {:reservation-reconciliation :unknown :usage-consumption :not-established})]
+    (assoc facts :family
+           (if-not (and entry (family/valid? (:family entry))) {:admission :unknown :return :unknown}
+                   {:admission (if (get-in entry [:family :sealed?]) :sealed :open)
+                    :return (if (family/quiescent? (:family entry)) :acknowledged :pending)
+                    :leases (mapv (fn [[token value]]
+                                    (assoc (select-keys value [:phase :child-id :callback-exited? :child-returned?
+                                                               :preparation-safe? :publication-acknowledged? :cancelled?])
+                                           :token token :kind :child-admission
+                                           :revision (:recovery-revision value)
+                                           :recovery-running? (boolean (:recovery-running? value))
+                                           :error-type (:type (ex-data (or (:admission-error value) (:release-error value))))
+                                           :error-class (some-> (or (:admission-error value) (:release-error value)) class .getName)))
+                                  (get-in entry [:family :leases]))}))))
+
+(defn- reconcile-child-admission! [room parent expected]
+  (let [token (:token expected)
+        owner (locking lifecycle-lock (:native-owner (family-entry! room parent)))
+        claimed (change-family!
+                 parent owner
+                 (fn [state]
+                   (let [value (family/lease state token)]
+                     (when-not (and (uuid? (:revision expected))
+                                    (= (:revision expected) (:recovery-revision value))
+                                    (= (:phase expected) (:phase value))
+                                    (#{:preparing :starting} (:phase value))
+                                    (:callback-exited? value) (not (:recovery-running? value)))
+                       (throw (ex-info "Child admission recovery changed" {:type ::stale-child-recovery})))
+                     (assoc-in state [:leases token :recovery-running?] true))))
+        value (family/lease claimed token)]
+    (try
+      (when (= :starting (:phase value))
+        ;; Persistence and disposal are outside all native lifecycle locks. The
+        ;; original callback has returned; an executing child is never disposed.
+        (when (get @active (:child-id value))
+          (throw (ex-info "Child admission already has an executing owner" {:type ::child-already-admitted})))
+        (let [fence (:start-fence value) st (:store room) cid (store/conversation-id room)]
+          (when-not (and st fence (store/-store-run! st cid fence)
+                         (= fence (store/-load-run st cid (:child-id value))))
+            (throw (ex-info "Failed admission fence is not acknowledged" {:type ::admission-fence-unconfirmed})))
+          (change-family! parent owner #(family/admission-fenced % token (:child-id value)))))
+      (when-not (:preparation-safe? value)
+        (if-let [cleanup! (:preparation-cleanup! value)]
+          (cleanup!)
+          (throw (ex-info "Original preparation cleanup is unavailable" {:type ::preparation-owner-unavailable}))))
+      (when-let [fence (:start-fence value)]
+        (when (:run/world fence)
+          (let [final (assoc fence :run/settlement-status :discarded :run/settlement-reason :admission-failed)
+                st (:store room) cid (store/conversation-id room)]
+            (when-not (and (store/-store-run! st cid final)
+                           (= final (store/-load-run st cid (:child-id value))))
+              (throw (ex-info "Disposed admission projection is not acknowledged" {:type ::admission-disposal-unconfirmed}))))))
+      (change-family! parent owner
+                      #(-> (family/preparation-cleaned % token)
+                           (update-in [:leases token] dissoc :recovery-running? :recovery-revision)))
+      nil
+      (catch Throwable error
+        (change-family! parent owner
+                        #(-> % (assoc-in [:leases token :recovery-running?] false)
+                             (assoc-in [:leases token :recovery-revision] (random-uuid))
+                             (assoc-in [:leases token :admission-error] error)))
+        (throw error)))))
+
+(defn reconcile-settlement!
+  "HOST-only advance of an original native owner's supported held obligation.
+   Expected launch/phase tokens are coordination facts, never permission. No
+   new inference, grant, worker code or replacement Room may be supplied."
+  [room run-id expected]
+  (when (or (simple/on-drain-thread?) (.get held-run) (Thread/holdsLock lifecycle-lock))
+    (throw (ex-info "Native settlement recovery requires an unlocked HOST worker" {:type ::engine-thread})))
+  (binding [ec/*execution-context* (:ctx room) ec/*spin-id* nil simple/*in-drain?* false]
+    (if (= :child-admission (:kind expected))
+      (reconcile-child-admission! room run-id expected)
+      (let [reconcile (locking lifecycle-lock (:settlement-reconciler (family-entry! room run-id)))]
+        (when-not reconcile
+          (throw (ex-info "Original native owner has no supported recovery adapter" {:type ::recovery-unavailable})))
+        (reconcile expected)))))
 
 (defn with-owned-child!
-  "Admit a child under a live parent Run's executor. The executor reserves
-   ownership before admission and rejects admission after cancellation/seal."
+  "Admit under the original live native Run family. Program supervisors attach
+   their existing preparation/cleanup hooks; Jobs use the same canonical lease."
   [room run-id admit-child!]
-  (let [owner (locking lifecycle-lock
-                (let [entry (get @active run-id)]
-                  (when (= (:id room) (get-in entry [:run :run/room]))
-                    (:own-child! entry))))]
-    (when-not owner
-      (throw (ex-info "Parent Run has no live child supervisor" {:run/id run-id})))
-    (owner admit-child!)))
+  (let [owner (locking lifecycle-lock (:own-child! (family-entry! room run-id)))]
+    (if owner (owner admit-child!)
+        (with-family-admission! room run-id admit-child!))))
 
 (defn register-cancel-hook!
   "Register process-local `f` for targeted cancellation of a live Run. If a

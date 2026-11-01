@@ -438,6 +438,19 @@
                 (= (job-cleanup-ack-id (:run/id run) stage)
                    (get run (get job-cleanup-attributes stage))))))
 
+(defn family-return-ack-id [run-id]
+  (when-not (uuid? run-id)
+    (throw (ex-info "Invalid family acknowledgement identity" {:type :room-store/invalid-family-ack})))
+  (java.util.UUID/nameUUIDFromBytes
+   (.getBytes (str "dvergr.run/family-return-v1/" run-id) java.nio.charset.StandardCharsets/UTF_8)))
+
+(defn family-return-acknowledged? [run]
+  (boolean (and (uuid? (:run/id run))
+                (= (family-return-ack-id (:run/id run)) (:run/family-return-ack run)))))
+
+(def native-run-ack-attributes
+  (conj (set (vals job-cleanup-attributes)) :run/family-return-ack))
+
 (def durable-run-keys
   #{:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
     :run/caused-by
@@ -445,7 +458,7 @@
     :run/reason :run/error
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason
-    :run/job-core-cleanup-ack :run/job-adapter-cleanup-ack
+    :run/job-core-cleanup-ack :run/job-adapter-cleanup-ack :run/family-return-ack
     :run/roster :run/agent-version :run/program-kind
     :run/interpreter-version :run/agent-def-hash :run/chat-id
     ;; the part the Run plays for its parent (dvergr.agent.budget)
@@ -488,6 +501,9 @@
     (throw (ex-info "Invalid durable run status"
                     {:type :room-store/invalid-run-status
                      :status (:run/status run) :run run})))
+  (when (and (contains? run :run/family-return-ack) (not (family-return-acknowledged? run)))
+    (throw (ex-info "Invalid native family return acknowledgement"
+                    {:type :room-store/invalid-family-ack :run-id (:run/id run)})))
   (doseq [[stage attr] job-cleanup-attributes :when (contains? run attr)]
     (when-not (job-cleanup-acknowledged? run stage)
       (throw (ex-info "Invalid native Job cleanup acknowledgement"
@@ -554,7 +570,7 @@
 (defn validate-run-update!
   "Reject an update that changes identity or removes durable causal evidence."
   [existing run]
-  (doseq [[_ attr] job-cleanup-attributes]
+  (doseq [attr native-run-ack-attributes]
     (when (or (and (nil? existing) (contains? run attr))
               (and (contains? existing attr) (not= (get existing attr) (get run attr))))
       (throw (ex-info "Native Job cleanup acknowledgements are append-only after admission"

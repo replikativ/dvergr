@@ -39,6 +39,27 @@
       (is (thrown? clojure.lang.ExceptionInfo
                    (put! (assoc agent :run/job-core-cleanup-ack (store/job-cleanup-ack-id other :core))))))))
 
+(defn assert-family-return-witness! [st room-id]
+  (store/-store-room! st room-id {:slug (name room-id)})
+  (doseq [kind [:agent-task :workflow]]
+    (let [id (random-uuid) now (java.util.Date. 1000)
+          base {:run/id id :run/kind kind :run/room room-id :run/actor :test
+                :run/trigger (random-uuid) :run/status :running
+                :run/created-at now :run/started-at now :run/updated-at now}
+          ack (assoc base :run/family-return-ack (store/family-return-ack-id id))
+          put! #(store/-store-run! st room-id %)]
+      (is (thrown? clojure.lang.ExceptionInfo (put! ack)))
+      (put! base)
+      (is (not (store/family-return-acknowledged? (store/-load-run st room-id id))))
+      (doseq [bad ["not-a-uuid" (random-uuid) (store/family-return-ack-id (random-uuid))]]
+        (is (thrown? clojure.lang.ExceptionInfo (put! (assoc base :run/family-return-ack bad)))))
+      (put! ack)
+      (put! ack)
+      (is (store/family-return-acknowledged? (store/-load-run st room-id id)))
+      (is (thrown? clojure.lang.ExceptionInfo (put! base)))
+      (put! (assoc ack :run/status :completed :run/ended-at now))
+      (is (store/family-return-acknowledged? (store/-load-run st room-id id))))))
+
 (defn assert-cross-room-scorecard-identity!
   "One certified Scorecard content identity has exactly one control Room owner."
   [st]

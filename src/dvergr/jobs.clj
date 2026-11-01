@@ -95,7 +95,8 @@
     ;; lifecycle/cleanup callbacks use the surviving control Room context.
     (binding [ec/*execution-context* (:ctx room)]
       (case stage
-        :before-finish (when before-finish (before-finish id status (or error value)))
+        :before-finish (do (run/await-family! room id)
+                           (when before-finish (before-finish id status (or error value))))
         :core-ack (run/acknowledge-job-cleanup! room id :core)
         :adapter-ack (run/acknowledge-job-cleanup! room id :adapter)
         :persist (do (run/retain-finished! id status opts) (retained-run! owner))
@@ -167,7 +168,8 @@
         (when-let [ack-stage ({:core-ack :core :adapter-ack :adapter} (:stage current))]
           (let [room (:room owner)
                 durable (binding [ec/*execution-context* (:ctx room)] (run/run room id))]
-            (when-not (store/job-cleanup-acknowledged? durable ack-stage)
+            (when-not (and (store/job-cleanup-acknowledged? durable ack-stage)
+                           (store/family-return-acknowledged? durable))
               (throw (ex-info "Job cleanup acknowledgement is not durable"
                               {:type ::cleanup-ack-unconfirmed :job id :stage (:stage current)})))
             ;; Lost ACK may have left the live Run cache stale. Confirm and
@@ -185,7 +187,7 @@
         (swap! state assoc :phase :held :error error :token (random-uuid))
         (throw error)))))
 
-(defn start!
+(defn- start-unowned!
   "Start `(work job-id)`, a Spin, as one durable Job Run. Work construction is
    synchronous, then its monitor waits off the engine drain. `:before-finish`
    joins physical work/returns resources before terminal persistence. `:settled`
@@ -195,7 +197,7 @@
    its active lease until explicit HOST recovery; :settled? remains false.
    :parent names a parent Run and :actor the owner (default :dvergr). `finish`
    observes the work value; `reason-of` supplies an optional reason keyword."
-  [room {:keys [kind parent ctx actor]} work & {:keys [finish settled reason-of before-finish]}]
+  [room {:keys [id kind parent ctx actor]} work & {:keys [finish settled reason-of before-finish]}]
   (when-not (satisfies? store/PRoomStore (:store room))
     (throw (ex-info "Jobs require a durable Room store" {:type ::durable-store-required})))
   (when-not (contains? kinds kind)
@@ -203,51 +205,66 @@
   (let [ctx (or ctx (:ctx room))
         r (binding [ec/*execution-context* (:ctx room)]
             (run/start! room (or actor :dvergr) (random-uuid) nil
-                        (cond-> {:kind kind} parent (assoc :parent parent))))
+                        (cond-> {:id id :kind kind} parent (assoc :parent parent))))
         id (:run/id r)
         owner {:id id :room room :done (promise) :state (atom {:phase :working})
                :before-finish before-finish :settled settled}]
     (swap! live assoc id owner)
+    (run/register-cancel-hook! id ::family #(run/cancel-family! room id))
     (try
+      (when (run/cancel-requested? id)
+        (throw (java.util.concurrent.CancellationException. "Job admission cancelled")))
       (let [spin (binding [ec/*execution-context* ctx] (work id))]
         (run/register-cancel-hook! id ::spin
                                    #(binding [ec/*execution-context* ctx]
                                       (spin-core/cancel-spin! spin)))
-        (threads/future
-          (binding [simple/*in-drain?* false ec/*spin-id* nil]
-            (let [[status value error reason]
-                  (try
-                    (let [value (binding [ec/*execution-context* ctx] @spin)]
-                      (when finish (finish value))
-                      [:completed value nil (when reason-of (reason-of value))])
-                    (catch Throwable error
-                      (if (run/cancel-requested? id)
-                        [:cancelled nil nil nil]
-                        [:failed nil error nil])))]
-              (finish-owned! owner status value error reason)))))
+        (threads/native-future
+         (binding [simple/*in-drain?* false ec/*spin-id* nil]
+           (let [[status value error reason]
+                 (try
+                   (let [value (binding [ec/*execution-context* ctx] @spin)]
+                     (when finish (finish value))
+                     [:completed value nil (when reason-of (reason-of value))])
+                   (catch Throwable error
+                     (if (run/cancel-requested? id)
+                       [:cancelled nil nil nil]
+                       [:failed nil error nil])))]
+             (finish-owned! owner status value error reason)))))
       (catch Throwable error
         ;; No monitor owns synchronous construction failure. The SAME staged
         ;; owner joins cleanup and adapter retirement exactly once here.
-        (finish-owned! owner :failed nil error nil)
+        (finish-owned! owner (if (run/cancel-requested? id) :cancelled :failed) nil error nil)
         (throw error)))
     (job room r)))
+
+(defn start!
+  "Start a durable Job under its original parent's admission lease. The lease
+   precedes work construction and survives exceptions after Run admission."
+  [room opts work & options]
+  (let [id (or (:id opts) (random-uuid))]
+    (run/call-with-child-admission!
+     room (:parent opts) id
+     (fn [_] (apply start-unowned! room (assoc opts :id id) work options)))))
 
 (defn- settlement-observation [room r]
   (let [id (:run/id r)]
     (when (and r (kinds (:run/kind r)))
-      (let [core? (store/job-cleanup-acknowledged? r :core)
+      (let [family? (store/family-return-acknowledged? r)
+            core? (store/job-cleanup-acknowledged? r :core)
             adapter? (store/job-cleanup-acknowledged? r :adapter)
             owner (get @live id)
             lease? (some #(= id (:run/id %)) (run/active-runs (:id room)))
             terminal? (contains? store/terminal-run-statuses (:run/status r))]
         {:id id :outcome (:run/status r)
+         :family-return (cond-> {:state (if family? :acknowledged (if owner :pending :unknown))}
+                          family? (assoc :ack (:run/family-return-ack r)))
          :core-cleanup (cond-> {:state (if core? :acknowledged (if owner :pending :unknown))}
                          core? (assoc :ack (:run/job-core-cleanup-ack r)))
          :adapter-cleanup (cond-> {:state (if adapter? :acknowledged (if owner :pending :unknown))}
                             adapter? (assoc :ack (:run/job-adapter-cleanup-ack r)))
          :owner-state (if owner :live :missing)
          :execution-lease (if lease? :held :absent)
-         :settled? (boolean (and terminal? core? adapter? (not owner) (not lease?)))}))))
+         :settled? (boolean (and terminal? family? core? adapter? (not owner) (not lease?)))}))))
 
 (defn observe-settlement
   "HOST facts for a Job in an explicit Room, including after restart. Native

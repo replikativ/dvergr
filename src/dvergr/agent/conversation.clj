@@ -110,7 +110,7 @@
   "Finish the episode Run: :completed when graded, :failed for an
    infrastructure fault (`reason` records it)."
   [run-id status reason]
-  (run/finish! run-id status (cond-> {} reason (assoc :reason reason))))
+  (run/finish-durably! run-id status (cond-> {} reason (assoc :reason reason))))
 
 ;; ---------------------------------------------------------------------------
 ;; Effect rows

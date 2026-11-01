@@ -22,6 +22,11 @@ trigger message
     └── output message
 ```
 
+Structural child admission, physical return and durable settlement evidence are
+specified in [Native Run families](design/native-run-family.md). Parent settlement
+waits for its admitted children and publication edges; terminal execution status
+alone is not that acknowledgement.
+
 ## Durable shape
 
 ```clojure

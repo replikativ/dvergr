@@ -32,6 +32,7 @@
             [dvergr.model.api.claude-code :as claude-code]
             [dvergr.resource :as resource]
             [dvergr.room.store :as room-store]
+            [dvergr.runtime.threads :as threads]
             [dvergr.system.rooms :as system-rooms]
             [dvergr.tools :as tools]
             [datahike.api :as dh]
@@ -50,9 +51,7 @@
             [taoensso.telemere :as tel])
   (:import [java.nio.charset StandardCharsets]
            [java.util UUID]
-           [java.util.concurrent Callable CountDownLatch Executors FutureTask
-            ThreadFactory]
-           [java.util.concurrent.atomic AtomicLong]))
+           [java.util.concurrent Callable CountDownLatch FutureTask]))
 
 (def run-sink
   "Reserved non-subscribed Room address for private Run inputs and outputs.
@@ -64,22 +63,7 @@
 
 (def ^:private default-max-model-steps 32)
 
-(defonce ^:private native-thread-counter (AtomicLong.))
-
-(defonce ^:private native-executor
-  ;; Clojure futures and send-off share Agent/soloExecutor. A finalization watcher
-  ;; blocks until its orchestration publishes an outcome, so using that same
-  ;; executor for the native worker which produces the outcome creates a
-  ;; scheduler-dependent deadlock when an embedder bounds or replaces the Agent
-  ;; executor. Dvergr owns this cached daemon pool as part of its process-local
-  ;; Run supervisor instead.
-  (Executors/newCachedThreadPool
-   (reify ThreadFactory
-     (newThread [_ runnable]
-       (doto (Thread. ^Runnable runnable)
-         (.setName (str "dvergr-agent-native-"
-                        (.incrementAndGet native-thread-counter)))
-         (.setDaemon true))))))
+(def ^:private native-executor threads/native-executor)
 
 (declare with-owned-child! cancel!)
 
@@ -133,7 +117,7 @@
       (f))
     (f)))
 
-(declare start-worker!)
+(declare start-worker! launch-owned-worker!)
 
 (defn- deadline-expired? [supervisor]
   (when-let [deadline (:deadline-nanos supervisor)]
@@ -171,6 +155,7 @@
                   :cleanup-error nil
                   :llm-metrics nil
                   :execution-phase :admitted
+                  :family-join-phase :unstarted
                   :quiesced? false})
     :quiesced (sync/deferred)
     :quiesced-latch (CountDownLatch. 1)}))
@@ -192,17 +177,20 @@
                  :as state}
                 @(:state supervisor)
                 normal-live? (or (seq children)
-                                 (some #(= :normal (:kind %)) (vals workers)))]
+                                 (and (:run-id supervisor) (not= :done (:family-join-phase state)))
+                                 (some #(#{:normal :family} (:kind %)) (vals workers)))]
             (cond
               (and sealed? cleanup-safe? (not normal-live?) (= :pending cleanup-phase)
                    (seq cleanups))
-              (let [cleanup (peek cleanups)]
+              (let [cleanup (peek cleanups)
+                    launch {:id (random-uuid) :worker-id (random-uuid) :kind :cleanup
+                            :callback cleanup :phase :selected}]
                 (swap! (:state supervisor)
                        #(-> %
                             (assoc :cleanup-admission-open? false
-                                   :cleanup-phase :running)
+                                   :cleanup-phase :running :cleanup-launch launch)
                             (update :cleanups pop)))
-                [:cleanup cleanup])
+                [:launch :cleanup-launch])
 
               (and sealed? cleanup-safe? (not normal-live?) (= :pending cleanup-phase))
               (do (swap! (:state supervisor)
@@ -221,8 +209,8 @@
       (= :advance action)
       (advance-supervisor! supervisor)
 
-      (= :cleanup (first action))
-      (start-worker! supervisor (second action) :cleanup)
+      (= :launch (first action))
+      (launch-owned-worker! supervisor (second action))
 
       (= :quiesced (first action))
       (try
@@ -234,19 +222,33 @@
           (.countDown ^CountDownLatch (:quiesced-latch supervisor)))))
     nil))
 
-(defn- worker-finished! [supervisor worker-id kind result]
+(defn- worker-finished! [supervisor worker-id kind result & [launch]]
   (locking supervisor
     (swap! (:state supervisor)
            (fn [state]
-             (cond-> (update state :workers dissoc worker-id)
-               (= :cleanup kind)
-               (assoc :cleanup-phase :pending)
-
-               (and (= :cleanup kind)
-                    (map? result)
-                    (contains? result ::worker-error))
-               (update :cleanup-error #(or % (::worker-error result)))))))
+             (let [failed? (and (map? result) (contains? result ::worker-error))
+                   family-ack? (= ::family-returned result)
+                   matching? (and launch (= (:id launch) (get-in state [(:key launch) :id]))
+                                  (= worker-id (get-in state [(:key launch) :worker-id])))]
+               (cond-> (update state :workers dissoc worker-id)
+                 (= :cleanup kind) (assoc :cleanup-phase :pending)
+                 (and (= :cleanup kind) failed?) (update :cleanup-error #(or % (::worker-error result)))
+                 (= :family kind) (assoc :family-join-phase (if family-ack? :done :held))
+                 matching?
+                 (update (:key launch)
+                         #(cond-> (assoc % :phase (if (and (= :family kind) (not family-ack?))
+                                                    :held-callback :completed))
+                            (and (= :family kind) (not family-ack?))
+                            (assoc :token (random-uuid) :error (or (::worker-error result)
+                                                                   (ex-info "Family join did not acknowledge return" {}))))))))))
   (advance-supervisor! supervisor))
+
+(defn- mark-launch-entered! [supervisor launch worker-id]
+  (when launch
+    (locking supervisor
+      (when (and (= (:id launch) (get-in @(:state supervisor) [(:key launch) :id]))
+                 (= worker-id (get-in @(:state supervisor) [(:key launch) :worker-id])))
+        (swap! (:state supervisor) update (:key launch) #(-> % (assoc :phase :entered) (dissoc :token :error)))))))
 
 (defn- worker-stage! [supervisor worker-id kind stage started-nanos]
   (try
@@ -262,9 +264,10 @@
    Cancellation is sticky: registration and the cancellation check share the
    supervisor lock, closing the cancel-before-start and between-step races."
   ([supervisor f] (start-worker! supervisor f :normal))
-  ([supervisor f kind]
+  ([supervisor f kind] (start-worker! supervisor f kind nil))
+  ([supervisor f kind launch]
    (let [done       (sync/deferred)
-         worker-id  (random-uuid)
+         worker-id  (or (:worker-id launch) (random-uuid))
          started-nanos (System/nanoTime)
          phase      (atom :new)
          result     (atom nil)
@@ -280,6 +283,7 @@
                                     ec/*spin-id* nil
                                     *worker-supervisor* supervisor]
                             (try
+                              (mark-launch-entered! supervisor launch worker-id)
                               (worker-stage! supervisor worker-id kind :entered started-nanos)
                               ;; Absolute deadlines are host-owned coordination,
                               ;; not forkable AgentDef state. Check at physical
@@ -299,7 +303,7 @@
                                     (done @result)
                                     (finally
                                       (worker-finished! supervisor worker-id kind
-                                                        @result)
+                                                        @result launch)
                                       (worker-stage! supervisor worker-id kind :acknowledged started-nanos))))))))))
          task       (proxy [FutureTask] [callable]
                       (done []
@@ -315,15 +319,24 @@
                                 (done value)
                                 (finally
                                   (worker-finished! supervisor worker-id kind
-                                                    value))))))))
-         worker     {:id worker-id :task task :done done :kind kind :started-nanos started-nanos}
+                                                    value launch))))))))
+         worker     {:id worker-id :task task :done done :kind kind :started-nanos started-nanos
+                     :phase phase}
          cancel-now?
          (locking supervisor
            (let [{:keys [sealed? cancelled?]} @(:state supervisor)]
              (when (and sealed? (= :normal kind))
                (throw (ex-info "Cannot start work after supervisor seal"
                                {:type ::supervisor-sealed})))
-             (swap! (:state supervisor) assoc-in [:workers worker-id] worker)
+             (when launch
+               (when-not (and (= (:id launch) (get-in @(:state supervisor) [(:key launch) :id]))
+                              (= :constructing (get-in @(:state supervisor) [(:key launch) :phase])))
+                 (throw (ex-info "Native worker launch changed before registration" {:type ::stale-launch}))))
+             ;; Publish the exact Task and its registration in one owner update,
+             ;; before any executor can enter it.
+             (swap! (:state supervisor)
+                    #(cond-> (assoc-in % [:workers worker-id] worker)
+                       launch (update (:key launch) assoc :worker worker :phase :registered)))
              (and cancelled? (= :normal kind))))]
      (if cancel-now?
       ;; Do not even enqueue work when cancellation preceded registration.
@@ -332,11 +345,112 @@
          (.execute native-executor task)
          (catch Throwable t
           ;; Make executor rejection flow through the same acknowledgement path.
-           (reset! result {::worker-error t})
-           (.cancel task false))))
+           (if launch
+             (locking supervisor
+               (when (= :registered (get-in @(:state supervisor) [(:key launch) :phase]))
+                 (swap! (:state supervisor) update (:key launch)
+                        assoc :phase :held-submission :token (random-uuid) :error t)))
+             (do (reset! result {::worker-error t}) (.cancel task false))))))
      worker)))
 
+(defn- launch-owned-worker! [supervisor key]
+  (let [launch (locking supervisor
+                 (let [current (get @(:state supervisor) key)]
+                   (when (= :selected (:phase current))
+                     (swap! (:state supervisor) assoc-in [key :phase] :constructing)
+                     (assoc current :key key))))]
+    (when launch
+      (try
+        (binding [ec/*execution-context* (:execution-ctx supervisor)
+                  ec/*spin-id* nil simple/*in-drain?* false]
+          (start-worker! supervisor (:callback launch) (:kind launch) launch))
+        (catch Throwable error
+          (locking supervisor
+            (when (= :constructing (get-in @(:state supervisor) [key :phase]))
+              (swap! (:state supervisor) update key
+                     assoc :phase :held-construction :token (random-uuid) :error error))))))))
+
+(defn- native-launches [supervisor]
+  (mapv (fn [key]
+          (let [value (get @(:state supervisor) key)]
+            (when value
+              (assoc (select-keys value [:id :kind :phase :token :worker-id])
+                     :worker-phase (some-> value :worker :phase deref)
+                     :error-class (some-> (:error value) class .getName)))))
+        (filter #(get @(:state supervisor) %) [:cleanup-launch :family-launch])))
+
+(defn- recover-native-launch! [supervisor expected]
+  (let [key (case (:kind expected) :cleanup :cleanup-launch :family :family-launch
+                  (throw (ex-info "Unknown native launch" {:type ::invalid-launch})))
+        action
+        (locking supervisor
+          (let [current (get @(:state supervisor) key)
+                phase (:phase current)]
+            (when-not (and (uuid? (:id current)) (uuid? (:token current))
+                           (= (select-keys expected [:id :token :phase])
+                              (select-keys current [:id :token :phase]))
+                           (#{:held-construction :held-submission :held-callback} phase))
+              (throw (ex-info "Native launch recovery no longer owns this phase" {:type ::stale-launch})))
+            (case phase
+              :held-construction
+              (do
+                (when (or (:worker current) (get-in @(:state supervisor) [:workers (:worker-id current)]))
+                  (throw (ex-info "Native launch registration is not absent" {:type ::launch-registration-uncertain})))
+                (swap! (:state supervisor) update key #(-> % (assoc :phase :selected) (dissoc :token :error)))
+                :construct)
+              :held-submission
+              (let [worker (:worker current)]
+                (when-not (and worker (not (.isCancelled ^FutureTask (:task worker))))
+                  (throw (ex-info "Native task cannot be resubmitted" {:type ::launch-task-unavailable})))
+                (swap! (:state supervisor) update key #(-> % (assoc :phase :resubmitting) (dissoc :token :error)))
+                [:submit (:task worker) (:id current)])
+              :held-callback
+              (do
+                (when-not (and (= :family (:kind current))
+                               (= :terminated (some-> current :worker :phase deref))
+                               (.isDone ^FutureTask (get-in current [:worker :task])))
+                  (throw (ex-info "Only a physically returned idempotent family join can retry"
+                                  {:type ::launch-callback-not-replayable})))
+                ;; New physical attempt, same native join obligation. Arbitrary
+                ;; cleanup callbacks never enter this branch.
+                (swap! (:state supervisor)
+                       #(-> % (assoc :family-join-phase :starting)
+                            (update key (fn [value] (-> value
+                                                        (assoc :phase :selected :worker-id (random-uuid))
+                                                        (dissoc :worker :token :error))))))
+                :construct))))]
+    (if (= :construct action)
+      (launch-owned-worker! supervisor key)
+      (let [[_ task id] action]
+        (try
+          ;; FutureTask itself is run-once, even if the first submit accepted it
+          ;; before throwing. Never reconstruct or cancel this exact task.
+          (.execute native-executor ^FutureTask task)
+          (locking supervisor
+            (when (and (= id (get-in @(:state supervisor) [key :id]))
+                       (= :resubmitting (get-in @(:state supervisor) [key :phase])))
+              (swap! (:state supervisor) assoc-in [key :phase] :registered)))
+          (catch Throwable error
+            (locking supervisor
+              (when (and (= id (get-in @(:state supervisor) [key :id]))
+                         (= :resubmitting (get-in @(:state supervisor) [key :phase])))
+                (swap! (:state supervisor) update key
+                       assoc :phase :held-submission :token (random-uuid) :error error)))))))
+    (native-launches supervisor)))
+
 (declare cancel-supervisor! mark-cleanup-safe! seal-supervisor!)
+
+(defn- supervisor-controls [supervisor]
+  ;; Stored in the original native Run entry at admission, before its parent
+  ;; transfers custody. No callback runs under the lifecycle frontier.
+  {:own-child! #(with-owned-child! supervisor %)
+   :settlement-observer
+   #(assoc (resource/dispatch-accounting-state (:dispatch-owner supervisor))
+           :workers-quiesced? (:quiesced? @(:state supervisor))
+           :supervisor-admission-sealed? (:sealed? @(:state supervisor))
+           :launches (native-launches supervisor))
+   :settlement-reconciler #(recover-native-launch! supervisor %)
+   :cancel-hooks {::native-worker #(cancel-supervisor! supervisor)}})
 
 (defn on-worker!
   "Call f on a native worker. The owned arity admits a room lifecycle Run,
@@ -354,97 +468,87 @@
   ([room owner f]
    (when ec/*spin-id*
      (throw (ex-info "A worker boundary cannot block a Spin" {:type ::worker-boundary})))
-   (let [r (run/start! room :settlement (random-uuid) nil
-                       (cond-> {:kind :settlement} owner (assoc :parent owner)))
-         id (:run/id r)
-         supervisor (assoc (make-supervisor (:ctx room)) :lifecycle-run id)
-         key [::settlement id]
-         cancelled? (atom false)
-         interrupted? (atom false)
-         failure (atom nil)
-         cancel #(do (reset! cancelled? true) (cancel-supervisor! supervisor))
-         join! (fn []
+   (run/call-with-child-admission! room owner (random-uuid)
+                                   (fn [child-id]
+                                     (let [supervisor (assoc (make-supervisor (:ctx room)) :lifecycle-run child-id :run-id child-id :control-room room)
+                                           r (run/start! room :settlement (random-uuid) nil
+                                                         (cond-> {:id child-id :kind :settlement :native-controls (supervisor-controls supervisor)}
+                                                           owner (assoc :parent owner)))
+                                           id (:run/id r)
+                                           key [::settlement id]
+                                           cancelled? (atom false)
+                                           interrupted? (atom false)
+                                           failure (atom nil)
+                                           cancel #(do (reset! cancelled? true) (cancel-supervisor! supervisor))
+                                           join! (fn []
                  ;; Future cancellation is not a physical acknowledgement. An
                  ;; outer blocking Spin may interrupt this host waiter again;
                  ;; retain the Run and clear/remember interrupts until native
                  ;; workers and cleanup have actually left.
-                 (when (Thread/interrupted)
-                   (reset! interrupted? true)
-                   (cancel))
-                 (loop []
-                   (when-not
-                    (try
-                      (.await ^CountDownLatch (:quiesced-latch supervisor))
-                      true
-                      (catch InterruptedException _
-                        (reset! interrupted? true)
-                        (cancel)
-                        false))
-                     (recur))))
-         outcome (promise)]
-     (try
-       (run/register-cancel-hook! id key cancel)
-       (when owner
-         (when-not (run/register-cancel-hook! owner key cancel)
-           (throw (ex-info "Settlement job is no longer live" {:run/id owner}))))
-       (let [worker (start-worker! supervisor
-                                   #(deliver outcome (try {:value (f)}
-                                                          (catch Throwable t {:error t}))))]
-         (try (.get ^FutureTask (:task worker))
-              (catch java.util.concurrent.CancellationException _ nil)
-              (catch InterruptedException error
-                (reset! interrupted? true)
-                (cancel)
-                (throw error)))
-         (mark-cleanup-safe! supervisor)
-         (seal-supervisor! supervisor)
-         (join!)
-         (when @cancelled? (throw (ex-info "Settlement cancelled" {:run/id id})))
-         (when-let [error (:cleanup-error @(:state supervisor))]
-           (throw (ex-info "Settlement cleanup failed" {:run/id id} error)))
-         (when-not (realized? outcome)
-           (throw (ex-info "Settlement worker exited without an outcome"
-                           {:type ::missing-worker-outcome :run/id id})))
-         (let [{:keys [value error]} @outcome]
-           (if error (throw error) value)))
-       (catch Throwable error
-         (reset! failure error)
-         (throw error))
-       (finally
-         (try
-           (mark-cleanup-safe! supervisor)
-           (seal-supervisor! supervisor)
-           (join!)
-           (when owner (run/unregister-cancel-hook! owner key))
-           (run/finish! id (cond @cancelled? :cancelled @failure :failed :else :completed))
-           (finally
+                                                   (when (Thread/interrupted)
+                                                     (reset! interrupted? true)
+                                                     (cancel))
+                                                   (run/await-family! room id)
+                                                   (loop []
+                                                     (when-not
+                                                      (try
+                                                        (.await ^CountDownLatch (:quiesced-latch supervisor))
+                                                        true
+                                                        (catch InterruptedException _
+                                                          (reset! interrupted? true)
+                                                          (cancel)
+                                                          false))
+                                                       (recur))))
+                                           outcome (promise)]
+                                       (try
+                                         (run/register-cancel-hook! id key cancel)
+                                         (when owner
+                                           (when-not (run/register-cancel-hook! owner key cancel)
+                                             (throw (ex-info "Settlement job is no longer live" {:run/id owner}))))
+                                         (let [worker (start-worker! supervisor
+                                                                     #(deliver outcome (try {:value (f)}
+                                                                                            (catch Throwable t {:error t}))))]
+                                           (try (.get ^FutureTask (:task worker))
+                                                (catch java.util.concurrent.CancellationException _ nil)
+                                                (catch InterruptedException error
+                                                  (reset! interrupted? true)
+                                                  (cancel)
+                                                  (throw error)))
+                                           (mark-cleanup-safe! supervisor)
+                                           (seal-supervisor! supervisor)
+                                           (join!)
+                                           (when @cancelled? (throw (ex-info "Settlement cancelled" {:run/id id})))
+                                           (when-let [error (:cleanup-error @(:state supervisor))]
+                                             (throw (ex-info "Settlement cleanup failed" {:run/id id} error)))
+                                           (when-not (realized? outcome)
+                                             (throw (ex-info "Settlement worker exited without an outcome"
+                                                             {:type ::missing-worker-outcome :run/id id})))
+                                           (let [{:keys [value error]} @outcome]
+                                             (if error (throw error) value)))
+                                         (catch Throwable error
+                                           (reset! failure error)
+                                           (throw error))
+                                         (finally
+                                           (try
+                                             (mark-cleanup-safe! supervisor)
+                                             (seal-supervisor! supervisor)
+                                             (join!)
+                                             (when owner (run/unregister-cancel-hook! owner key))
+                                             (run/finish! id (cond @cancelled? :cancelled @failure :failed :else :completed))
+                                             (finally
              ;; Restoring earlier could interrupt durable Run retirement and
              ;; falsely leave an otherwise quiescent lifecycle owner behind.
-             (when @interrupted?
-               (.interrupt (Thread/currentThread))))))))))
+                                               (when @interrupted?
+                                                 (.interrupt (Thread/currentThread))))))))))))
 
 (defn- cancel-supervisor! [supervisor]
-  (let [[tasks cancel-children]
-        (locking supervisor
-          (swap! (:state supervisor) assoc :cancelled? true)
-          [(->> (get @(:state supervisor) :workers)
-                vals
-                (filter #(= :normal (:kind %)))
-                (map :task)
-                vec)
-           (->> (get @(:state supervisor) :children)
-                vals
-                (map :cancel!)
-                vec)])]
-    (doseq [^FutureTask task tasks]
-      (.cancel task true))
-    (doseq [cancel-child! cancel-children]
-      (try
-        (cancel-child!)
-        (catch Throwable t
-          (tel/log! {:level :warn :id ::child-cancellation-failed
-                     :data {:error (ex-message t)}}
-                    "Owned child cancellation failed")))))
+  (let [tasks (locking supervisor
+                (swap! (:state supervisor) assoc :cancelled? true)
+                (->> (get @(:state supervisor) :workers) vals
+                     (filter #(= :normal (:kind %))) (map :task) vec))]
+    (when-let [parent (:run-id supervisor)]
+      (run/cancel-family! (:control-room supervisor) parent))
+    (doseq [^FutureTask task tasks] (.cancel task true)))
   nil)
 
 (defn- register-cleanup! [supervisor cleanup]
@@ -474,10 +578,29 @@
   nil)
 
 (defn- seal-supervisor! [supervisor]
-  (locking supervisor
-    (swap! (:state supervisor) assoc :sealed? true))
-  (advance-supervisor! supervisor)
-  (:quiesced supervisor))
+  (let [join? (locking supervisor
+                (let [start? (and (:run-id supervisor)
+                                  (= :unstarted (:family-join-phase @(:state supervisor))))]
+                  (swap! (:state supervisor)
+                         #(cond-> (assoc % :sealed? true)
+                            start? (assoc :family-join-phase :starting
+                                          :family-launch
+                                          {:id (random-uuid) :worker-id (random-uuid) :kind :family :phase :selected
+                                           :callback
+                                           (fn []
+                                             (loop []
+                                               (let [returned? (try
+                                                                 (run/await-family! (:control-room supervisor) (:run-id supervisor))
+                                                                 true
+                                                                 (catch InterruptedException _ false))]
+                                                 (when-not returned? (recur))))
+                                             ::family-returned)})))
+                  start?))]
+    (when-let [parent (:run-id supervisor)]
+      (run/seal-family! (:control-room supervisor) parent))
+    (when join? (launch-owned-worker! supervisor :family-launch))
+    (advance-supervisor! supervisor)
+    (:quiesced supervisor)))
 
 (defn- worker-result-spin [worker]
   (sp/spin (sp/await (:done worker))))
@@ -698,70 +821,29 @@
   (advance-supervisor! supervisor))
 
 (defn- with-owned-child!
-  "Reserve parent ownership before invoking zero-argument `admit-child!`.
-
-   The reservation closes the cancellation/seal race around durable child
-   admission: a parent cannot quiesce while admission is in progress, and a
-   cancellation that arrives before the RunHandle exists is replayed against
-   it immediately afterward. The lease is released only when admission fails
-   or the admitted child reaches its durable terminal state."
+  "Reference the canonical Run admission lease from this existing supervisor.
+   No handle parsing or independent release decision lives in the adapter."
   [supervisor admit-child!]
-  (let [lease-id (random-uuid)
-        cancel-slot (atom nil)
-        watch-key (Object.)
-        acknowledged? (atom false)
-        acknowledge! (fn []
-                       (when (compare-and-set! acknowledged? false true)
-                         (run/unwatch-runs! watch-key)
-                         (child-finished! supervisor lease-id)))]
-    (locking supervisor
-      (let [{:keys [sealed? cancelled?]} @(:state supervisor)]
-        (when (or sealed? cancelled?)
-          (throw (ex-info "Cannot hire an owned child after parent cancellation/seal"
-                          {:type ::supervisor-sealed})))
-        (swap! (:state supervisor) assoc-in [:children lease-id]
-               {:cancel! #(when-let [cancel-child! @cancel-slot]
-                            (cancel-child!))})))
-    (try
-      (let [handle (admit-child!)
-            child-id (run-id handle)
-            owner-ctx (ec/current-execution-context)
-            cancel-child! #(binding [ec/*execution-context* owner-ctx]
-                             ;; Host-owned jobs share the same lease. They
-                             ;; terminalize only after their before-finish
-                             ;; boundary has joined cleanup and returned grants.
-                             (if-let [cancel-job! (when (map? handle) (::cancel! handle))]
-                               (cancel-job!)
-                               (cancel! handle)))]
-        (reset! cancel-slot cancel-child!)
-        (locking supervisor
-          (swap! (:state supervisor) assoc-in [:children lease-id :handle] handle))
-        ;; Lifecycle registration and its initial active snapshot share the Run
-        ;; registry lock. We therefore cannot miss a child that terminalizes
-        ;; during registration, and acknowledgement is independent of either
-        ;; execution graph being cancelled.
-        (let [watch-terminal!
-              (fn [] (run/watch-runs!
-                      watch-key
-                      (fn [{:keys [type runs run]}]
-                        (when (or (and (= :runs/snapshot type)
-                                       (not-any? #(= child-id (:run/id %)) runs))
-                                  (and (= :run/finished type)
-                                       (= child-id (:run/id run))))
-                          (acknowledge!)))))]
-          (if-let [on-settled! (when (map? handle) (::on-settled! handle))]
-            ;; A Job must BOTH publish into its still-live caller context and
-            ;; durably terminalize. Neither frontier alone releases ownership.
-            (on-settled! watch-terminal!)
-            (watch-terminal!)))
-        (when (:cancelled? @(:state supervisor))
-          (cancel-child!))
-        handle)
-      (catch Throwable t
-        (acknowledge!)
-        (when-let [cancel-child! @cancel-slot]
-          (try (cancel-child!) (catch Throwable _)))
-        (throw t)))))
+  (let [room (:control-room supervisor) parent (:run-id supervisor)]
+    (run/with-family-admission!
+      room parent
+      (fn []
+        (let [handle (admit-child!)]
+          (when-let [on-settled! (when (map? handle) (::on-settled! handle))]
+            (on-settled! (run/require-child-publication!)))
+          handle))
+      {:on-reserve
+       (fn [token]
+         (locking supervisor
+           (let [{:keys [sealed? cancelled?]} @(:state supervisor)]
+             (when (or sealed? cancelled?)
+               (throw (ex-info "Cannot hire an owned child after parent cancellation/seal"
+                               {:type ::supervisor-sealed})))
+             (swap! (:state supervisor) assoc-in [:children token] {:admission-token token}))))
+       :on-release (fn [token]
+                     (binding [ec/*execution-context* (:execution-ctx supervisor)
+                               ec/*spin-id* nil simple/*in-drain?* false]
+                       (child-finished! supervisor token)))})))
 
 (defn- cancelled! [run-id]
   (throw (ex-info "Run cancelled" {:type ::cancelled :run/id run-id})))
@@ -1975,6 +2057,7 @@
          ;; Spin explicitly acknowledges terminality. Polling context state is
          ;; racy with graph cleanup and is not a compositional completion edge.
          @execution-terminal
+         (run/await-family! control-room id)
          (await-supervisor! supervisor)
          (resource/reconcile-dispatch-owner! (:dispatch-owner supervisor))
          (return-unused-resources! control-room id (get outcome ::return-to parent-run)
@@ -2192,7 +2275,7 @@
                    "The world of a Run that was not admitted could not be settled")
          nil)))
 
-(defn ^:no-doc hire-prepared-in!
+(defn- hire-prepared-unowned-in!
   "Host-only Run admission with a trusted fork-local world preparer.
 
    `control-room` owns durable Run/message facts. `world-parent` is the
@@ -2232,11 +2315,20 @@
         ;; from there, and goes back there if the Run is not admitted. What it
         ;; leaves once it ran returns to its parent, as for any Run.
         grantor   (or resources-from parent-run)
+        _ (when-not (contains? world/settlement-policies settlement)
+            (throw (ex-info "Unknown Run settlement policy" {:type ::invalid-settlement-policy :policy settlement})))
+        construction-cleanup (atom nil)
+        _ (run/child-preparation-entered!)
         run-world (world/open! world-parent id settlement control-room
                                (not-empty (into {} (remove (comp nil? val))
-                                                (select-keys host-options [:snapshots :checkpoints]))))
+                                                (cond-> (select-keys host-options [:snapshots :checkpoints])
+                                                  parent-run
+                                                  (assoc :retain-construction!
+                                                         (fn [cleanup!]
+                                                           (reset! construction-cleanup cleanup!)
+                                                           (run/retain-child-preparation! cleanup!)))))))
         work-room (:work run-world)
-        supervisor (cond-> (assoc (make-supervisor (:ctx world-parent) (:ctx work-room)) :run-id id)
+        supervisor (cond-> (assoc (make-supervisor (:ctx world-parent) (:ctx work-room)) :run-id id :control-room control-room)
                      deadline-nanos (assoc :deadline-nanos deadline-nanos)
                      (contains? host-options :experiment-capabilities)
                      (assoc :experiment-capabilities (:experiment-capabilities host-options))
@@ -2244,6 +2336,13 @@
                      (assoc :delegation-policy (:delegation-policy host-options)))
         session-close (atom nil)
         close-owned-session! #(when-let [close! @session-close] (close!))
+        _ (when parent-run
+            (run/retain-child-preparation!
+             #(do (if-let [close! @session-close]
+                    (close!)
+                    (when-let [session (savepoint/session (:ctx work-room))]
+                      (close-session-reconciled! session)))
+                  (@construction-cleanup))))
         _ (when (:store control-room)
             (try
               (when-let [session (install-turn-savepoints! control-room work-room)]
@@ -2252,13 +2351,14 @@
                   (when on-world (on-world work-room session))
                   (register-cleanup! supervisor close-session!)))
               (catch Throwable t
-                ;; Creation-time masking guarantees this cannot be the parent
-                ;; Session, even when installation failed partway through.
-                (when-let [session (savepoint/session (:ctx work-room))]
-                  (close-session-reconciled! session))
-                (try ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
-                     (catch Throwable cleanup-error
-                       (.addSuppressed t cleanup-error)))
+                ;; Structural preparation retains its original cleanup callback;
+                ;; a HOST recovery drives it after this constructor has exited.
+                (when-not parent-run
+                  (when-let [session (savepoint/session (:ctx work-room))]
+                    (close-session-reconciled! session))
+                  (try
+                    ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
+                    (catch Throwable cleanup-error (.addSuppressed t cleanup-error))))
                 (throw t))))
         allocation-state
         (atom (if (seq resources) :not-started :not-requested))
@@ -2285,24 +2385,21 @@
     ;; never miss an orphan trigger between posting and admission.
     (try
       (run/start! control-room actor trigger nil
-                  (cond-> {:id id :kind :agent-task :provenance provenance}
+                  (cond-> {:id id :kind :agent-task :provenance provenance
+                           :native-controls (supervisor-controls supervisor)}
                     parent-run (assoc :parent parent-run)
                     (:from resume-from) (assoc :caused-by #{(:from resume-from)})))
       (catch Throwable t
         ;; Drop the world the Run never owned, by its own policy (a deferred
         ;; world refuses a plain discard), and keep the admission error.
-        (close-owned-session!)
-        (try ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
-             (catch Throwable _ nil))
+        (when-not parent-run
+          (close-owned-session!)
+          (try
+            ((if (= :deferred settlement) d/discard-deferred d/discard) work-room)
+            (catch Throwable cleanup-error (.addSuppressed t cleanup-error))))
+        ;; For a structural child, fence the ambiguous initial Run write before
+        ;; disposing the world, through its retained family recovery obligation.
         (throw t)))
-    (run/register-child-owner! id #(with-owned-child! supervisor %))
-    (run/register-settlement-observer!
-     control-room id
-     #(assoc (resource/dispatch-accounting-state (:dispatch-owner supervisor))
-             :workers-quiesced? (:quiesced? @(:state supervisor))
-             :supervisor-admission-sealed? (:sealed? @(:state supervisor))))
-    (run/register-cancel-hook! id ::native-worker
-                               #(cancel-supervisor! supervisor))
     ;; The trigger is the Run's durable causal input, not candidate execution.
     ;; Persist it for every admitted Run—including setup failures—before any
     ;; asynchronous phase starts. The private run sink prevents participant
@@ -2478,6 +2575,16 @@
                                                             :settlement-reason reason))))
           (throw t))))))
 
+(defn ^:no-doc hire-prepared-in!
+  "HOST preparation boundary: acquire parent custody before creating a world."
+  [control-room world-parent roster agent-ref opts prepare-world! & [protocol host-options]]
+  (let [id (or (:id host-options) (random-uuid))]
+    (run/call-with-child-admission!
+     control-room (:parent-run opts) id
+     (fn [_]
+       (hire-prepared-unowned-in! control-room world-parent roster agent-ref opts prepare-world!
+                                  protocol (assoc host-options :id id))))))
+
 (defn- chat-spent
   "Microdollars the chat `chat-id` recorded as used, in `room`'s store."
   [room chat-id]
@@ -2485,7 +2592,7 @@
         (dh/q '[:find ?u . :in $ ?c :where [?e :chat/id ?c] [?e :chat/budget-used ?u]] @conn chat-id))
       0))
 
-(defn resume!
+(defn- resume-unowned!
   "Continue Run `run-id` of `control-room` from its latest turn savepoint
    (doc/runs.md, Resuming a Run): a new Run, caused by it, whose world is a fork of
    `world-parent` at the systems' recorded snapshots, whose conversation
@@ -2576,6 +2683,16 @@
           handle)
         (finally
           (run/release-resume! run-id))))))
+
+(defn resume!
+  "Continue a stopped Run from its savepoint as a causally linked new Run.
+   An inherited structural parent must still admit and own this continuation;
+   a closed family is refused before predecessor claims or resource movement.
+   Resuming as a fresh root is a separate admission, never implicit reparenting."
+  [control-room world-parent run-id]
+  (if-let [parent (:run/parent (run/run control-room run-id))]
+    (run/with-owned-child! control-room parent #(resume-unowned! control-room world-parent run-id))
+    (binding [run/*child-admission* nil] (resume-unowned! control-room world-parent run-id))))
 
 (defn hire-in!
   "Start one AgentDef execution with separate control and work parents.

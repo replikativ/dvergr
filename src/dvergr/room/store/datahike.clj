@@ -418,7 +418,7 @@
     :run/agent-def-hash :run/chat-id
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason
-    :run/job-core-cleanup-ack :run/job-adapter-cleanup-ack
+    :run/job-core-cleanup-ack :run/job-adapter-cleanup-ack :run/family-return-ack
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error :run/savepoint :run/conversation-ref :run/resumed-by :run/search :run/role])
 
@@ -501,6 +501,7 @@
     (assoc :run/settlement-status (:run/settlement-status run))
     (:run/settlement-reason run)
     (assoc :run/settlement-reason (:run/settlement-reason run))
+    (:run/family-return-ack run) (assoc :run/family-return-ack (:run/family-return-ack run))
     (:run/job-core-cleanup-ack run) (assoc :run/job-core-cleanup-ack (:run/job-core-cleanup-ack run))
     (:run/job-adapter-cleanup-ack run) (assoc :run/job-adapter-cleanup-ack (:run/job-adapter-cleanup-ack run))
     (:run/ended-at run) (assoc :run/ended-at (:run/ended-at run))
@@ -832,6 +833,29 @@
     (when (= (:db/id (dh/entity db [:chat/id chat-id]))
              (:db/id (:run/chat (dh/entity db [:run/id run-id]))))
       entity)))
+
+(defn- store-run-tx
+  "Validate lifecycle updates against the serialized writer snapshot. In
+   particular, a delayed admission must never reopen an acknowledged terminal
+   fence. Local striped locks cannot establish this across lost write ACKs."
+  [db chat-id run touched-at]
+  (when-let [global (dh/entity db [:run/id (:run/id run)])]
+    (when-not (= chat-id (:chat/id (:run/chat global)))
+      (throw (ex-info "Run identity belongs to another conversation"
+                      {:type :room-store/run-room-mismatch :run-id (:run/id run)}))))
+  (let [load-run (fn [id]
+                   (when (dh/entity db [:run/id id])
+                     (some-> (checkpoint-entity db chat-id id) (dissoc :db/id) entity->run)))
+        existing (load-run (:run/id run))
+        run (merge (dissoc run :run/savepoint :run/conversation-ref)
+                   (select-keys existing [:run/savepoint :run/conversation-ref]))
+        run (->> (store/validate-run! run)
+                 (store/validate-run-update! existing)
+                 (store/validate-run-causes! existing load-run))]
+    (cond-> [(dissoc (run->entity chat-id run) :run/savepoint :run/conversation-ref)
+             {:db/id [:chat/id chat-id] :chat/updated-at touched-at}]
+      (and (:run/resumed-by existing) (not (:run/resumed-by run)))
+      (conj [:db/retract [:run/id (:run/id run)] :run/resumed-by (:run/resumed-by existing)]))))
 
 (defn- record-run-savepoint-tx [db chat-id store-room-id run-id origin expected data ref]
   (let [current (checkpoint-entity db chat-id run-id)
@@ -1199,39 +1223,19 @@
   (-store-run! [this room-id run]
     (let [slug (store/room-id->slug room-id)]
       (when-let [ent (room-by-slug conn slug)]
-        ;; Serialize validation and assertion per Run: the update is checked
-        ;; against that Run's stored version, and append-only checking keeps
-        ;; concurrent/stale writers of it from losing an accepted edge. Terminal
-        ;; cause Runs cannot be retracted through this store, so another Run's
-        ;; concurrent write cannot invalidate the check, and writes of different
-        ;; Runs reach the writer together (one lock on the connection
-        ;; serialized every Run's commit).
         (locking (run-write-lock (:run/id (store/validate-run! run)))
-          (let [run (store/validate-run! run)
-                existing (store/-load-run this room-id (:run/id run))
-                ;; Lifecycle writes never own checkpoint publication. Preserve
-                ;; the observed projection and OMIT these attrs from its TX so
-                ;; a newer checkpoint cannot be overwritten by a stale caller.
-                run (merge (dissoc run :run/savepoint :run/conversation-ref)
-                           (select-keys existing [:run/savepoint :run/conversation-ref]))
-                run (->> run
-                         (store/validate-run-update! existing)
-                         (store/validate-run-causes!
-                          existing
-                          #(store/-load-run this room-id %)))]
+          ;; Preserve synchronous caller validation errors. The transaction
+          ;; repeats these checks against its own snapshot, which is the actual
+          ;; authority if a lost-ACK or remote writer commits between them.
+          (let [existing (store/-load-run this room-id (:run/id run))
+                checked (merge (dissoc run :run/savepoint :run/conversation-ref)
+                               (select-keys existing [:run/savepoint :run/conversation-ref]))
+                checked (->> checked (store/validate-run-update! existing)
+                             (store/validate-run-causes! existing #(store/-load-run this room-id %)))]
             (when (persist/persist-tx!
-                   conn
-                   (cond-> [(dissoc (run->entity (:chat/id ent) run)
-                                    :run/savepoint :run/conversation-ref)
-                            {:db/id [:chat/id (:chat/id ent)]
-                             :chat/updated-at (java.util.Date.)}]
-                     ;; a stored Run is the map stored: a withdrawn resume
-                     ;; claim is gone, as in the memory store
-                     (and (:run/resumed-by existing) (not (:run/resumed-by run)))
-                     (conj [:db/retract [:run/id (:run/id run)]
-                            :run/resumed-by (:run/resumed-by existing)]))
+                   conn [[:db.fn/call store-run-tx (:chat/id ent) checked (java.util.Date.)]]
                    {:op :store-run :room-id room-id :run-id (:run/id run)})
-              run))))))
+              (store/-load-run this room-id (:run/id run))))))))
 
   (-load-run [_ room-id run-id]
     (let [slug (store/room-id->slug room-id)]

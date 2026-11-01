@@ -74,3 +74,6 @@
                     st :object-memory
                     {:id (random-uuid) :from :alice :content message
                      :metadata {:object object}}))))))
+
+(deftest family-return-witness-contract
+  (contract/assert-family-return-witness! (memory/make) :family-memory))

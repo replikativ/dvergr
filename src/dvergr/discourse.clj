@@ -1570,11 +1570,13 @@
            room*       (volatile! nil)
            _ (when acquisition
                (vreset! (:key acquisition) new-id)
-               (vreset! (:lease acquisition)
-                        (preparation/retain-room-cleanup!
-                         room {new-id acquisition} rollback-fork-construction!)))
+               (when-not (:external-owner? acquisition)
+                 (vreset! (:lease acquisition)
+                          (preparation/retain-room-cleanup!
+                           room {new-id acquisition} rollback-fork-construction!))))
            fork-handle (when (= :ctx isolation)
                          (binding [ec/*execution-context* (:ctx room)]
+                           (when-let [entered? (:native-entered? acquisition)] (reset! entered? true))
                            (let [handle (ygg/fork! (merge {:purpose :workroom
                                                            :owner new-id}
                                                           fork-opts))]
@@ -1680,8 +1682,9 @@
                ;; The complete receiver now owns the child. Even if the receipt
                ;; transfer reports an error, rollback must not destroy it.
                (reset! (:published? acquisition) true)
-               (preparation/transfer-room-cleanup-entry!
-                @(:lease acquisition) new-id acquisition))
+               (when-not (:external-owner? acquisition)
+                 (preparation/transfer-room-cleanup-entry!
+                  @(:lease acquisition) new-id acquisition)))
      ;; Control-plane: announce the fork on the peer-bus so dashboards,
      ;; audit logs, and oversight agents see it without subscribing to
      ;; the fork's bus directly.
@@ -1772,6 +1775,43 @@
                (.addSuppressed ^Throwable error cleanup-error))
              (throw error))
          (:value outcome))))))
+
+(declare discard-outcome discard-deferred settlement)
+
+(defn ^:no-doc fork-room-owned!
+  "Synchronous Run construction with cleanup retained by the caller BEFORE
+   native entry. retain! receives the original idempotent HOST disposal closure;
+   it must retain it through constructor failure. No HOST join runs on a drain."
+  [room opts retain!]
+  (let [acquisition {:parent room :child (volatile! nil) :handle (volatile! nil)
+                     :recovery (volatile! nil) :key (volatile! nil) :lease (volatile! nil)
+                     :published? (atom false) :state (atom {:done #{}})
+                     :native-entered? (atom false) :external-owner? true}
+        dispose! (fn []
+                   (if @(:published? acquisition)
+                     (let [child @(:child acquisition)]
+                       (when-not child (throw (ex-info "Published construction has no original Room" {})))
+                       (when-not (= :discarded (:op (settlement child)))
+                         (if (= :deferred (:settlement-policy @(:meta child)))
+                           (discard-deferred child)
+                           (let [result (discard-outcome child)]
+                             (when-not (= :discarded (:outcome result))
+                               (throw (ex-info "Construction disposal has no discard acknowledgement" {:outcome result}))))))
+                       (when-not (and (= :discarded (:op (settlement child)))
+                                      (= :discarded (:status (ygg/fork-disposition @(:handle acquisition)))))
+                         (throw (ex-info "Construction disposal is not acknowledged" {}))))
+                     (do
+                       (when (and @(:native-entered? acquisition)
+                                  (nil? @(:handle acquisition)) (nil? @(:recovery acquisition)))
+                         (throw (ex-info "Original native constructor has no cleanup acknowledgement"
+                                         {:type ::construction-owner-unavailable})))
+                       (rollback-fork-construction! acquisition))))]
+    (retain! dispose!)
+    (try (fork-room-locked room opts acquisition)
+         (catch Throwable error
+           (when-let [owner (:construction/owner (ex-data error))]
+             (vreset! (:recovery acquisition) owner))
+           (throw error)))))
 
 (defn fork-handle
   "Return an isolated Room fork's process-local canonical ForkHandle, or nil.

@@ -23,28 +23,31 @@
   (doseq [publication-first? [true false]]
     (let [room (d/make-room {:id (keyword (str "job-frontiers-" publication-first?))
                              :store (memory/make)})
+          parent (binding [ec/*execution-context* (:ctx room)]
+                   (:run/id (run/start! room :parent (random-uuid) nil)))
           supervisor (binding [ec/*execution-context* (:ctx room)]
-                       (#'program/make-supervisor (:ctx room)))
-          published (atom nil)
-          child (binding [ec/*execution-context* (:ctx room)]
-                  (:run/id (run/start! room :job (random-uuid) nil)))]
+                       (assoc (#'program/make-supervisor (:ctx room)) :run-id parent :control-room room))
+          published (atom nil) child (random-uuid)]
       (try
         (binding [ec/*execution-context* (:ctx room)]
           (#'program/with-owned-child!
-           supervisor #(hash-map :run/id child ::program/cancel! (constantly nil)
-                                 ::program/on-settled! (fn [f] (reset! published f))))
+           supervisor
+           #(do (run/start! room :job (random-uuid) nil {:id child :parent parent})
+                {:run/id child ::program/cancel! (constantly nil)
+                 ::program/on-settled! (fn [f] (reset! published f))}))
           (is (= 1 (count (:children @(:state supervisor)))))
-          (if publication-first?
-            (@published)
-            (run/finish! child :completed))
+          (if publication-first? (@published) (run/finish! child :completed))
           (is (= 1 (count (:children @(:state supervisor))))
               "one frontier alone is insufficient")
-          (if publication-first?
-            (run/finish! child :completed)
-            (@published))
+          (if publication-first? (run/finish! child :completed) (@published))
+          (run/await-family! room parent)
           (is (empty? (:children @(:state supervisor)))))
         (finally
-          (run/finish! child :cancelled)
+          (when (some #(= child (:run/id %)) (run/active-runs (:id room)))
+            (run/finish! child :cancelled))
+          (when @published (@published))
+          (run/await-family! room parent)
+          (run/finish! parent :completed)
           (d/close-room! room))))))
 
 (def nested-code
