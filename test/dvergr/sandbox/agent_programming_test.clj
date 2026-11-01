@@ -507,7 +507,8 @@
         work-room (:work run-world)
         supervisor (binding [ec/*execution-context* (:ctx room)]
                      @(sp/spin
-                       (#'program/make-supervisor (:ctx room) (:ctx work-room))))
+                       (assoc (#'program/make-supervisor (:ctx room) (:ctx work-room))
+                              :run-id parent-id :control-room room)))
         ceiling {:program-kinds #{:echo :scripted}
                  :parent-run parent-id
                  :own-child! (fn [admit!]

@@ -648,10 +648,13 @@
            {:ok? false
             :error (str "fork " (:id fork) (if in-progress? " is being " " was ") (name (:op settlement)))}
 
-           :else
+           (or (= :discarded outcome)
+               (and (= :lost outcome) (not in-progress?) (= :discarded (:op settlement))))
            (do (when (and parent run-id)
                  (agent-run/update-durable-settlement! (run-record-room fork parent) run-id :discarded reason))
-               {:ok? true}))))
+               {:ok? true})
+
+           :else {:ok? false :error "fork has no completed discard acknowledgement"})))
      (catch Throwable t {:ok? false :error (.getMessage t)}))))
 
 (defn adopt!

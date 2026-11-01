@@ -469,3 +469,12 @@
         (deliver drain-go true)
         (deliver read-go true)
         (d/close-room! parent)))))
+
+(deftest missing-fork-without-discard-ack-cannot-create-a-discarded-projection
+  (with-redefs-fn
+    {#'forks/require-settleable! (fn [& _] nil)
+     #'d/discard-outcome (constantly {:outcome :gone})
+     #'rreg/lookup (constantly nil)}
+    (fn []
+      (is (= {:ok? false :error "fork has no completed discard acknowledgement"}
+             (forks/discard! {:id :unacknowledged :meta (atom {})}))))))

@@ -118,7 +118,8 @@
   [world status]
   (let [{:keys [outcome settlement in-progress?]} (d/discard-outcome (:work world))]
     (cond
-      (not= :lost outcome) status
+      (= :discarded outcome) status
+      (= :gone outcome) {:status :recovery-required :reason :discard-unacknowledged}
       (and in-progress?
            (not= :incomplete (some-> (:work world) d/fork-handle ygg/fork-disposition :status)))
       {:status :review :reason :settlement-in-progress}
@@ -146,7 +147,10 @@
        (#{:failed :cancelled} execution-status)
        (if (= :deferred (:policy world))
          (do (d/discard-deferred (:work world))
-             {:status :discarded :reason execution-status})
+             (if (and (= :discarded (:op (d/settlement (:work world))))
+                      (= :discarded (some-> (:work world) d/fork-handle ygg/fork-disposition :status)))
+               {:status :discarded :reason execution-status}
+               {:status :recovery-required :reason :discard-unacknowledged}))
          (discarded world {:status :discarded :reason execution-status}))
 
        (= :deferred (:policy world))

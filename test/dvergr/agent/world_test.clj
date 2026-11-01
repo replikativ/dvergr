@@ -98,3 +98,15 @@
             (is (= {:status :discarded :reason status} (world/settle! w status))))
           (is (zero? @commits))
           (is (= #{"old.txt" "keep.txt"} (set (keys (tree parent))))))))))
+
+(deftest absent-world-without-a-discard-receipt-is-not-successful-disposal
+  (let [w (world/->RunWorld :absent nil {} :discard (atom nil))]
+    (with-redefs [d/discard-outcome (constantly {:outcome :gone})]
+      (is (= {:status :recovery-required :reason :discard-unacknowledged}
+             (world/settle! w :completed))))))
+
+(deftest deferred-disposal-needs-positive-native-and-integration-return
+  (let [w (world/->RunWorld :absent nil {} :deferred (atom nil))]
+    (with-redefs [d/discard-deferred (constantly nil) d/settlement (constantly nil)]
+      (is (= {:status :recovery-required :reason :discard-unacknowledged}
+             (world/settle! w :failed))))))
