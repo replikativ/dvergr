@@ -627,6 +627,11 @@
     :db/index true
     :db/doc "Runs whose resolved results this run explicitly observed; unlike :run/parent, this is a causal dependency and may have many values"}
 
+   {:db/ident :run/family-return-ack
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/doc "Sealed native structural family; all owned admissions, children and publication/release edges returned"}
+
    {:db/ident :run/job-core-cleanup-ack
     :db/valueType :db.type/uuid
     :db/cardinality :db.cardinality/one

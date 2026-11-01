@@ -837,7 +837,7 @@
 
 (deftest recursive-hire-separates-control-room-from-immediate-world-parent
   (let [control-room (test-room :program-recursive-control)
-        parent-run (random-uuid)
+        parent-run (:run/id (run/start! control-room :orchestrator (random-uuid) nil))
         parent-world (binding [ec/*execution-context* (:ctx control-room)]
                        (world/open! control-room parent-run :review))
         work-parent (:work parent-world)
@@ -862,6 +862,8 @@
         (binding [ec/*execution-context* (:ctx work-parent)]
           (d/discard child-world)))
       (finally
+        (run/await-family! control-room parent-run)
+        (run/finish! parent-run :completed)
         (binding [ec/*execution-context* (:ctx control-room)]
           (d/discard work-parent))
         (d/close-room! control-room)))))
@@ -1104,7 +1106,7 @@
 
 (deftest delegation-tools-are-thin-run-interpreter-adapters
   (let [room (test-room :program-tool-delegation)
-        parent-run (random-uuid)]
+        parent-run (:run/id (run/start! room :orchestrator (random-uuid) nil))]
     (try
       (with-redefs [providers/ensure-initialized! (constantly nil)
                     chat-agent/run-agent-turn!
@@ -1137,6 +1139,8 @@
               (binding [ec/*execution-context* (:ctx room)]
                 (d/discard (registry/lookup (:run/world durable))))))))
       (finally
+        (run/await-family! room parent-run)
+        (run/finish! parent-run :completed)
         (d/close-room! room)))))
 
 (deftest discarded-world-retains-the-parent-owned-model-trace
@@ -1703,8 +1707,9 @@
       ;; transition into the between-callback :pending phase is deterministic.
       (with-redefs-fn
         {#'program/start-worker!
-         (fn [_ cleanup kind]
+         (fn [_ cleanup kind & [launch]]
            (is (= :cleanup kind))
+           (is (uuid? (:id launch)))
            (deliver claimed-cleanup cleanup))}
         #(do
            (#'program/mark-cleanup-safe! supervisor)
@@ -2094,7 +2099,7 @@
 (deftest structural-parent-is-explicit
   (let [room (test-room :program-parent)
         team (test-roster)
-        parent-id (random-uuid)]
+        parent-id (:run/id (run/start! room :orchestrator (random-uuid) nil))]
     (try
       (binding [ec/*execution-context* (:ctx room)]
         (let [handle (program/hire! room team :analyst
@@ -2102,6 +2107,8 @@
           @handle
           (is (= parent-id (:run/parent (program/observe room handle))))))
       (finally
+        (run/await-family! room parent-id)
+        (run/finish! parent-id :completed)
         (d/close-room! room)))))
 
 (deftest hire-validates-the-effect-envelope-before-starting

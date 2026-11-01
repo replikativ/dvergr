@@ -24,28 +24,30 @@
    (default `parent`) is the Room that keeps the Run."
   ([parent run-id policy] (open! parent run-id policy parent))
   ([parent run-id policy record-room] (open! parent run-id policy record-room nil))
-  ([parent run-id policy record-room {:keys [snapshots checkpoints]}]
+  ([parent run-id policy record-room {:keys [snapshots checkpoints retain-construction!]}]
    (when-not (contains? settlement-policies policy)
      (throw (ex-info "Unknown Run settlement policy"
                      {:type ::invalid-settlement-policy
                       :policy policy
                       :allowed settlement-policies})))
-   (let [work (d/fork-room parent {:isolation :ctx
-                                   :fork-opts {:purpose :run
-                                               :owner run-id
+   (let [fork! (if retain-construction!
+                 #(d/fork-room-owned! %1 %2 retain-construction!) d/fork-room)
+         work (fork! parent {:isolation :ctx
+                             :fork-opts {:purpose :run
+                                         :owner run-id
                                                ;; resuming: the systems as the
                                                ;; savepoint recorded them
-                                               :snapshots snapshots
+                                         :snapshots snapshots
                                                ;; A one-admission HOST origin, never
                                                ;; inheritable delegation authority.
-                                               :checkpoints checkpoints
+                                         :checkpoints checkpoints
                                                ;; Hiring starts an independent computation,
                                                ;; not a continuation of the parent's session.
-                                               :state-updates
-                                               (savepoint/independent-fork-state
-                                                (savepoint/derive-seed
-                                                 (savepoint/seed (:ctx parent))
-                                                 :dvergr/run run-id))
+                                         :state-updates
+                                         (savepoint/independent-fork-state
+                                          (savepoint/derive-seed
+                                           (savepoint/seed (:ctx parent))
+                                           :dvergr/run run-id))
                                               ;; A hired agent receives the
                                               ;; durable substrate of its
                                               ;; parent world, but constructs
@@ -55,11 +57,11 @@
                                               ;; to fork the interpreter that
                                               ;; is currently evaluating the
                                               ;; hire! call.
-                                               :forkable-components #{}}
+                                         :forkable-components #{}}
                                   ;; A Run world is an internal transaction, not
                                   ;; a child conversation. Nested agents enter
                                   ;; only through explicit hire/tool effects.
-                                   :clone-participants? false})]
+                             :clone-participants? false})]
      ;; the world knows its Run: a resource authority spends from its wallet
      (resource/register-ledger-room! record-room)
      (binding [ec/*execution-context* (:ctx work)]

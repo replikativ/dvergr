@@ -118,7 +118,7 @@
 (deftest parent-is-explicit-structure-not-message-causality
   (let [[room _st] (run-room :explicit-parent)
         causal-run-id (random-uuid)
-        structural-parent-id (random-uuid)
+        structural-parent-id (:run/id (run/start! room :orchestrator (random-uuid) nil))
         trigger (assoc (d/message :upstream :agent "handoff")
                        :metadata {:run-id causal-run-id})
         causal-only (run/start! room :agent trigger (live-ctx))
@@ -131,6 +131,7 @@
       (finally
         (run/finish! (:run/id causal-only) :completed)
         (run/finish! (:run/id explicit) :completed)
+        (run/finish! structural-parent-id :completed)
         (d/close-room! room)))))
 
 (deftest resolved-run-inputs-are-durable-causality-not-structure
