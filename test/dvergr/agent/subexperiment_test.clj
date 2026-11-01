@@ -11,6 +11,7 @@
             [dvergr.agent.invocations :as invocations]
             [dvergr.chat.agent :as chat-agent]
             [dvergr.discourse :as d]
+            [dvergr.jobs :as jobs]
             [dvergr.model.chat :as chat]
             [dvergr.model.providers :as providers]
             [dvergr.resource :as resource]
@@ -214,6 +215,8 @@
             (is (= {"microUSD" 200M "model-dispatch" 2M} (resource/run-balance room parent)))
             (is (= {} (resource/run-balance room (:job result))))
             (is (every? #(empty? (resource/run-balance room %)) @calls))
+            ;; Publication precedes adapter ACK persistence and native release.
+            (is (:settled? (jobs/status (:job result) 5000)))
             (is (= 1 (count (run/active-runs (:id room))))))))
       (finally
         (run/finish! parent :completed)
