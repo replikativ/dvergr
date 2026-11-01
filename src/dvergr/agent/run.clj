@@ -244,6 +244,7 @@
                         (seq caused-by) (assoc :run/caused-by (set caused-by)))
                       provenance))
          entry      {:run run
+                     :execution-context (:ctx room)
                      :chat-ctx live-chat-ctx
                      ;; Explicitly process-local control state. Durable meaning
                      ;; is the Room-store Run projection; this live owner map
@@ -854,6 +855,29 @@
     (when (get @active run-id)
       (swap! active assoc-in [run-id :own-child!] own-child!)
       true)))
+
+(defn register-settlement-observer!
+  "Attach read-only facts from the original native owner. Private callbacks
+   are never persisted, forked, or returned by Run snapshots."
+  [room run-id observe]
+  (locking lifecycle-lock
+    (when-let [entry (get @active run-id)]
+      (when (and (= (:id room) (get-in entry [:run :run/room]))
+                 (identical? (:ctx room) (:execution-context entry)))
+        (swap! active assoc-in [run-id :settlement-observer] observe)
+        true))))
+
+(defn observe-settlement
+  "HOST read-only native facts for this exact live Room incarnation. Absence
+   of a process-local owner is unknown, not a durable completion witness."
+  [room run-id]
+  (let [observe (locking lifecycle-lock
+                  (let [entry (get @active run-id)]
+                    (when (and (= (:id room) (get-in entry [:run :run/room]))
+                               (identical? (:ctx room) (:execution-context entry)))
+                      (:settlement-observer entry))))]
+    (if observe (observe)
+        {:reservation-reconciliation :unknown :usage-consumption :not-established})))
 
 (defn with-owned-child!
   "Admit a child under a live parent Run's executor. The executor reserves

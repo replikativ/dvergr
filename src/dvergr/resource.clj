@@ -476,93 +476,299 @@
   (boolean (and (pos? (get resources microdollars 0))
                 (pos? (get resources model-dispatches 0)))))
 
+(def ^:dynamic *dispatch-id* nil)
+
+(defn- current-dispatch []
+  (when *dispatches*
+    (if *dispatch-id*
+      (some #(when (= *dispatch-id* (:id %)) %) @*dispatches*)
+      (peek @*dispatches*))))
+
+(defn- update-dispatch! [id f & args]
+  (apply swap! *dispatches*
+         (fn [records & xs]
+           (mapv #(if (= id (:id %)) (apply f % xs) %) records)) args))
+
+(defn- dispatch-record [id]
+  (some #(when (= id (:id %)) %) @*dispatches*))
+
+(defn- submit-dispatch-command!
+  "Retain the exact intent until the ledger acknowledges it. Only Kontor's
+   synchronous insufficient-balance rejection proves a definite refusal."
+  [id key payer]
+  (let [record (dispatch-record id) command (get record key)
+        state-key (keyword (str (name key) "-state"))]
+    (when (and command (not (#{:acknowledged :refused} (get record state-key))))
+      (update-dispatch! id assoc state-key :submitted)
+      (try
+        (store/-transfer-resources! (resource-store! (:room payer)) command)
+        (update-dispatch! id assoc state-key :acknowledged)
+        (catch Throwable error
+          (when (and (#{:reserve-command :admission-command} key)
+                     (= :kontor.resource/insufficient (:type (ex-data error))))
+            (update-dispatch! id assoc state-key :refused))
+          (throw (ex-info "Model dispatch accounting requires reconciliation"
+                          {:type ::dispatch-accounting-failed :dispatch id :phase key} error)))))))
+
+(declare append-dispatch!)
+
+(defn- open-dispatch-wallet! [room spec]
+  (try (store/-open-resource-wallet! (resource-store! room) spec)
+       (catch Throwable error
+         (throw (ex-info "Model dispatch wallet requires reconciliation"
+                         {:type ::dispatch-accounting-failed :phase :open-wallet :wallet (:id spec)} error)))))
+
 (defn- reserve!
-  "Move `amount` from the paying wallet into a reservation of its own."
+  "Publish reservation identity BEFORE either wallet creation or transfer."
   [{:keys [room wallet] :as payer} amount]
   (let [id (UUID/randomUUID)
-        reservation (stable-id [:dvergr/reservation id])]
-    ;; an empty reservation left by a crash before the grant holds nothing
-    (store/-open-resource-wallet! (resource-store! room)
-                                  {:id reservation :purpose :reservation :name (str "dispatch " id)})
-    (store/-transfer-resources! (resource-store! room)
-                                {:id (stable-id [:dvergr/reserve id]) :kind :grant
-                                 :source (kontor/account-ref wallet)
-                                 :destination (kontor/account-ref reservation)
-                                 :effective-date (java.util.Date.) :resources {microdollars amount}})
-    (let [record {:id id :wallet reservation :amount amount :payer payer}]
-      (swap! *dispatches* conj record)
-      record)))
+        reservation (stable-id [:dvergr/reservation id])
+        record {:id id :wallet reservation :amount amount :payer payer
+                :reserve-command {:id (stable-id [:dvergr/reserve id]) :kind :grant
+                                  :source (kontor/account-ref wallet)
+                                  :destination (kontor/account-ref reservation)
+                                  :effective-date (java.util.Date.) :resources {microdollars amount}}}]
+    (append-dispatch! record)
+    (open-dispatch-wallet! room
+                           {:id reservation :purpose :reservation :name (str "dispatch " id)})
+    (submit-dispatch-command! id :reserve-command payer)
+    (dispatch-record id)))
 
 (defn reserve-dispatch!
-  "Before a governed dispatch that has a paying wallet: move its bound
-   (`*dispatch-bound*`) from that wallet into a reservation of its own; the
-   ledger refuses what the wallet cannot cover. A known zero bound needs no
-   monetary reservation, but still needs its model-call scope and consumes
-   admission at the gateway. An unknown/invalid bound is refused."
+  "Begin one governed dispatch before any ledger submission or HTTP entry.
+   Zero-price and admission-only calls retain their admission identity too."
   []
   (require-model-scope!)
-  (when-let [payer (when *model-scope* (monetary-payer))]
-    (let [amount *dispatch-bound*]
-      (when-not (and (number? amount) (Double/isFinite (double amount)) (not (neg? amount)))
-        (throw (ex-info "A funded model dispatch needs a bound on its cost: a priced model, an output limit, no remote content"
-                        {:type ::unbounded-dispatch})))
-      (when-not *dispatches*
-        (throw (ex-info "A funded model dispatch must be made by a model call that settles it"
-                        {:type ::unsettled-dispatch})))
-      (when (pos? amount) (reserve! payer amount)))))
+  (when *model-scope*
+    (let [payer (monetary-payer) amount *dispatch-bound*]
+      (when payer
+        (when-not (and (number? amount) (Double/isFinite (double amount)) (not (neg? amount)))
+          (throw (ex-info "A funded model dispatch needs a bound on its cost: a priced model, an output limit, no remote content"
+                          {:type ::unbounded-dispatch})))
+        (when-not *dispatches*
+          (throw (ex-info "A funded model dispatch must be made by a model call that settles it"
+                          {:type ::unsettled-dispatch}))))
+      (if (and payer (pos? amount))
+        (reserve! payer amount)
+        (when *dispatches*
+          (let [record {:id (UUID/randomUUID) :amount 0M :payer payer}]
+            (append-dispatch! record)
+            record))))))
+
+(defn dispatch-entered!
+  "The next native call may reach the provider. Recovery never enters HTTP."
+  []
+  (when-let [record (current-dispatch)]
+    (update-dispatch! (:id record) assoc :egress-entered? true)))
 
 (defn- move! [payer reservation kind id destination amount]
   (when (pos? amount)
+    ;; Generated audit dates belong to Kontor. Explicit fresh dates would
+    ;; change a stable command's replay payload after a lost acknowledgement.
     (store/-transfer-resources! (resource-store! (:room payer))
                                 {:id id :kind kind
                                  :source (kontor/account-ref reservation)
-                                 :destination destination
-                                 :effective-date (java.util.Date.)
-                                 :resources {microdollars amount}})))
-
-(defn- release! [{:keys [id wallet amount payer]}]
-  (move! payer wallet :return (stable-id [:dvergr/release id])
-         (kontor/account-ref (:wallet payer)) amount))
-
-(defn- forfeit! [{:keys [id wallet amount payer]}]
-  (move! payer wallet :consume (stable-id [:dvergr/forfeit id]) kontor/sink-account amount))
-
-(defn- hold! [{:keys [id wallet amount payer]} cost]
-  (let [cost (min amount (max 0M (bigdec cost)))
-        hold (hold-wallet-id (:wallet payer))]
-    (when (pos? cost)
-      (store/-open-resource-wallet! (resource-store! (:room payer))
-                                    {:id hold :purpose :hold :name (str "hold " (:wallet payer))})
-      (move! payer wallet :grant (stable-id [:dvergr/hold id]) (kontor/account-ref hold) cost))
-    (move! payer wallet :return (stable-id [:dvergr/release id])
-           (kontor/account-ref (:wallet payer)) (- amount cost))))
+                                 :destination destination :resources {microdollars amount}})))
 
 (defn- refused? [status]
   (or (= :refused status) (and (number? status) (>= status 400))))
 
+(defn- settlement-plan [{:keys [id wallet amount payer status egress-entered?]} cost final?]
+  (let [kind (cond (or (not egress-entered?) (refused? status)) :release
+                   (and final? (some? cost)) :hold
+                   :else :forfeit)
+        held (if (= kind :hold) (min amount (max 0M (bigdec cost))) 0M)
+        command (fn [suffix kind destination n]
+                  (when (pos? n)
+                    {:id (stable-id [suffix id]) :kind kind
+                     :source (kontor/account-ref wallet) :destination destination
+                     :effective-date (java.util.Date.) :resources {microdollars n}}))]
+    {:kind kind :held held :reported-cost (when final? cost)
+     :hold-command (when (pos? held)
+                     (command :dvergr/hold :grant
+                              (kontor/account-ref (hold-wallet-id (:wallet payer))) held))
+     :release-command (when (#{:hold :release} kind)
+                        (command :dvergr/release :return (kontor/account-ref (:wallet payer)) (- amount held)))
+     :forfeit-command (when (= :forfeit kind)
+                        (command :dvergr/forfeit :consume kontor/sink-account amount))}))
+
+(defn- settle-record! [id]
+  (let [{:keys [payer admission-payer reserve-command reserve-command-state] :as r} (dispatch-record id)]
+    (when-not (:settled? r)
+      (when (and reserve-command (not= :refused reserve-command-state))
+        ;; Wallet creation may itself have lost its acknowledgement.
+        (open-dispatch-wallet! (:room payer)
+                               {:id (:wallet r) :purpose :reservation :name (str "dispatch " id)})
+        (submit-dispatch-command! id :reserve-command payer))
+      (when (:admission-command r)
+        (submit-dispatch-command! id :admission-command admission-payer))
+      (when-not (= :refused (:reserve-command-state (dispatch-record id)))
+        (when (pos? (get-in r [:settlement :held] 0))
+          (let [hold (hold-wallet-id (:wallet payer))]
+            (open-dispatch-wallet! (:room payer)
+                                   {:id hold :purpose :hold :name (str "hold " (:wallet payer))})))
+        (doseq [key [:hold-command :release-command :forfeit-command]]
+          (submit-dispatch-command! id key payer)))
+      (update-dispatch! id assoc :settled? true))))
+
 (defn dispatch-status!
-  "Note the HTTP status of the latest dispatch of this model call; a refused
-   dispatch's reservation is returned at once."
+  "Record refusal evidence before its fallible refund. A lost refund ACK must
+   never turn a known refusal into ambiguous provider spend."
   [status]
-  (when-let [ds *dispatches*]
-    (when-let [r (peek @ds)]
-      (when (and (not (:settled? r)) (nil? (:status r)))
-        (when (refused? status) (release! r))
-        (swap! ds (fn [v] (assoc v (dec (count v))
-                                 (cond-> (assoc (peek v) :status status)
-                                   (refused? status) (assoc :settled? true)))))))))
+  (when-let [r (current-dispatch)]
+    (when (and (not (:settled? r)) (nil? (:status r)))
+      (let [id (:id r)]
+        (update-dispatch! id assoc :status status)
+        (when (refused? status)
+          (let [plan (settlement-plan (dispatch-record id) nil false)]
+            (update-dispatch! id #(if (:settlement %) % (merge % plan {:settlement plan}))))
+          (settle-record! id))))))
 
 (defn settle-dispatches!
-  "Settle the dispatches of one model call (`*dispatches*`) not settled yet:
-   the latest successful one holds `cost` (microdollars from the final usage
-   the provider reported, nil when it reported none) and returns the rest;
-   every other one is consumed."
+  "Freeze every unresolved plan before its first ledger submission. Retry
+   resumes the original commands, including a partially acknowledged hold and
+   return; no record is drained before acknowledgement."
   [cost]
   (when-let [ds *dispatches*]
-    (let [records (remove :settled? (first (reset-vals! ds [])))
-          final (when cost (last (filter #(and (number? (:status %)) (< (:status %) 300)) records)))]
-      (doseq [r records]
-        (if (= r final) (hold! r cost) (forfeit! r))))))
+    (let [records @ds
+          final (when (some? cost)
+                  (:id (last (filter #(and (number? (:status %)) (< (:status %) 300)) records))))]
+      (doseq [r records
+              :when (and (some? cost) (= :hold (get-in r [:settlement :kind]))
+                         (not= (bigdec cost) (bigdec (get-in r [:settlement :reported-cost]))))]
+        (throw (ex-info "Dispatch settlement cost changed" {:type ::settlement-conflict :dispatch (:id r)})))
+      (swap! ds (fn [rs]
+                  (mapv (fn [r]
+                          (if (or (:settled? r) (:settlement r)) r
+                              (let [plan (settlement-plan r cost (= final (:id r)))]
+                                (merge r plan {:settlement plan})))) rs)))
+      (doseq [r @ds :when (not (:settled? r))] (settle-record! (:id r))))))
+
+(defn make-dispatch-owner
+  "Private host custody for one executor's model calls. No balances live here;
+   Kontor remains authoritative. Never put this owner in forkable Room state."
+  []
+  (atom {:sealed? false :calls {} :hold-transfers []}))
+
+(def ^:dynamic *dispatch-call* nil)
+(def ^:dynamic *dispatch-thread* nil)
+
+(defn reusable-dispatch-call?
+  "A conveyed binding is not ownership of its originating call. Raw requests
+   on another thread or after that call exits must register a fresh call."
+  []
+  (boolean
+   (and *dispatch-call* (identical? *dispatch-thread* (Thread/currentThread))
+        (if-let [owner (:dispatch-owner *model-scope*)]
+          (let [call (get-in @owner [:calls *dispatch-call*])]
+            (and (= :active (:phase call)) (identical? *dispatches* (:dispatches call))))
+          true))))
+
+(defn- append-dispatch! [record]
+  (let [owner (:dispatch-owner *model-scope*)]
+    (locking (or owner *dispatches*)
+      (when (and owner (:sealed? @owner))
+        (throw (ex-info "Model dispatch owner is sealed" {:type ::dispatch-owner-sealed})))
+      (when (and owner (not (reusable-dispatch-call?)))
+        (throw (ex-info "Model dispatch has no live call owner" {:type ::dispatch-call-unowned})))
+      (swap! *dispatches* conj record))))
+
+(defn- complete-dispatch-call! [owner id ds]
+  (when owner
+    (locking owner
+      (when (identical? ds (get-in @owner [:calls id :dispatches]))
+        (let [holds (for [r @ds :when (pos? (get-in r [:settlement :held] 0))]
+                      {:dispatch (:id r) :payer-wallet (get-in r [:payer :wallet])
+                       :hold-wallet (hold-wallet-id (get-in r [:payer :wallet]))
+                       :transfer (get-in r [:hold-command :id])
+                       :usage-consumption :not-established})]
+          (swap! owner #(-> % (update :calls dissoc id)
+                            (update :hold-transfers into holds))))))))
+
+(defn- hold-dispatch-call! [owner id ds error]
+  (when owner
+    (locking owner
+      (when (identical? ds (get-in @owner [:calls id :dispatches]))
+        (swap! owner update-in [:calls id] assoc :phase :exited :error error)))))
+
+(defn call-with-dispatch-accounting!
+  "Retain a model call before effects and through its physical exit. On error,
+   the original owner keeps every unresolved ledger command. This function
+   never repeats inference or authorizes another dispatch."
+  [f]
+  (let [owner (:dispatch-owner *model-scope*)
+        id (UUID/randomUUID) ds (atom [])]
+    (when owner
+      (locking owner
+        (when (:sealed? @owner)
+          (throw (ex-info "Model dispatch owner is sealed" {:type ::dispatch-owner-sealed})))
+        (swap! owner assoc-in [:calls id] {:dispatches ds :phase :active})))
+    (binding [*dispatches* ds *dispatch-call* id *dispatch-id* nil
+              *dispatch-thread* (Thread/currentThread)]
+      (try
+        (let [result (f)]
+          (settle-dispatches! nil)
+          (complete-dispatch-call! owner id ds)
+          result)
+        (catch Throwable original
+          (try
+            (settle-dispatches! nil)
+            (complete-dispatch-call! owner id ds)
+            (catch Throwable reconciliation
+                ;; Only now has this thread stopped touching the call. A HOST
+                ;; reconciler may claim it after this monotonic handoff.
+              (hold-dispatch-call! owner id ds reconciliation)
+              (when-not (identical? original reconciliation)
+                (.addSuppressed original reconciliation))))
+          (throw original))))))
+
+(defmacro with-dispatch-accounting [& body]
+  `(call-with-dispatch-accounting! (fn [] ~@body)))
+
+(defn dispatch-accounting-state
+  "Read-only process-local acknowledgement facts. Hold transfers are custody
+   evidence, NOT proof of usage consumption. Missing owner is unknown."
+  [owner]
+  (if-not owner
+    {:reservation-reconciliation :unknown :usage-consumption :not-established}
+    (let [{:keys [sealed? calls hold-transfers]} @owner]
+      {:admission-sealed? sealed?
+       :reservation-reconciliation (if (empty? calls) :complete :pending)
+       :usage-consumption :not-established
+       :hold-transfers hold-transfers
+       :calls (mapv (fn [[id {:keys [phase dispatches error]}]]
+                      {:id id :phase phase :error-class (some-> error class .getName)
+                       :dispatches (mapv #(select-keys % [:id :wallet :amount :status :egress-entered?
+                                                          :reserve-command-state :admission-command-state
+                                                          :hold-command-state :release-command-state
+                                                          :forfeit-command-state :settled?]) @dispatches)}) calls)})))
+
+(defn reconcile-dispatch-owner!
+  "After the executor's physical join, close admission and retain the original
+   owner until all submitted reservation/admission commands acknowledge.
+   Active conveyed calls are not classified as exited. This native finalizer
+   retries exact ledger commands only, never HTTP or consumer usage charging."
+  [owner]
+  (when owner
+    (locking owner (swap! owner assoc :sealed? true))
+    (loop []
+      (doseq [id (keys (:calls @owner))]
+        (when-let [call (locking owner
+                          (let [current (get-in @owner [:calls id])]
+                            (when (= :exited (:phase current))
+                              (swap! owner assoc-in [:calls id :phase] :reconciling)
+                              current)))]
+          (let [ds (:dispatches call)]
+            (binding [*dispatches* ds]
+              (try
+                (settle-dispatches! nil)
+                (complete-dispatch-call! owner id ds)
+                (catch Throwable error (hold-dispatch-call! owner id ds error)))))))
+      (when (seq (:calls @owner))
+        ;; Cleanup is externally supervised, like reconcile-return!. A store
+        ;; failure or interrupt cannot silently abandon its owned obligations.
+        (try (Thread/sleep 25) (catch InterruptedException _))
+        (recur)))))
 
 (defn- draw-held!
   "Consume up to `cost` of what `payer`'s hold has (`hold-wallet-id`), under
@@ -666,12 +872,14 @@
   (when-let [{:keys [room run-id cancel?]} *model-scope*]
     (when (or (.isInterrupted (Thread/currentThread)) (and cancel? (cancel?)))
       (throw (java.util.concurrent.CancellationException. "Model admission cancelled")))
-    (let [payer (or (current-payer) {:room room :wallet (run-wallet-id run-id)})]
-      (store/-transfer-resources!
-       (resource-store! (:room payer))
-       {:id (UUID/randomUUID) :kind :consume
-        :source (kontor/account-ref (:wallet payer)) :destination kontor/sink-account
-        :resources {model-dispatches 1M}}))))
+    (let [payer (or (current-payer) {:room room :wallet (run-wallet-id run-id)})
+          command {:id (UUID/randomUUID) :kind :consume
+                   :source (kontor/account-ref (:wallet payer)) :destination kontor/sink-account
+                   :resources {model-dispatches 1M}}]
+      (if-let [record (current-dispatch)]
+        (do (update-dispatch! (:id record) assoc :admission-command command :admission-payer payer)
+            (submit-dispatch-command! (:id record) :admission-command payer))
+        (store/-transfer-resources! (resource-store! (:room payer)) command)))))
 
 (defn return!
   "Return an explicit positive vector from a Run to its immediate parent/Room."

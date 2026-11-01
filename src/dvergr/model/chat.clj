@@ -377,7 +377,7 @@
       ;; Every dispatch of a funded call reserved a bound of its cost; they
       ;; are settled here, once each: the answer's against its usage, the
       ;; rest kept unless the provider refused them (`resource/settle-dispatches!`).
-      (binding [resource/*dispatches* (atom [])]
+      (resource/with-dispatch-accounting
         (let [response
               (try
                 (loop [attempt 0]
@@ -395,7 +395,7 @@
                 (catch Throwable e
                   (resource/settle-dispatches! nil)
                   (throw e)))
-              reserved? (seq @resource/*dispatches*)
+              reserved? (some :reserve-command @resource/*dispatches*)
               ;; only usage the provider reported as final settles: a stream
               ;; that ended without it, or an unpriced answer, forfeits its
               ;; reservation, which then stands for its cost, so no usage is

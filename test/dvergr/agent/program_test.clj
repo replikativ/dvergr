@@ -1240,6 +1240,66 @@
               (is (= :discarded (:run/settlement-status result))))))
         (finally (close-resource-test-room! room conn))))))
 
+(deftest unresolved-dispatch-ack-keeps-the-original-run-before-return-and-world-settlement
+  (let [[room conn] (resource-test-room (keyword (str "held-dispatch-" (random-uuid))))
+        st (:store room) fail? (atom true) owner (promise) finished (promise) entered (atom 0)
+        team (roster/make-agent (roster/make-roster)
+                                {:id :candidate :model-policy {:provider :test :model "stub"}
+                                 :program {:kind :llm :max-model-steps 1}})
+        wrapped (reify room-store/PRoomStore
+                  (-load-run [_ room-id run-id] (room-store/-load-run st room-id run-id))
+                  room-store/PResourceStore
+                  (-open-resource-wallet! [_ spec] (room-store/-open-resource-wallet! st spec))
+                  (-install-resource-unit! [_ spec] (room-store/-install-resource-unit! st spec))
+                  (-allocate-resource-wallet! [_ wallet transfer] (room-store/-allocate-resource-wallet! st wallet transfer))
+                  (-resource-balance [_ account] (room-store/-resource-balance st account))
+                  (-resource-receipt [_ id] (room-store/-resource-receipt st id))
+                  (-transfer-resources! [_ command]
+                    (let [value (room-store/-transfer-resources! st command)]
+                      (when (and @fail? (= :consume (:kind command))
+                                 (contains? (:resources command) resource/model-dispatches))
+                        (throw (java.io.IOException. "Admission committed; acknowledgement unavailable")))
+                      value)))
+        protocol {:run (fn [{:keys [model-scope]}]
+                         (deliver owner (:dispatch-owner model-scope))
+                         (binding [gateway/*request-fn* (fn [_] (swap! entered inc) {:status 200})]
+                           (gateway/request! {:url "https://model.test/responses"
+                                              :credentials (gateway/static-credentials :test {} #{"https://model.test"})})))}]
+    (try
+      (resource/install-unit! room {:symbol resource/model-dispatches :name "Admission" :precision 0})
+      (resource/mint! room {:id (random-uuid) :resources {resource/model-dispatches 2M}})
+      (with-redefs-fn {(ns-resolve 'dvergr.resource 'resource-store!) (constantly wrapped)}
+        (fn []
+          (let [handle (binding [ec/*execution-context* (:ctx room)]
+                         (program/hire-prepared-in! room room team :candidate
+                                                    {:task "pending accounting" :settlement :discard
+                                                     :resources {resource/model-dispatches 2M}} nil protocol))
+                id (program/run-id handle)
+                dispatch-owner (deref owner 10000 nil)]
+            (binding [ec/*execution-context* (:ctx room)]
+              ((program/owned-result-spin handle) #(deliver finished %) #(deliver finished %)))
+            (is (some? dispatch-owner))
+            (is (wait-until #(and dispatch-owner (:sealed? @dispatch-owner)) 10000))
+            (is (= ::pending (deref finished 20 ::pending)))
+            (is (= :pending (:reservation-reconciliation (run/observe-settlement room id))))
+            (is (true? (:workers-quiesced? (run/observe-settlement room id))))
+            (is (nil? (room-store/-resource-receipt st (resource/return-id id))))
+            (is (seq (filter #(= id (:run/id %)) (run/active-runs (:id room)))))
+            (is (= :open (:run/settlement-status (run/run room id))))
+            (is (zero? @entered))
+            (reset! fail? false)
+            (let [result (deref finished 10000 ::timeout)]
+              (is (= :failed (:run/status result)))
+              (is (= :discarded (:run/settlement-status result))))
+            (is (= {resource/model-dispatches 1M} (resource/balance room)))
+            (is (= {} (resource/run-balance room id)))
+            (is (= :unknown (:reservation-reconciliation (run/observe-settlement room id))))
+            (is (empty? (run/active-runs (:id room)))))))
+      (finally
+        (reset! fail? false)
+        (when (realized? owner) (deref finished 10000 nil))
+        (close-resource-test-room! room conn)))))
+
 (deftest a-protocol-run-spends-its-own-dispatch-admissions
   ;; A protocol (an environment's conversation, a benchmark's model step) is
   ;; the Run's program, so its model calls are governed like an LLM program's:
