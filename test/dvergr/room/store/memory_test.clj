@@ -13,6 +13,9 @@
 (deftest run-causality-contract
   (contract/assert-run-causality! (memory/make) :run-causes-memory))
 
+(deftest job-cleanup-witness-contract
+  (contract/assert-job-cleanup-witnesses! (memory/make) :job-cleanup-memory))
+
 (deftest attention-projection-contract
   (contract/assert-attention-projection! (memory/make) :attention-memory))
 

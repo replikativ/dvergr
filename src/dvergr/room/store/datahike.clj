@@ -418,6 +418,7 @@
     :run/agent-def-hash :run/chat-id
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason
+    :run/job-core-cleanup-ack :run/job-adapter-cleanup-ack
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error :run/savepoint :run/conversation-ref :run/resumed-by :run/search :run/role])
 
@@ -500,6 +501,8 @@
     (assoc :run/settlement-status (:run/settlement-status run))
     (:run/settlement-reason run)
     (assoc :run/settlement-reason (:run/settlement-reason run))
+    (:run/job-core-cleanup-ack run) (assoc :run/job-core-cleanup-ack (:run/job-core-cleanup-ack run))
+    (:run/job-adapter-cleanup-ack run) (assoc :run/job-adapter-cleanup-ack (:run/job-adapter-cleanup-ack run))
     (:run/ended-at run) (assoc :run/ended-at (:run/ended-at run))
     (:run/savepoint run) (assoc :run/savepoint (:run/savepoint run))
     (:run/conversation-ref run) (assoc :run/conversation-ref (:run/conversation-ref run))

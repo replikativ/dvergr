@@ -18,6 +18,7 @@
   (:require [dvergr.runtime.threads :as threads]
             [dvergr.agent.run :as run]
             [dvergr.room.registry :as rreg]
+            [dvergr.room.store :as store]
             [org.replikativ.spindel.engine.core :as ec]
             [org.replikativ.spindel.engine.impl.simple :as simple]
             [org.replikativ.spindel.spin.core :as spin-core]
@@ -25,7 +26,7 @@
 
 (def kinds
   "The Run kinds a job has."
-  #{:workflow :experiment})
+  store/job-run-kinds)
 
 (def max-wait-ms
   "Longest a status call blocks: below the shortest common client timeout."
@@ -73,7 +74,8 @@
     (catch Throwable _ "Job failed")))
 
 (def ^:private next-stage
-  {:before-finish :persist :persist :settled :settled :release :release :done})
+  {:before-finish :core-ack :core-ack :persist :persist :settled
+   :settled :adapter-ack :adapter-ack :release :release :done})
 
 (defn- retained-run! [{:keys [id room state]}]
   (let [{:keys [outcome]} @state
@@ -94,6 +96,8 @@
     (binding [ec/*execution-context* (:ctx room)]
       (case stage
         :before-finish (when before-finish (before-finish id status (or error value)))
+        :core-ack (run/acknowledge-job-cleanup! room id :core)
+        :adapter-ack (run/acknowledge-job-cleanup! room id :adapter)
         :persist (do (run/retain-finished! id status opts) (retained-run! owner))
         :settled (when settled (settled status (or error value)))
         :release (when (some #(= id (:run/id %)) (run/active-runs (:id room)))
@@ -159,6 +163,16 @@
                       {:type ::stale-recovery :job id})))
     (try
       (when (= :acknowledge action)
+        ;; A persistence acknowledgement cannot invent a missing durable ACK.
+        (when-let [ack-stage ({:core-ack :core :adapter-ack :adapter} (:stage current))]
+          (let [room (:room owner)
+                durable (binding [ec/*execution-context* (:ctx room)] (run/run room id))]
+            (when-not (store/job-cleanup-acknowledged? durable ack-stage)
+              (throw (ex-info "Job cleanup acknowledgement is not durable"
+                              {:type ::cleanup-ack-unconfirmed :job id :stage (:stage current)})))
+            ;; Lost ACK may have left the live Run cache stale. Confirm and
+            ;; synchronize it through the same original-owner writer.
+            (run/acknowledge-job-cleanup! room id ack-stage)))
         ;; A persistence acknowledgement cannot invent the retained Run lease.
         (when (= :persist (:stage current)) (retained-run! owner))
         (when (and (= :release (:stage current))
@@ -182,6 +196,8 @@
    :parent names a parent Run and :actor the owner (default :dvergr). `finish`
    observes the work value; `reason-of` supplies an optional reason keyword."
   [room {:keys [kind parent ctx actor]} work & {:keys [finish settled reason-of before-finish]}]
+  (when-not (satisfies? store/PRoomStore (:store room))
+    (throw (ex-info "Jobs require a durable Room store" {:type ::durable-store-required})))
   (when-not (contains? kinds kind)
     (throw (ex-info "Unknown job kind" {:type ::unknown-kind :kind kind :kinds kinds})))
   (let [ctx (or ctx (:ctx room))
@@ -216,6 +232,30 @@
         (throw error)))
     (job room r)))
 
+(defn- settlement-observation [room r]
+  (let [id (:run/id r)]
+    (when (and r (kinds (:run/kind r)))
+      (let [core? (store/job-cleanup-acknowledged? r :core)
+            adapter? (store/job-cleanup-acknowledged? r :adapter)
+            owner (get @live id)
+            lease? (some #(= id (:run/id %)) (run/active-runs (:id room)))
+            terminal? (contains? store/terminal-run-statuses (:run/status r))]
+        {:id id :outcome (:run/status r)
+         :core-cleanup (cond-> {:state (if core? :acknowledged (if owner :pending :unknown))}
+                         core? (assoc :ack (:run/job-core-cleanup-ack r)))
+         :adapter-cleanup (cond-> {:state (if adapter? :acknowledged (if owner :pending :unknown))}
+                            adapter? (assoc :ack (:run/job-adapter-cleanup-ack r)))
+         :owner-state (if owner :live :missing)
+         :execution-lease (if lease? :held :absent)
+         :settled? (boolean (and terminal? core? adapter? (not owner) (not lease?)))}))))
+
+(defn observe-settlement
+  "HOST facts for a Job in an explicit Room, including after restart. Native
+   witnesses certify configured hooks, not arbitrary effects or acceptance.
+   Missing owner without witnesses is unknown, never settled."
+  [room id]
+  (settlement-observation room (binding [ec/*execution-context* (:ctx room)] (run/run room id))))
+
 (defn status
   "The job `id` (its Run's id), waiting up to `wait-ms` (capped at
    `max-wait-ms`) for it to finish; nil for an unknown id. Also returns the
@@ -233,7 +273,7 @@
        ;; this owner remain until every native cleanup stage acknowledges.
        (let [current (some-> (get @live id) :state deref)]
          (some-> (job room r)
-                 (assoc :room-value room :settled? (not (contains? @live id)))
+                 (assoc :room-value room :settled? (true? (:settled? (settlement-observation room r))))
                  (cond-> (= :held (:phase current))
                    (assoc :cleanup-required? true :cleanup-stage (:stage current)))))))))
 

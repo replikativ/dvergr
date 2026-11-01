@@ -1678,7 +1678,10 @@
                                                        (when-not ok?
                                                          (tel/log! {:level :warn :id ::fixture-room-not-archived
                                                                     :data {:room (id->str (:id r)) :error error}}
-                                                                   "A benchmark's fixture room could not be archived")))))
+                                                                   "A benchmark's fixture room could not be archived")
+                                                         (throw (ex-info "Benchmark fixture retirement was not acknowledged"
+                                                                         {:type ::fixture-retirement-unconfirmed
+                                                                          :room (:id r) :error error}))))))
                              (jobs/start! r (job-opts {:kind :experiment})
                                           #(runner/run-in r (assoc plan :experiment exp :parent-run %))
                                           :reason-of refused-reason))

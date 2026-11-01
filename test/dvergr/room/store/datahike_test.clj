@@ -28,6 +28,11 @@
       (schema/ensure-full-schema! conn)
       [conn (dhs/make conn)])))
 
+(deftest job-cleanup-witness-contract
+  (let [[conn st] (mem-store)]
+    (try (contract/assert-job-cleanup-witnesses! st :job-cleanup-datahike)
+         (finally (dh/release conn)))))
+
 (defn- store-running-run! [st room-id run-id]
   (let [now (java.util.Date.)]
     (store/-store-run!

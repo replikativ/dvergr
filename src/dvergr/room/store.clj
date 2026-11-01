@@ -419,6 +419,25 @@
          (remove #(contains? applied (:attention/id %)))
          vec)))
 
+(def job-run-kinds #{:workflow :experiment})
+
+(def job-cleanup-attributes
+  {:core :run/job-core-cleanup-ack :adapter :run/job-adapter-cleanup-ack})
+
+(defn job-cleanup-ack-id
+  "Versioned native evidence identity, bound to the exact Job and stage."
+  [run-id stage]
+  (when-not (and (uuid? run-id) (contains? job-cleanup-attributes stage))
+    (throw (ex-info "Invalid Job cleanup witness identity" {:type :room-store/invalid-job-cleanup-ack})))
+  (java.util.UUID/nameUUIDFromBytes
+   (.getBytes (str "dvergr.job/" (name stage) "-cleanup-v1/" run-id)
+              java.nio.charset.StandardCharsets/UTF_8)))
+
+(defn job-cleanup-acknowledged? [run stage]
+  (boolean (and (uuid? (:run/id run)) (job-run-kinds (:run/kind run))
+                (= (job-cleanup-ack-id (:run/id run) stage)
+                   (get run (get job-cleanup-attributes stage))))))
+
 (def durable-run-keys
   #{:run/id :run/kind :run/room :run/actor :run/trigger :run/parent
     :run/caused-by
@@ -426,6 +445,7 @@
     :run/reason :run/error
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason
+    :run/job-core-cleanup-ack :run/job-adapter-cleanup-ack
     :run/roster :run/agent-version :run/program-kind
     :run/interpreter-version :run/agent-def-hash :run/chat-id
     ;; the part the Run plays for its parent (dvergr.agent.budget)
@@ -468,6 +488,15 @@
     (throw (ex-info "Invalid durable run status"
                     {:type :room-store/invalid-run-status
                      :status (:run/status run) :run run})))
+  (doseq [[stage attr] job-cleanup-attributes :when (contains? run attr)]
+    (when-not (job-cleanup-acknowledged? run stage)
+      (throw (ex-info "Invalid native Job cleanup acknowledgement"
+                      {:type :room-store/invalid-job-cleanup-ack :run-id (:run/id run) :stage stage}))))
+  (when (and (contains? run :run/job-adapter-cleanup-ack)
+             (not (and (job-cleanup-acknowledged? run :core)
+                       (terminal-run-statuses (:run/status run)))))
+    (throw (ex-info "Adapter cleanup acknowledgement requires core cleanup and terminal outcome"
+                    {:type :room-store/invalid-job-cleanup-order :run-id (:run/id run)})))
   (when (and (:run/parent run) (not (uuid? (:run/parent run))))
     (throw (ex-info ":run/parent must be a UUID"
                     {:type :room-store/invalid-run :key :run/parent :run run})))
@@ -525,6 +554,11 @@
 (defn validate-run-update!
   "Reject an update that changes identity or removes durable causal evidence."
   [existing run]
+  (doseq [[_ attr] job-cleanup-attributes]
+    (when (or (and (nil? existing) (contains? run attr))
+              (and (contains? existing attr) (not= (get existing attr) (get run attr))))
+      (throw (ex-info "Native Job cleanup acknowledgements are append-only after admission"
+                      {:type :room-store/immutable-job-cleanup-ack :run-id (:run/id run) :attribute attr}))))
   (when (and existing
              (not= (select-keys existing immutable-run-keys)
                    (select-keys run immutable-run-keys)))
