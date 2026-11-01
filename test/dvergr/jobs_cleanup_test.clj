@@ -4,16 +4,19 @@
             [dvergr.discourse :as d]
             [dvergr.jobs :as jobs]
             [dvergr.room.registry :as registry]
+            [dvergr.room.store :as store]
             [dvergr.room.store.memory :as memory]
             [org.replikativ.spindel.core :as sp]
             [org.replikativ.spindel.engine.context :as context]
             [org.replikativ.spindel.engine.core :as ec]))
 
-(defn- with-room [f]
-  (let [room (d/make-room {:id (keyword (str "job-cleanup-" (random-uuid))) :store (memory/make)})]
-    (try
-      (binding [ec/*execution-context* (:ctx room)] (registry/register! room) (f room))
-      (finally (d/close-room! room)))))
+(defn- with-room
+  ([f] (with-room identity f))
+  ([decorate f]
+   (let [room (d/make-room {:id (keyword (str "job-cleanup-" (random-uuid))) :store (decorate (memory/make))})]
+     (try
+       (binding [ec/*execution-context* (:ctx room)] (registry/register! room) (f room))
+       (finally (d/close-room! room))))))
 
 (defn- ready [room]
   (binding [ec/*execution-context* (:ctx room)] (sp/spin :done)))
@@ -38,6 +41,102 @@
 (defn- recover-held! [id]
   (dotimes [_ 4]
     (when-let [expected (jobs/recovery-state id)] (jobs/recover! id expected :retry))))
+
+(deftest terminal-job-without-cleanup-witnesses-is-not-settled-after-owner-loss
+  (with-room
+    (fn [room]
+      (let [id (:run/id (run/start! room :test (random-uuid) nil {:kind :workflow}))]
+        (run/finish! id :completed)
+        (is (= :completed (:status (jobs/status id))))
+        (is (false? (:settled? (jobs/status id))))))))
+
+(deftest missing-durable-store-is-refused-before-any-job-work
+  (with-room
+    (fn [room]
+      (let [called? (atom false)]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"durable Room store"
+                              (jobs/start! (assoc room :store nil) {:kind :workflow}
+                                           (fn [_] (reset! called? true) (ready room)))))
+        (is (false? @called?))
+        (is (empty? (run/active-runs (:id room))))))))
+
+(defn- fault-ack-store [delegate attribute fail? committed?]
+  (reify store/PRoomStore
+    (-store-room! [_ room-id metadata] (store/-store-room! delegate room-id metadata))
+    (-load-room [_ id] (store/-load-room delegate id))
+    (-delete-room! [_ id] (store/-delete-room! delegate id))
+    (-list-rooms [_] (store/-list-rooms delegate))
+    (-store-message! [_ room-id message] (store/-store-message! delegate room-id message))
+    (-message-thread-root [_ room-id id] (store/-message-thread-root delegate room-id id))
+    (-list-messages [_ room-id opts] (store/-list-messages delegate room-id opts))
+    (-store-run! [_ room-id value]
+      (if (and @fail? (contains? value attribute))
+        (do (when committed? (store/-store-run! delegate room-id value))
+            (throw (ex-info "Cleanup witness acknowledgement unavailable" {})))
+        (store/-store-run! delegate room-id value)))
+    (-load-run [_ room-id id] (store/-load-run delegate room-id id))
+    (-list-runs [_ room-id opts] (store/-list-runs delegate room-id opts))))
+
+(deftest cleanup-witness-write-failure-never-replays-the-successful-hook
+  (doseq [stage [:core :adapter] committed? [false true]]
+    (let [fail? (atom true) attr (get store/job-cleanup-attributes stage)]
+      (with-room
+        #(fault-ack-store % attr fail? committed?)
+        (fn [room]
+          (let [core (atom 0) adapter (atom 0)
+                job (jobs/start! room {:kind :workflow} (fn [_] (ready room))
+                                 :before-finish (fn [& _] (swap! core inc))
+                                 :settled (fn [& _] (swap! adapter inc)))
+                id (:id job)]
+            (try
+              (let [expected (held! id)]
+                (is (= (if (= stage :core) :core-ack :adapter-ack) (:stage expected)))
+                (is (= 1 @core))
+                (is (= (if (= stage :core) 0 1) @adapter))
+                (is (active? room id))
+                (is (false? (:settled? (jobs/observe-settlement room id))))
+                (is (= committed? (store/job-cleanup-acknowledged? (run/run room id) stage)))
+                (when-not committed?
+                  (is (thrown? clojure.lang.ExceptionInfo (jobs/recover! id expected :acknowledge)))
+                  (is (= (:stage expected) (:stage (jobs/recovery-state id)))))
+                (reset! fail? false)
+                (is (:settled? (jobs/recover! id (jobs/recovery-state id) :retry)))
+                (is (= [1 1] [@core @adapter]))
+                (is (store/job-cleanup-acknowledged? (run/run room id) :core))
+                (is (store/job-cleanup-acknowledged? (run/run room id) :adapter))
+                (is (:settled? (jobs/observe-settlement room id))))
+              (finally (reset! fail? false) (recover-held! id)))))))))
+
+(deftest cleanup-witness-cache-repair-preserves-concurrent-cancellation
+  (with-room
+    (fn [room]
+      (let [id (:run/id (run/start! room :test (random-uuid) nil {:kind :workflow}))
+            state (:state (:store room)) key (Object.)]
+        (try
+          (add-watch state key
+                     (fn [_ _ before after]
+                       (let [path [:runs (store/conversation-id room) id :run/job-core-cleanup-ack]]
+                         (when (and (nil? (get-in before path)) (get-in after path))
+                           (run/cancel-run! id)))))
+          (run/acknowledge-job-cleanup! room id :core)
+          (is (store/job-cleanup-acknowledged? (run/run room id) :core))
+          (is (= :cancelling (:run/status (first (filter #(= id (:run/id %)) (run/active-runs (:id room)))))))
+          (finally (remove-watch state key) (run/finish! id :cancelled)))))))
+
+(deftest job-status-uses-one-durable-snapshot-for-outcome-and-settlement
+  (with-room
+    (fn [room]
+      (let [job (jobs/start! room {:kind :workflow} (fn [_] (ready room))) id (:id job)]
+        (is (:settled? (jobs/status id 5000)))
+        (let [terminal (run/run room id)
+              earlier (-> terminal (assoc :run/status :running) (dissoc :run/ended-at :run/job-adapter-cleanup-ack))
+              reads (atom 0)]
+          (with-redefs [jobs/job-room (constantly room)
+                        run/run (fn [& _] (if (= 1 (swap! reads inc)) earlier terminal))]
+            (let [status (jobs/status id)]
+              (is (= :running (:status status)))
+              (is (false? (:settled? status)))
+              (is (= 1 @reads)))))))))
 
 (deftest failed-core-cleanup-retains-owner-and-explicit-recovery-does-not-replay-work
   (with-room

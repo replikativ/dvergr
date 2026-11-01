@@ -627,6 +627,16 @@
     :db/index true
     :db/doc "Runs whose resolved results this run explicitly observed; unlike :run/parent, this is a causal dependency and may have many values"}
 
+   {:db/ident :run/job-core-cleanup-ack
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/doc "Versioned acknowledgement of this Job's configured core cleanup boundary"}
+
+   {:db/ident :run/job-adapter-cleanup-ack
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/doc "Versioned acknowledgement of this Job's configured adapter cleanup boundary"}
+
    {:db/ident :run/roster
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one

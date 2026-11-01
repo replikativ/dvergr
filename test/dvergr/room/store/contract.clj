@@ -8,6 +8,37 @@
             [dvergr.room.store :as store]
             [hasch.core :as hasch]))
 
+(defn assert-job-cleanup-witnesses! [st room-id]
+  (store/-store-room! st room-id {:slug (name room-id)})
+  (let [id (random-uuid) now (java.util.Date. 1000)
+        base {:run/id id :run/kind :workflow :run/room room-id :run/actor :test
+              :run/trigger (random-uuid) :run/status :running
+              :run/created-at now :run/started-at now :run/updated-at now}
+        core (assoc base :run/job-core-cleanup-ack (store/job-cleanup-ack-id id :core))
+        terminal (assoc core :run/status :completed :run/ended-at now)
+        complete (assoc terminal :run/job-adapter-cleanup-ack (store/job-cleanup-ack-id id :adapter))
+        put! #(store/-store-run! st room-id %)]
+    (is (thrown? clojure.lang.ExceptionInfo (put! core)) "Admission cannot arrive pre-acknowledged")
+    (put! base)
+    (doseq [bad [(assoc core :run/job-core-cleanup-ack (random-uuid))
+                 (assoc core :run/job-core-cleanup-ack (store/job-cleanup-ack-id (random-uuid) :core))
+                 (assoc core :run/job-core-cleanup-ack (store/job-cleanup-ack-id id :adapter))
+                 (assoc base :run/job-adapter-cleanup-ack (store/job-cleanup-ack-id id :adapter))
+                 (assoc complete :run/status :running)]]
+      (is (thrown? clojure.lang.ExceptionInfo (put! bad))))
+    (put! core)
+    (is (store/job-cleanup-acknowledged? (store/-load-run st room-id id) :core))
+    (is (thrown? clojure.lang.ExceptionInfo (put! base)) "A stale writer cannot strip the ACK")
+    (put! terminal)
+    (put! complete)
+    (put! complete)
+    (is (store/job-cleanup-acknowledged? (store/-load-run st room-id id) :adapter))
+    (is (thrown? clojure.lang.ExceptionInfo (put! terminal)))
+    (let [other (random-uuid) agent (assoc base :run/id other :run/kind :agent-task)]
+      (put! agent)
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (put! (assoc agent :run/job-core-cleanup-ack (store/job-cleanup-ack-id other :core))))))))
+
 (defn assert-cross-room-scorecard-identity!
   "One certified Scorecard content identity has exactly one control Room owner."
   [st]

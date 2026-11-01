@@ -510,6 +510,41 @@
                                :run/id run-id
                                :run/settlement-status status}))))))))
 
+(defn acknowledge-job-cleanup!
+  "Record one configured native Job cleanup boundary while its original
+   execution lease protects this exact Room. Retry confirms a committed ACK
+   and synchronizes the live projection without replaying cleanup."
+  [room run-id stage]
+  (let [attribute (get store/job-cleanup-attributes stage)
+        ack (store/job-cleanup-ack-id run-id stage)]
+    (with-run-lock run-id
+      (let [entry (get @active run-id)]
+        (when-not (and entry (= (:id room) (get-in entry [:run :run/room]))
+                       (identical? (:ctx room) (:execution-context entry))
+                       (identical? (:store room) (:store entry)))
+          (throw (ex-info "Job cleanup acknowledgement has no original live owner"
+                          {:type ::cleanup-owner-unavailable :run/id run-id})))
+        (binding [ec/*execution-context* (:ctx room)]
+          (let [st (:store entry) conversation (:store-room-id entry)
+                durable (store/-load-run st conversation run-id)]
+            (when-not durable
+              (throw (ex-info "Job cleanup owner is not durable" {:type ::run-not-found :run/id run-id})))
+            (when-not (store/job-cleanup-acknowledged? durable stage)
+              (when-not (store/-store-run! st conversation (assoc durable attribute ack :run/updated-at (java.util.Date.)))
+                (throw (ex-info "Job cleanup acknowledgement was not durable"
+                                {:type ::cleanup-ack-unconfirmed :run/id run-id :stage stage}))))
+            (let [confirmed (store/-load-run st conversation run-id)]
+              (when-not (store/job-cleanup-acknowledged? confirmed stage)
+                (throw (ex-info "Job cleanup acknowledgement was not confirmed"
+                                {:type ::cleanup-ack-unconfirmed :run/id run-id :stage stage})))
+              (locking lifecycle-lock
+                ;; Cancellation can update the live lifecycle without taking
+                ;; this Run's persistence lock. Repair only the confirmed ACK
+                ;; fields; never replace a concurrent :cancelling projection.
+                (swap! active update-in [run-id :run]
+                       merge (select-keys confirmed (vals store/job-cleanup-attributes))))
+              ack)))))))
+
 (defn record-savepoint!
   "Keep `data` (a portable savepoint, `savepoint.portable/persist`) as the live
    Run's latest point to resume from (doc/runs.md, Resuming a Run). Durable and in the
