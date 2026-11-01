@@ -910,3 +910,14 @@ control room; the result Spin still belongs to the caller world. Ordinary SCI
 fixture and any physical checker capacity until descendant cleanup joins;
 deleting author files alone does not hide their Git history. Neither API
 mints money or provider admissions.
+
+
+That HOST arity also accepts optional `:admit! (fn [job-id] ...)` and
+`:settled! (fn [status value] ...)` physical-owner hooks. Admission runs before
+resource allocation or experiment work. Settlement runs only after native
+physical cleanup and resource return, before result delivery and the parent's
+owned-child acknowledgement. A failed settlement hook leaves the native Job
+held for explicit recovery; it must not release a permit or publish success
+prematurely. Hooks must be idempotent across acknowledged recovery stages.
+A fixed host can thus bound concurrent checker work without observing an
+otherwise ignored result Spin or inventing a second lifetime mechanism.

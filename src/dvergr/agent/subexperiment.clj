@@ -30,9 +30,10 @@
   ([control-room work-room team definition opts authority]
    (start! control-room work-room team definition opts authority {}))
   ([control-room work-room team definition opts authority host-options]
-   (when-not (and (map? host-options) (every? #{:world-parent} (keys host-options))
+   (when-not (and (map? host-options) (every? #{:world-parent :admit! :settled!} (keys host-options))
                   (or (not (contains? host-options :world-parent))
-                      (some? (:world-parent host-options))))
+                      (some? (:world-parent host-options)))
+                  (every? #(or (not (contains? host-options %)) (fn? (get host-options %))) [:admit! :settled!]))
      (throw (ex-info "Invalid HOST child experiment options" {:type ::invalid-host-options})))
    (let [{:keys [resources parallelism capabilities]} (admission/plan team definition opts authority)
          parent (:parent-run authority)
@@ -49,6 +50,7 @@
                  (jobs/start!
                   control-room (cond-> {:kind :experiment :ctx execution-ctx} parent (assoc :parent parent))
                   (fn [id]
+                    (when-let [admit! (:admit! host-options)] (admit! id))
                     (when (seq resources)
                       (reset! allocation :attempting)
                       (resource/allocate-run! control-room id parent resources)
@@ -66,6 +68,10 @@
                       (when failure (throw failure))))
                   :settled
                   (fn [status value]
+                    (when-let [settled! (:settled! host-options)]
+                       ;; A failed physical release leaves the Job AND parent
+                       ;; acknowledgement held. Never publish before this hook.
+                      (settled! status value))
                     (try
                       (binding [ec/*execution-context* ctx]
                         (sp/deliver! done (cond-> {:status status}
