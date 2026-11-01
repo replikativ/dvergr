@@ -618,7 +618,10 @@
   (when-let [r (current-dispatch)]
     (when (and (not (:settled? r)) (nil? (:status r)))
       (let [id (:id r)]
-        (update-dispatch! id assoc :status status)
+        ;; A native HTTP status also acknowledges provider entry. The
+        ;; pre-invocation marker remains necessary for response-less failures.
+        (update-dispatch! id #(cond-> (assoc % :status status)
+                               (number? status) (assoc :egress-entered? true)))
         (when (refused? status)
           (let [plan (settlement-plan (dispatch-record id) nil false)]
             (update-dispatch! id #(if (:settlement %) % (merge % plan {:settlement plan}))))
