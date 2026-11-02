@@ -474,6 +474,58 @@
         (finally
           (d/close-room! r))))))
 
+(deftest required-replies-cannot-silently-complete
+  (doseq [[sender content expected-status] [[:alice "[SKIP]" :failed]
+                                            [:alice "" :failed]
+                                            [:alice nil :failed]
+                                            [:alice "Here is the plan." :completed]
+                                            [:peer "[SKIP]" :completed]]]
+    (let [r (d/make-room {:id (keyword (str "required-reply-" (random-uuid)))
+                          :store (memory/make)})
+          calls (atom 0)
+          participant (binding [ec/*execution-context* (:ctx r)]
+                        (llm/llm-agent
+                         {:id :worker :spec {:provider :mock :model "mock"}
+                          :reply-required? #(= :alice (:from %))
+                          :run-turn-fn (fn [chat-ctx _]
+                                         (swap! calls inc)
+                                         (cc/add-message! chat-ctx {:role :assistant :content content})
+                                         :complete)}))]
+      (binding [ec/*execution-context* (:ctx r)] (d/join r participant))
+      (try
+        (let [trigger (d/message sender :worker "Please design a workflow.")]
+          (d/post! r trigger)
+          (is (await-condition #(= expected-status (:run/status (first (run/runs r)))) wait-ms))
+          (is (= 1 @calls) "a missing reply must not silently spend on a retry")
+          (let [messages (d/messages r {:limit 20})
+                errors (filter #(= :_activity (:to %)) messages)]
+            (if (= :failed expected-status)
+              (do
+                (is (= 1 (count errors)))
+                (is (= (:id trigger) (:in-reply-to (first errors))))
+                (is (re-find #"without answering" (:content (first errors))))
+                (is (= :error (:run/reason (first (run/runs r))))))
+              (is (empty? errors)))
+            (is (empty? (filter #(= "[SKIP]" (:content %)) messages)))))
+        (finally (d/close-room! r))))))
+
+(deftest cancelled-required-reply-does-not-report-missing-answer
+  (let [r (d/make-room {:id :cancelled-required-reply :store (memory/make)})]
+    (binding [ec/*execution-context* (:ctx r)]
+      (d/join r (llm/llm-agent
+                 {:id :worker :spec {:provider :mock :model "mock"}
+                  :reply-required? (constantly true)
+                  :run-turn-fn (fn [chat-ctx {:keys [run-id]}]
+                                 (cc/add-message! chat-ctx {:role :assistant :content "[SKIP]"})
+                                 (run/cancel-run! run-id)
+                                 :complete)})))
+    (try
+      (d/post! r (d/message :alice :worker "go"))
+      (is (await-condition #(= :cancelled (:run/status (first (run/runs r)))) wait-ms))
+      (is (empty? (filter #(re-find #"without answering" (or (:content %) ""))
+                          (d/messages r {:limit 20}))))
+      (finally (d/close-room! r)))))
+
 (deftest a-reply-withheld-by-a-wrapper-completes-its-run
   (testing "any wrapper that drops the reply settles the Run, not only silence"
     (let [st (memory/make)

@@ -344,6 +344,10 @@
                   embedder hook threaded to `run-agent-turn!` — rewrites the
                   agent's outbound reply (e.g. resolve references) and returns
                   system notes injected into the chat-ctx for the next turn.
+   :reply-required? — optional (fn [inbound-message] → boolean). An embedder
+                  can require an answer to selected requests using its own
+                  authoritative actor identities. A silent answer then fails
+                  visibly through the normal turn-error path; it is not retried.
    :attention-policy — (fn [{:active-message :incoming-message :participant
                              :room}] → AttentionDecision).
                   Defaults to same-thread steer and different-thread queue.
@@ -355,7 +359,7 @@
                   (default: `*execution-context*`)"
   [{:keys [id spec tools sandbox db-conn budget compaction
            chat-ctx participant-context tool-ctx run-turn-fn ctx room-safe? on-reply
-           attention-policy]
+           attention-policy reply-required?]
     :or   {budget      {:dollars 1.0}
            compaction  {:auto? true :strategy :sync-before-turn}
            run-turn-fn default-run-turn
@@ -1002,7 +1006,25 @@
                          (let [error "turn ended without producing a reply — likely a provider/model resolution failure"]
                            (reset! errored error)
                            (turn/post-turn-error! room id error run-id msg)))
-                       (when-let [last-asst (when-not @errored
+                       ;; Silence is allowed for peer conversation, but an
+                       ;; embedder may require a visible outcome for a human
+                       ;; request. Check before extracting text: nil text is
+                       ;; also missing. Cancellation and pauses keep their own
+                       ;; outcome instead of becoming missing-answer failures.
+                       (when (and (not @errored) (not @cancelled?)
+                                  (not @policy-cancelled?) (not @wait-reason)
+                                  (not (run/cancel-requested? run-id))
+                                  (not= :cancelled (cc/get-status chat-ctx))
+                                  reply-required? (reply-required? msg)
+                                  (enr/silent-reply?
+                                   (some-> (last-assistant-message chat-ctx) assistant-text)))
+                         (let [error "ended without answering your request; completion has not been confirmed"]
+                           (reset! errored error)
+                           (turn/post-turn-error! room id error run-id msg)))
+                       (when-let [last-asst (when-not (or @errored @cancelled?
+                                                          @policy-cancelled?
+                                                          (run/cancel-requested? run-id)
+                                                          (= :cancelled (cc/get-status chat-ctx)))
                                               (let [la (last-assistant-message chat-ctx)]
                                                 (when (not= la pre-turn-last-asst) la)))]
                          (when-let [reply (assistant-text last-asst)]
@@ -1011,7 +1033,8 @@
                      ;; not have that fragment posted as its reply — the room
                      ;; would show code as an answer and other agents would reply
                      ;; TO it. Surface it as a non-triggering activity row instead.
-                           (if (quirks/code-fragment? reply)
+                           (cond
+                             (quirks/code-fragment? reply)
                              (do (tel/log! {:level :warn :id ::reply-was-code-fragment
                                             :data {:agent id}}
                                            "Suppressed a code fragment posing as a reply")
@@ -1025,6 +1048,7 @@
                      ;; record (metadata → store → seeding) so reasoning models
                      ;; (MiniMax M2 / Kimi / DeepSeek) keep their <think> context
                      ;; across a rehydrate/restart, not just within a live session.
+                             :else
                              (let [reasoning (or (:message/reasoning last-asst) (:reasoning last-asst))
                                    reply-spec
                                    (cond-> {:to (:from msg) :content reply
@@ -1088,6 +1112,7 @@
                           :compaction  compaction
                           :run-turn-fn run-turn-fn
                           :attention-policy attention-policy
+                          :reply-required? reply-required?
                           :on-reply    on-reply
                           ;; Built bare: the room-safety wrappers below re-thread
                           ;; through this factory and wrap the clone themselves, so
