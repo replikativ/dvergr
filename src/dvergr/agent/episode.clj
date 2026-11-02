@@ -5,6 +5,7 @@
    Run projection is joined at read time; the immutable receipt remains exactly
    as certified even when review later changes world settlement."
   (:require [dvergr.agent.attempt :as certified]
+            [dvergr.attempt.bounds :as bounds]
             [dvergr.room.store :as store]))
 
 (defn attempt
@@ -13,6 +14,21 @@
   (when-let [room-store (:store room)]
     (when (satisfies? store/PAttemptStore room-store)
       (store/-load-attempt room-store (store/conversation-id room) attempt-id))))
+
+(defn attempt-bounded
+  "Load one exact managed certified Attempt under fixed byte/collection limits.
+   Options may only lower ceilings. Caller owns current authorization, selected
+   context and Room/artifact lifetime; no legacy or unbounded fallback."
+  ([room attempt-id] (attempt-bounded room attempt-id {}))
+  ([room attempt-id options]
+   (let [budget (bounds/limits options)]
+     (when-not (uuid? attempt-id)
+       (throw (ex-info "An Attempt UUID is required" {:type ::invalid-attempt-id})))
+     (when-let [room-store (:store room)]
+       (if (satisfies? store/PBoundedAttemptStore room-store)
+         (store/-load-attempt-bounded room-store (store/conversation-id room) attempt-id budget)
+         (throw (ex-info "Room store has no bounded Attempt reader"
+                         {:type ::unsupported-bounded-attempts})))))))
 
 (defn attempts
   "List exact certified Attempts using the store's bounded typed filters."

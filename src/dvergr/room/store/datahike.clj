@@ -14,6 +14,7 @@
             [dvergr.agent.spend :as spend]
             [dvergr.agent.conversation-capture :as conversation]
             [dvergr.artifact :as artifact]
+            [dvergr.attempt.bounds :as attempt-bounds]
             [dvergr.chat.schema :as schema]
             [dvergr.chat.persist :as persist]
             [dvergr.room.store :as store]
@@ -578,6 +579,76 @@
              (mapv (fn [id] [:message/id id])
                    (:attempt/evidence-message-ids value))))))
 
+(defn- validate-attempt-projection [entity value]
+  (attempt/validate-attempt value)
+  (let [receipt (:attempt/receipt value)
+        definition (:attempt/environment value)
+        verifier (:environment/verifier definition)
+        metrics (:attempt/metrics receipt)
+        checks (into {}
+                     (map (juxt :attempt.check/key
+                                :attempt.check/passed?))
+                     (:attempt/checks entity))
+        projected {:attempt/id (:attempt/id value)
+                   :attempt/content-id (:attempt/content-id value)
+                   :attempt/environment-id (:environment/id definition)
+                   :attempt/environment-version (:environment/version definition)
+                   :attempt/environment-content-id
+                   (:environment/content-id definition)
+                   :attempt/verifier-id (:verifier/id verifier)
+                   :attempt/verifier-version (:verifier/version verifier)
+                   :attempt/provider (:attempt/provider receipt)
+                   :attempt/model (:attempt/model receipt)
+                   :attempt/status (:attempt/status receipt)
+                   :attempt/started-at
+                   (java.util.Date. ^long (:attempt/started-at receipt))
+                   :attempt/elapsed-ms (:attempt/elapsed-ms receipt)
+                   :attempt/certified-at
+                   (java.util.Date. ^long (:attempt/certified-at value))
+                   :attempt/reward (double (:attempt/reward receipt))
+                   :attempt/agent-def-hash (:attempt/agent-def-hash value)
+                   :attempt/program-kind (:program-kind metrics)
+                   :attempt/interpreter-version (:interpreter-version metrics)
+                   :attempt/prompt-id (:prompt-id metrics)
+                   :attempt/model-resolution (:model-resolution metrics)
+                   :attempt/model-steps (:model-steps metrics)
+                   :attempt/evidence-content-id
+                   (:attempt/evidence-content-id value)
+                   :attempt/settlement-intent
+                   (:attempt/settlement-intent value)
+                   :attempt/check-map (:attempt/checks receipt)
+                   :attempt/evidence-run-ids
+                   (:attempt/evidence-run-ids value)
+                   :attempt/evidence-message-ids
+                   (or (:attempt/evidence-message-ids value) #{})}
+        actual (assoc entity
+                      :attempt/check-map checks
+                      :attempt/evidence-run-ids
+                      (into #{} (map :run/id)
+                            (:attempt/evidence-runs entity))
+                      :attempt/evidence-message-ids
+                      (into #{} (map :message/id)
+                            (:attempt/evidence-messages entity)))]
+    (doseq [[k expected] (merge projected
+                                ;; Projected since these attributes exist;
+                                ;; checked where an Attempt has them.
+                                (select-keys
+                                 {:attempt/microdollars (get-in metrics [:spend :microdollars])
+                                  :attempt/notional-microdollars (get-in metrics [:spend :notional-microdollars])
+                                  :attempt/spend-priced? (:priced? (spend/measurements [(:spend metrics)]))
+                                  :attempt/notional-priced? (:notional-priced? (spend/measurements [(:spend metrics)]))
+                                  :attempt/usage-reported? (:usage-reported? (spend/measurements [(:spend metrics)]))
+                                  :attempt/experiment-content-id (:experiment-content-id metrics)
+                                  :attempt/experiment-candidate (:experiment-candidate metrics)
+                                  :attempt/inputs-id (:inputs-id metrics)}
+                                 (keys entity)))]
+      (when-not (= expected (get actual k))
+        (throw (ex-info "Attempt typed projection differs from exact payload"
+                        {:type :room-store/corrupt-attempt-projection
+                         :attempt/id (:attempt/id value)
+                         :key k :expected expected :actual (get actual k)}))))
+    value))
+
 (defn- entity->attempt [entity artifacts]
   (when entity
     (when-not (= :edn-v1 (:attempt/payload-codec entity))
@@ -590,74 +661,95 @@
                         {:type :room-store/missing-attempt-payload
                          :attempt/id (:attempt/id entity)
                          :artifact/ref (or (:attempt/payload-ref entity) (:attempt/payload-blob entity))})))
-      (attempt/validate-attempt value)
-      (let [receipt (:attempt/receipt value)
-            definition (:attempt/environment value)
-            verifier (:environment/verifier definition)
-            metrics (:attempt/metrics receipt)
-            checks (into {}
-                         (map (juxt :attempt.check/key
-                                    :attempt.check/passed?))
-                         (:attempt/checks entity))
-            projected {:attempt/id (:attempt/id value)
-                       :attempt/content-id (:attempt/content-id value)
-                       :attempt/environment-id (:environment/id definition)
-                       :attempt/environment-version (:environment/version definition)
-                       :attempt/environment-content-id
-                       (:environment/content-id definition)
-                       :attempt/verifier-id (:verifier/id verifier)
-                       :attempt/verifier-version (:verifier/version verifier)
-                       :attempt/provider (:attempt/provider receipt)
-                       :attempt/model (:attempt/model receipt)
-                       :attempt/status (:attempt/status receipt)
-                       :attempt/started-at
-                       (java.util.Date. ^long (:attempt/started-at receipt))
-                       :attempt/elapsed-ms (:attempt/elapsed-ms receipt)
-                       :attempt/certified-at
-                       (java.util.Date. ^long (:attempt/certified-at value))
-                       :attempt/reward (double (:attempt/reward receipt))
-                       :attempt/agent-def-hash (:attempt/agent-def-hash value)
-                       :attempt/program-kind (:program-kind metrics)
-                       :attempt/interpreter-version (:interpreter-version metrics)
-                       :attempt/prompt-id (:prompt-id metrics)
-                       :attempt/model-resolution (:model-resolution metrics)
-                       :attempt/model-steps (:model-steps metrics)
-                       :attempt/evidence-content-id
-                       (:attempt/evidence-content-id value)
-                       :attempt/settlement-intent
-                       (:attempt/settlement-intent value)
-                       :attempt/check-map (:attempt/checks receipt)
-                       :attempt/evidence-run-ids
-                       (:attempt/evidence-run-ids value)
-                       :attempt/evidence-message-ids
-                       (or (:attempt/evidence-message-ids value) #{})}
-            actual (assoc entity
-                          :attempt/check-map checks
-                          :attempt/evidence-run-ids
-                          (into #{} (map :run/id)
-                                (:attempt/evidence-runs entity))
-                          :attempt/evidence-message-ids
-                          (into #{} (map :message/id)
-                                (:attempt/evidence-messages entity)))]
-        (doseq [[k expected] (merge projected
-                                    ;; Projected since these attributes exist;
-                                    ;; checked where an Attempt has them.
-                                    (select-keys
-                                     {:attempt/microdollars (get-in metrics [:spend :microdollars])
-                                      :attempt/notional-microdollars (get-in metrics [:spend :notional-microdollars])
-                                      :attempt/spend-priced? (:priced? (spend/measurements [(:spend metrics)]))
-                                      :attempt/notional-priced? (:notional-priced? (spend/measurements [(:spend metrics)]))
-                                      :attempt/usage-reported? (:usage-reported? (spend/measurements [(:spend metrics)]))
-                                      :attempt/experiment-content-id (:experiment-content-id metrics)
-                                      :attempt/experiment-candidate (:experiment-candidate metrics)
-                                      :attempt/inputs-id (:inputs-id metrics)}
-                                     (keys entity)))]
-          (when-not (= expected (get actual k))
-            (throw (ex-info "Attempt typed projection differs from exact payload"
-                            {:type :room-store/corrupt-attempt-projection
-                             :attempt/id (:attempt/id value)
-                             :key k :expected expected :actual (get actual k)}))))
-        value))))
+      (validate-attempt-projection entity value))))
+
+(def ^:private attempt-header-pull-pattern
+  ;; No component/relation expansion, including Datahike's default pull limit.
+  (vec (remove #{:attempt/payload-blob} (filter keyword? attempt-pull-pattern))))
+
+(defn- bounded-attempt-relations [db entity attribute maximum]
+  (let [references (into [] (take (inc maximum)) (dh/datoms db :eavt entity attribute))]
+    (when (> (count references) maximum)
+      (throw (ex-info "Attempt relation exceeds read limit"
+                      {:type :room-store/attempt-read-limit :relation attribute})))
+    references))
+
+(defn- attempt-owned-reference [db reference pattern owner-attribute chat-id]
+  (let [child (dh/pull db (conj pattern {owner-attribute [:chat/id]}) (:v reference))]
+    (when-not (and child (uuid? (get child (first pattern)))
+                   (= chat-id (get-in child [owner-attribute :chat/id])))
+      (throw (ex-info "Attempt evidence is missing or outside its Room"
+                      {:type :room-store/foreign-attempt-evidence :relation owner-attribute})))
+    child))
+
+(defn- load-bounded-attempt [conn artifacts room-id attempt-id options]
+  (let [budget (attempt-bounds/limits options)]
+    (when-not (and (some? room-id) (uuid? attempt-id))
+      (throw (ex-info "An exact Room and Attempt UUID are required"
+                      {:type :room-store/invalid-attempt-id})))
+    (let [db @conn slug (store/room-id->slug room-id)]
+      (when-let [[entity chat-id]
+                 (dh/q '[:find [?a ?chat-id]
+                         :in $ ?slug ?id
+                         :where [?c :room/slug ?slug] [?c :chat/id ?chat-id]
+                         [?a :attempt/chat ?c] [?a :attempt/id ?id]]
+                       db slug attempt-id)]
+        (let [header (dh/pull db attempt-header-pull-pattern entity)
+              ;; Check every relation prefix before any child pull/blob read.
+              roots (bounded-attempt-relations db entity :attempt/run 1)
+              runs (bounded-attempt-relations db entity :attempt/evidence-runs (:max-evidence-runs budget))
+              messages (bounded-attempt-relations db entity :attempt/evidence-messages (:max-evidence-messages budget))
+              checks (bounded-attempt-relations db entity :attempt/checks (:max-checks budget))
+              ref (:attempt/payload-ref header)]
+          (when-not (= :edn-v1 (:attempt/payload-codec header))
+            (throw (ex-info "Unsupported Attempt payload codec"
+                            {:type :room-store/unsupported-attempt-payload})))
+          (when-not (uuid? ref)
+            (throw (ex-info "Bounded Attempts require managed UUID payloads"
+                            {:type :room-store/unsupported-bounded-attempt-payload})))
+          (when-not (= 1 (count roots))
+            (throw (ex-info "Attempt requires its exact root Run"
+                            {:type :room-store/corrupt-attempt-root})))
+          (let [root (attempt-owned-reference db (first roots)
+                                              [:run/id :run/status :run/agent-def-hash
+                                               :run/program-kind :run/interpreter-version]
+                                              :run/chat chat-id)
+                _ (when-not (and (= attempt-id (:run/id root))
+                                 (contains? #{:completed :failed :cancelled} (:run/status root))
+                                 (every? (fn [[attempt-key run-key]]
+                                           (= (get header attempt-key) (get root run-key)))
+                                         [[:attempt/status :run/status]
+                                          [:attempt/agent-def-hash :run/agent-def-hash]
+                                          [:attempt/program-kind :run/program-kind]
+                                          [:attempt/interpreter-version :run/interpreter-version]]))
+                    (throw (ex-info "Attempt root Run differs from its identity"
+                                    {:type :room-store/corrupt-attempt-root})))
+                children (mapv #(attempt-owned-reference db % [:run/id] :run/chat chat-id) runs)
+                message-children (mapv #(attempt-owned-reference db % [:message/id] :message/chat chat-id) messages)
+                check-children (mapv #(dh/pull db [:attempt.check/id :attempt.check/key :attempt.check/passed?] (:v %)) checks)]
+            (when-not (and (= (count check-children) (count (set (map :attempt.check/key check-children))))
+                           (every? #(= (check-id attempt-id (:attempt.check/key %)) (:attempt.check/id %)) check-children))
+              (throw (ex-info "Attempt check relation is corrupt"
+                              {:type :room-store/corrupt-attempt-checks})))
+            (let [loaded (artifact/get-bounded-value artifacts ref (:max-bytes budget))]
+              (when-not loaded
+                (throw (ex-info "Attempt payload artifact is unavailable"
+                                {:type :room-store/missing-attempt-payload :attempt/id attempt-id})))
+              (let [value (attempt-bounds/check-value! (:value loaded) budget)
+                    projection (assoc header :attempt/run root :attempt/evidence-runs children
+                                      :attempt/evidence-messages message-children :attempt/checks check-children)]
+                (try (validate-attempt-projection projection value)
+                     (catch clojure.lang.ExceptionInfo error
+                       ;; Existing ordinary readers retain their diagnostics.
+                       ;; A restricted reader must not reflect large/corrupt
+                       ;; native fields or payloads through ex-data or cause.
+                       (let [key (:key (ex-data error))]
+                         (throw (ex-info "Attempt certification or typed projection differs from canonical data"
+                                         (cond-> {:type :room-store/invalid-bounded-attempt
+                                                  :reason :invalid-certification-or-projection
+                                                  :attempt/id attempt-id}
+                                           (contains? (set attempt-header-pull-pattern) key)
+                                           (assoc :key key)))))))))))))))
 
 (defn- scorecard-summary-id [scorecard-id candidate-id]
   (hasch/uuid [:dvergr/scorecard-summary scorecard-id candidate-id]))
@@ -1506,6 +1598,11 @@
                (take (or limit 100))
                (mapv #(entity->attempt % artifacts))))
         [])))
+
+  store/PBoundedAttemptStore
+
+  (-load-attempt-bounded [_ room-id attempt-id limits]
+    (load-bounded-attempt conn artifacts room-id attempt-id limits))
 
   store/PScorecardStore
 

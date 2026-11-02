@@ -183,6 +183,14 @@
      :environment-id, :environment-content-id, :provider, :model, and :status;
      :limit is applied after filtering."))
 
+(defprotocol PBoundedAttemptStore
+  "Optional exact managed-Attempt reads under byte and relation ceilings.
+   This is a read capability, not authorization or artifact retention. Stores
+   without it must refuse rather than fall back to an unbounded loader."
+  (-load-attempt-bounded [this room-id attempt-id limits]
+    "Read one exact certified Attempt, or nil when absent from this Room.
+     Validate all supplied limits; only lower native ceilings are accepted."))
+
 (defprotocol PReviewStore
   "Reviews of retained worlds (`dvergr.agent.review`): one immutable record per
    review, holding its checks, the reviewer's verdict and the decision."
