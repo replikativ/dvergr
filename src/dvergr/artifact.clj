@@ -125,13 +125,20 @@
   (when-not (instance? DatahikeArtifactStore store)
     (throw (ex-info "Store has no bounded managed artifact reader" {:type ::unsupported-store})))
   (k/bget (:store @(:conn store)) ref
-          (fn [{:keys [input-stream]}]
-            (when input-stream
-              (let [bytes (if (bytes? input-stream)
-                            (do (when (> (alength ^bytes input-stream) max-bytes)
+          (fn [{:keys [input-stream blob]}]
+            (when (or input-stream blob)
+              (let [bytes (cond
+                            (instance? InputStream input-stream)
+                            (.readNBytes ^InputStream input-stream (int (inc max-bytes)))
+                            ;; Konserve's memory backend lends already-stored
+                            ;; bytes under :blob; it does not materialize IO.
+                            (and (bytes? blob)
+                                 (or (nil? input-stream) (identical? blob input-stream)))
+                            (do (when (> (alength ^bytes blob) max-bytes)
                                   (throw (ex-info "Artifact exceeds read limit" {:type ::too-large})))
-                                input-stream)
-                            (.readNBytes ^InputStream input-stream (int (inc max-bytes))))]
+                                blob)
+                            :else (throw (ex-info "Artifact backend has no bounded streaming view"
+                                                  {:type ::unsupported-stream})))]
                 (when (> (alength ^bytes bytes) max-bytes)
                   (throw (ex-info "Artifact exceeds read limit" {:type ::too-large})))
                 (when-not (= ref (blob/blob-id bytes))
@@ -149,7 +156,7 @@
                         (throw (ex-info "Artifact must contain one EDN value" {:type ::invalid-value})))
                       {:value value :ref ref :size (long (alength ^bytes bytes))
                        :codec :edn-v1}))))))
-          {:sync? true}))
+          {:sync? true :streaming? true}))
 
 (defn publish-value!
   "Publish a payload reference, guarding managed bytes until publish returns.
