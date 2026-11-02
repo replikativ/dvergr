@@ -70,10 +70,35 @@ model sometimes ends by announcing its next step, or writes a tool call as text)
 
 ## Trust
 
-The checker runs in a sandbox with no effects except reading the Attempt's captured evidence
-(the effect boundary's `:read-only` mode, doc/effects.md; until then, a sandbox without the
-network and write namespaces). Its trust tier is part of every Scorecard; a room-authored
-checker is `:ad-hoc` until promoted, then `:room`; never `:trusted`.
+The checker receives captured evidence as data in a fresh base SCI interpreter,
+without room/file/network namespaces or a load path. Its trust tier is part of
+every Scorecard; a room-authored checker is `:ad-hoc` until promoted, then `:room`;
+never `:trusted`.
+
+`dvergr.catalog.checker` executes on the caller's owned blocking worker, never
+on the engine drain and never in a detached future. Context creation, source
+execution, result validation and allocation observation share that physical
+worker. The default policy bounds source to 512 KiB UTF-8, cumulative allocation
+to 128 MiB, eager output to 10,000 nodes/32 levels/2 MiB conservative encoded EDN, and checks
+to 1,000. The encoded budget includes punctuation, scalar values and string
+escaping. Numeric representations are bounded before serialization.
+The 20-second deadline and interruption/allocation guards are cooperative, not
+hard OS isolation. A blocking native host operation remains owned until it exits;
+a cancellation request does not release that worker, its world or its capacity.
+
+Verdicts retain bounded portable extension fields as plain snapshots without
+collection metadata, and normalize numeric reward
+to a finite double in [0,1]. Catalog check maps may be empty for compatibility;
+a host can require at least one check. Lazy results are refused without
+realization. Judge requests must be an eager vector of at most 50 requests with
+unique IDs and bounded prompts; the entire vector is validated before the
+workflow's lower request limit truncates it. Missing `judge-requests` still means
+no judge calls.
+
+A caller providing `:allocation-check` owns the surrounding allocation extent;
+`:deadline-nanos` retains an absolute deadline across calls. These HOST hooks let
+calibration share a cumulative budget without rebasing it between reference and
+damaged answers. They are not sandbox authority or a new execution scheduler.
 
 ## Landed
 
@@ -83,8 +108,8 @@ Part 1 (`dvergr.catalog.room`): a bundle is read from `workflows/<name>/` (`bund
 so a changed checker is a different verifier), and turned into a world setup (fixtures
 seeded at the world root), an Evaluator (captures `:capture`, runs the checker) and an
 experiment plan. The checker runs in a fresh SCI interpreter with the base sandbox's core
-and no load path: no files, network, host classes or other code; bounded in time; its
-verdict validated. Ops: `catalog_check {room name answer?}` (problems, or the bundle and,
+and no load path: no files, network, arbitrary host classes or other code. Its
+source, output and cooperative execution limits are described above. Ops: `catalog_check {room name answer?}` (problems, or the bundle and,
 with an answer, the checker's verdict on it), `catalog_list {room}` lists a room's bundles,
 `catalog_benchmark {workflow: "<room>/<name>"}` benchmarks one like a catalog workflow.
 
@@ -92,9 +117,13 @@ Part 2: `calibration.edn` holds a reference answer and damaged variants, each na
 checks it damages. `catalog_calibrate` runs the checker on them: the reference must pass
 every check and score highest, each variant must fail what it damaged and score lower.
 `catalog_promote` (admin toolset: the owner's connection) calibrates the bundle now and, when
-that holds, records its content id on the host, under the state root and outside every
-workspace, so sandbox code cannot forge a promotion. From then on its verifier is `:room`;
-a changed bundle is a new id, `:ad-hoc` again. `catalog_list {room}` shows each bundle's
+that holds, records its content id and current checker-policy identity on the host,
+under the state root and outside every workspace, so sandbox code cannot forge a
+promotion. From then on its verifier is `:room`; a changed bundle or execution
+policy requires fresh calibration/promotion. Older policy-less promotion records
+remain on disk but do not confer the current tier. The evaluator basis includes
+the complete default checker-policy identity, so historical Attempts retain their
+original meaning. `catalog_list {room}` shows each bundle's
 tier and `scorecard_detail` lists the tiers among a Scorecard's Attempts
 (`:verifier-trust`).
 
