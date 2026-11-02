@@ -80,7 +80,8 @@ cancellable.
 - **Injected integrated namespaces** (via `setup-agent-namespaces!`), called
   fully-qualified or required and aliased as in babashka. The borrowed surfaces carry
   their real names, so the model's training transfers:
-  - `babashka.fs` (path-clamped to the workspace; content I/O is `slurp`/`spit`),
+  - `babashka.fs` (path-clamped to the workspace; text I/O is `slurp`/`spit`,
+    binary I/O is `read-all-bytes`/`write-bytes`, ZIP extraction is `unzip`),
     `babashka.http-client` (domain-gated), `babashka.process` (`shell`/`sh`, muschel-backed
     and jailed), `cheshire.core`, `clojure.data.xml` (XXE-safe), `datahike.api` (the real
     API on any conn, e.g. `dvergr.room/*kb*`; the agent aliases it `d` itself),
@@ -114,6 +115,64 @@ cancellable.
     `spin`/`await`/`track` when the session is backed by a spindel execution context.
   - `sandbox` — runtime self-reflection: `(sandbox/overview)` lists every injected
     namespace with purpose + example + fns; `(sandbox/doc 'datahike.api)` zooms into one.
+
+### Downloading binary files and extracting ZIPs
+
+The workspace is a filesystem, not a Markdown-only store. The same functions
+work with Geschichte-backed Memory and the transitional physical adapter:
+
+```clojure
+(require '[babashka.http-client :as http] '[babashka.fs :as fs])
+(let [response (http/get "https://example.org/dataset.zip"
+                         {:as :bytes :max-bytes (* 96 1024 1024)})]
+  (when-not (= 200 (:status response))
+    (throw (ex-info "Dataset download failed" {:status (:status response)})))
+  (fs/write-bytes "data/dataset.zip" (:body response)))
+(fs/unzip "data/dataset.zip" "data/dataset")
+```
+
+Use `:as :bytes` or `:byte-array` for exact binary data. Default `:as :string`
+is text; it cannot round-trip arbitrary binary data. Unsupported response modes
+are refused. Streams remain inside the HTTP effect and close on success or
+failure. The binary response limit defaults to 128 MiB and may be lowered, not
+raised. Domain/SSRF checks, secret egress rules and acquisition correlation
+remain in force. Configured secrets directly reflected as raw UTF-8 bytes make
+a binary response fail rather than corrupt it by text replacement; this is
+not detection of encoded or compressed secrets. Optional acquisition body
+capture remains text-only; binary effects have content-based receipt digests,
+and saved files have their normal repository content identities.
+
+`fs/read-all-bytes` returns exact bytes (at most 128 MiB); `fs/write-bytes` accepts
+bytes and creates missing parents, with only `{:append boolean}` as an optional
+write setting. Keep byte arrays inside a local `let`, and return counts or paths
+from a tool call, not the dataset itself. Do not base64-decode a text-decoded ZIP.
+
+`fs/unzip` reads one private bounded copy of its input. The JDK ZIP reader uses
+a private temporary file, closed and deleted on return or failure, to validate
+the central directory without exposing any host path or handle to SCI. It fully preflights
+entry paths, file/directory collisions, actual expanded lengths and entry CRCs
+before writing anything. Absolute paths, `..`, Windows path spellings and
+sensitive paths are refused. Archive modes are not applied: entries become
+ordinary data files/directories, never symlinks or executable programs.
+Defaults are 64 MiB per entry, 512 MiB total expansion and 10,000 entries.
+`:max-entry-bytes` (ceiling 128 MiB), `:max-total-bytes` (ceiling 512 MiB) and
+`:max-entries` (ceiling 10,000) control those bounds. Existing files are refused
+unless `:replace-existing true` is supplied. This is rechecked at each write,
+but is not an atomic no-overwrite guarantee against other concurrent writers.
+Unsupported options are refused.
+
+For a deliberately selected subset, `:extract-fn` receives `{:name string
+:size integer}` for each file and includes it when the callback returns truthy.
+Unlike the unrestricted babashka adapter, it does not expose a host `ZipEntry`.
+Directories are included; excluded files still count toward expansion limits
+and have their lengths and CRCs verified. Report deliberate exclusions to the
+user. Selection does not silently rename non-portable archive filenames.
+
+Every destination uses the current world's filesystem and ordinary effect
+permissions and write-byte quotas. Extraction is not one atomic repository
+transaction: an I/O, permission or concurrent-change failure during writing can
+leave partial output. Use the room's proposal workflow for discardable changes.
+No host archive command, arbitrary Java access or VM is required.
 
 ### Safety boundaries
 
