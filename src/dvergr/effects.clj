@@ -49,13 +49,20 @@
     {:http/request {:class #{:network}
                     :resource [:map [:method :keyword] [:url [:maybe :string]]
                                [:query {:optional true} :string]
-                               [:body-digest {:optional true} :string]]
+                               [:body-digest {:optional true} :string]
+                               [:as {:optional true} [:enum :bytes]]
+                               [:max-bytes {:optional true} :int]]
                     :result [:map [:status [:maybe :int]] [:headers :map] [:body :any]]}
-     :fs/read   {:class #{:read}  :resource path :result :string}
+     :fs/read   {:class #{:read}
+                 :resource [:map [:path :string] [:as {:optional true} [:enum :bytes]]]
+                 :result [:or :string [:fn bytes?]]}
      :fs/list   {:class #{:read}  :resource [:map [:path :string] [:glob {:optional true} :string]]
                  :result [:vector :string]}
      :fs/stat   {:class #{:read}  :resource path :result :any}
-     :fs/write  {:class #{:write} :resource path :result :string}
+     :fs/write  {:class #{:write}
+                 :resource [:map [:path :string] [:as {:optional true} [:enum :bytes]]
+                            [:append {:optional true} :boolean]]
+                 :result :string}
      :fs/mkdir  {:class #{:write} :resource path :result [:maybe :string]}
      :fs/delete {:class #{:write} :resource path :result :any}
      :fs/move   {:class #{:write} :resource pair :result [:maybe :string]}
@@ -193,7 +200,8 @@
    very effect whose admission is being receipted."
   [x]
   (when (and (some? x) (not (instance? clojure.lang.IDeref x)))
-    (let [bytes (.getBytes ^String (if (string? x) x (pr-str x)) "UTF-8")
+    (let [bytes (if (bytes? x) x
+                    (.getBytes ^String (if (string? x) x (pr-str x)) "UTF-8"))
           md (MessageDigest/getInstance "SHA-256")]
       (apply str (map #(format "%02x" %) (take 12 (.digest md bytes)))))))
 
@@ -380,13 +388,22 @@
                             :counts (atom {})})
     id))
 
+(defn- copy-binary-result
+  "Own mutable binary IO results in recordings and replay answers. These are
+   the two binary result shapes: a file's bytes, or an HTTP response body."
+  [value]
+  (cond
+    (bytes? value) (aclone ^bytes value)
+    (and (map? value) (bytes? (:body value))) (update value :body #(aclone ^bytes %))
+    :else value))
+
 (defn- record-handler [_ctx {:keys [id]}]
   (fn [effect next]
     (let [log (state id)
           k (effect-key effect)]
       (try
         (let [v (next effect)]
-          (swap! log conj {:key k :value v})
+          (swap! log conj {:key k :value (copy-binary-result v)})
           v)
         (catch clojure.lang.ExceptionInfo e
           ;; a refusal is the stack's own decision, not the world's answer
@@ -410,7 +427,7 @@
         (do (answer :replay nil)
             (throw (ex-info (str "Replayed error: " (:error entry))
                             {:type :effect/replayed-error :key k})))
-        (answer :replay (:value entry))))))
+        (answer :replay (copy-binary-result (:value entry)))))))
 
 (defn- fault-for
   "The fault the n-th occurrence of `k` gets under `cfg`, or nil."

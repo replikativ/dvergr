@@ -11,9 +11,11 @@
             [muschel.fs :as mfs]
             [dvergr.effects :as effects]
             [dvergr.io.acquisition :as acquisition]
+            [dvergr.io.binary :as binary]
+            [dvergr.io.archive :as archive]
             [org.replikativ.spindel.engine.core :as ec]
             [dvergr.sandbox.ns.doc :as doc])
-  (:import [java.io File]))
+  (:import [java.io File InputStream]))
 
 (declare fs-safe-resolve parse-porcelain-status parse-git-log git-log-format)
 
@@ -207,6 +209,13 @@
           scrub (fn [s] (if (string? s)
                           (reduce (fn [s [v ph]] (str/replace s v ph)) s pairs)
                           s))]
+      ;; Replacing a reflected value would corrupt an archive. Refuse direct
+      ;; byte reflections instead. This does not detect encoded/compressed data.
+      (when (and (bytes? (:body resp))
+                 (some (fn [[value _]]
+                         (binary/contains-bytes? (:body resp) (.getBytes ^String value "UTF-8"))) pairs))
+        (throw (ex-info "Binary HTTP response reflects a configured secret"
+                        {:type ::binary-secret-reflection})))
       (-> resp
           (update :body scrub)
           (update :headers (fn [hs] (into {} (map (fn [[k v]] [k (scrub v)]) hs))))))))
@@ -250,6 +259,71 @@
       (when (internal-address? addr)
         (throw (ex-info "HTTP request to internal/loopback address blocked (SSRF)"
                         {:url url :resolved (.getHostAddress addr)}))))))
+
+(defn- binary-fs-functions
+  "Adapter operations below must resolve/check paths on every invocation.
+   No streams or host path objects cross into the interpreter."
+  [effects {:keys [read! write! mkdir! stat!]}]
+  (letfn [(read-bytes [p]
+            (fx effects :fs/read {:path (str p) :as :bytes} #(read! p)))
+          (stat [p] (fx effects :fs/stat {:path (str p)} #(stat! p)))
+          (mkdir [p]
+            (fx effects :fs/mkdir {:path (str p)} #(mkdir! p)))
+          (write-bytes [p data opts no-overwrite?]
+            (when-not (and (bytes? data) (<= (alength ^bytes data) binary/max-bytes))
+              (throw (ex-info "write-bytes requires a bounded byte array" {})))
+            (when-not (and (or (nil? opts) (map? opts))
+                           (every? #{:append} (keys opts))
+                           (or (not (contains? opts :append)) (boolean? (:append opts))))
+              (throw (ex-info "Unsupported write-bytes options; only :append is supported" {})))
+            (let [data (aclone ^bytes data)]
+              (effects/perform!
+               effects {:effect :fs/write :resource {:path (str p) :as :bytes :append (boolean (:append opts))}
+                        :bytes (alength ^bytes data) :result-of (constantly data)}
+               #(do
+                  (when (and no-overwrite? (stat! p))
+                    (throw (ex-info "ZIP destination already exists" {:path (str p)})))
+                  (write! p data (boolean (:append opts)))))))
+          (unzip [source target opts]
+            (let [opts (archive/options opts)
+                  ;; read! returns one fresh bounded value. Never reopen source
+                  ;; between preflight and extraction, or hand these bytes to SCI.
+                  data (read-bytes source)
+                  target (str/replace (str target) #"/+$" "")
+                  path #(str (if (str/blank? target) "/" (str target "/")) %)
+                  check! (fn [name dir?]
+                           (let [p (path name) existing (stat p)]
+                             (when (and existing
+                                        (not (and dir? (= :dir (:type existing))))
+                                        (not (and (not dir?) (:replace-existing opts)
+                                                  (= :file (:type existing)))))
+                               (throw (ex-info "ZIP destination already exists or has wrong type" {:path p})))
+                             (doseq [parent (take-while #(not (str/blank? %))
+                                                        (rest (iterate #(str/replace % #"/?[^/]+$" "") p)))]
+                               (when-let [s (stat parent)]
+                                 (when-not (= :dir (:type s))
+                                   (throw (ex-info "ZIP destination parent is not a directory" {:path parent})))))))
+                  target (if (str/blank? target) "/" target)]
+              (archive/with-zip
+                data
+                (fn [zip]
+                  (let [entries (archive/preflight zip opts check!)]
+                    (mkdir target)
+                    (archive/extract! zip entries #(mkdir (path %))
+                                      #(write-bytes (path %1) %2 nil (not (:replace-existing opts))))
+                    target)))))]
+    (doc/with-docs
+      {'read-all-bytes read-bytes
+       'write-bytes (fn
+                      ([p data] (write-bytes p data nil false))
+                      ([p data opts] (write-bytes p data opts false)))
+       'unzip (fn
+                ([source] (unzip source "." nil))
+                ([source target] (unzip source target nil))
+                ([source target opts] (unzip source target opts)))}
+      '{read-all-bytes [([path]) "Read a file as exact bytes, at most 128 MiB, in the current world. Return a summary, not the bytes, from your tool call."]
+        write-bytes [([path bytes] [path bytes opts]) "Write exact bytes in the current world; creates parents. Only {:append boolean} is supported. Governed by file permissions and byte quotas."]
+        unzip [([source] [source target] [source target opts]) "Extract a ZIP in the current world. Preflights paths, CRC and expansion limits before writing; refuses existing files unless :replace-existing true. Optional :extract-fn receives {:name string :size int} for files (no host ZipEntry); false excludes a file, but all entries still count toward size/CRC limits. Options :max-entry-bytes (64MiB), :max-total-bytes (512MiB), :max-entries (10000) may lower hard ceilings. An I/O/permission failure during writing may leave partial output; use a proposal for discardable changes."]})))
 
 (defn- add-physical-fs-ns!
   "Expose rich filesystem operations as 'fs namespace in SCI.
@@ -393,6 +467,21 @@
                          'file-name          (fn [p] (str ((r 'file-name) p)))
                          'absolutize         (fn [p] (rel (sr p)))
                          'canonicalize       (fn [p] (rel (sr p)))})
+    (sci/add-namespace!
+     sci-ctx 'babashka.fs
+     (binary-fs-functions
+      effects
+      {:read! (fn [p]
+                (with-open [input (java.io.FileInputStream. ^File (sr p))]
+                  (binary/read-bounded input binary/max-bytes)))
+       :write! (fn [p data append?]
+                 (let [f (sr p)]
+                   (when-let [parent (bb-parent f)] (bb-create-dirs parent))
+                   (fs/write-bytes f data {:append append?})
+                   (rel f)))
+       :mkdir! (fn [p] (let [f (sr p)] (bb-create-dirs f) (rel f)))
+       :stat! (fn [p] (let [^File f (sr p)]
+                        (when (.exists f) {:type (if (.isDirectory f) :dir :file)})))}))
     ;; File CONTENT I/O under the clojure.core names the model reaches for, sandboxed.
     (sci/merge-opts sci-ctx
                     {:namespaces
@@ -433,14 +522,15 @@
                               (mfs/list-dir filesystem path))))))]
     (walk root)))
 
-(defn- virtual-write-bytes! [filesystem path bytes]
-  (when-let [sink (mfs/-open-sink filesystem path false)]
-    (if (instance? java.io.OutputStream sink)
-      (do (.write ^java.io.OutputStream sink ^bytes bytes)
-          (.close ^java.io.OutputStream sink)
-          true)
-      (throw (ex-info "Virtual filesystem sink does not accept binary content"
-                      {:path path})))))
+(defn- virtual-write-bytes!
+  ([filesystem path bytes] (virtual-write-bytes! filesystem path bytes false))
+  ([filesystem path bytes append?]
+   (let [sink (mfs/-open-sink filesystem path append?)]
+     (when-not (instance? java.io.OutputStream sink)
+       (throw (ex-info "Virtual filesystem sink does not accept binary content" {:path path})))
+     (with-open [output ^java.io.OutputStream sink]
+       (.write output ^bytes bytes))
+     true)))
 
 (defn- world-filesystem
   "A stable Muschel handle whose every operation resolves the ambient world.
@@ -578,6 +668,23 @@
         'absolutize #(relative (resolve! %))
         'canonicalize #(relative (resolve! %))
         'stat (stat-fx #(stat-map (resolve! %)))})
+      (sci/add-namespace!
+       sci-ctx 'babashka.fs
+       (binary-fs-functions
+        effects
+        {:read! (fn [p]
+                  (let [input (mfs/open-source filesystem (resolve! p))]
+                    (when-not (instance? InputStream input)
+                      (throw (ex-info "No such binary file" {:path (str p)})))
+                    (with-open [input ^InputStream input]
+                      (binary/read-bounded input binary/max-bytes))))
+         :write! (fn [p data append?]
+                   (let [path (resolve! p)]
+                     (virtual-mkdirs! filesystem (virtual-parent path))
+                     (virtual-write-bytes! filesystem path data append?)
+                     (relative path)))
+         :mkdir! (fn [p] (relative (virtual-mkdirs! filesystem (resolve! p))))
+         :stat! (fn [p] (mfs/stat filesystem (resolve! p)))}))
       (sci/merge-opts
        sci-ctx
        {:namespaces
@@ -918,12 +1025,30 @@
         generate (requiring-resolve 'hato.middleware/generate-query-string)]
     (generate (:query-params (nest {:query-params query-params})))))
 
+(defn- http-response-mode [request]
+  (let [as (or (:as request) :string)]
+    (when-not (#{:string :bytes :byte-array} as)
+      (throw (ex-info "Unsupported HTTP response format; use :string, :bytes or :byte-array" {})))
+    (when (#{:bytes :byte-array} as)
+      (binary/checked-limit (get request :max-bytes binary/max-bytes) binary/max-bytes))))
+
+(defn- binary-http-body [body limit]
+  (cond
+    (instance? InputStream body)
+    (with-open [input ^InputStream body] (binary/read-bounded input limit))
+    (bytes? body) (do (when (> (alength ^bytes body) limit)
+                        (throw (ex-info "Binary input exceeds size limit" {:max-bytes limit})))
+                      (aclone ^bytes body))
+    (nil? body) (byte-array 0)
+    :else (throw (ex-info "Binary HTTP body must be bytes, not decoded text" {}))))
+
 (defn add-http-ns!
   "Expose the HTTP client as the `babashka.http-client` namespace in SCI.
 
    Agents can make HTTP requests to build integrations.
-   Responses are returned as maps with :status, :headers, :body; the body is
-   the raw string, as in babashka.http-client (parse JSON with cheshire.core).
+   Responses are maps with :status, :headers, :body. Default :as :string returns
+   text; :as :bytes or :byte-array preserves binary data. Binary reads are
+   bounded by :max-bytes (default and ceiling 128 MiB); streams stay host-side.
 
    :effects        - boundary fn (`dvergr.effects/boundary-resolver`); every request is
                      an effect (method + URL; the response body by digest only)
@@ -952,9 +1077,12 @@
           (when domain-check (domain-check url))
           (ssrf-guard! url)
           (load/require! 'hato.client)
-          (let [hato-request (requiring-resolve 'hato.client/request)
+          (let [limit (http-response-mode request)
+                binary? (some? limit)
+                hato-request (requiring-resolve 'hato.client/request)
                 opts (cond-> {:url url
                               :method method
+                              :as (if binary? :stream :string)
                               :http-client {:redirect-policy :never}
                               :connect-timeout timeout
                               :socket-timeout timeout}
@@ -968,11 +1096,15 @@
                 ;; never holds plaintext. (No-op when no secrets configured.)
                 opts (substitute-secrets! secrets effects url opts)
                 resp (hato-request opts)
+                ;; Read and close inside this same governed acquisition. No
+                ;; lazy stream escapes the HTTP effect or enters a fork's heap.
+                resp (if binary?
+                       (assoc resp :body (binary-http-body (:body resp) limit))
+                       resp)
                 ;; Scrub any reflected secret value back to its placeholder — the
                 ;; only path the plaintext could re-enter the sandbox.
                 resp (scrub-response secrets resp)]
-            ;; Match babashka.http-client: :body is the RAW string (not auto-parsed).
-            ;; The agent parses explicitly — (cheshire.core/parse-string (:body r) true).
+            ;; No implicit JSON parse, base64 wrapping or lossy binary decode.
             {:status (:status resp)
              :headers (into {} (:headers resp))
              :body (:body resp)}))
@@ -980,13 +1112,16 @@
         ;; transport Var: concurrent live and simulated interpreters coexist.
         ;; A fixture does no DNS, secret substitution or network fallback.
         do-request (fn [opts]
-                     (let [method (or (:method opts) :get)]
+                     (let [limit (http-response-mode opts)
+                           method (or (:method opts) :get)]
                        (effects/perform!
                         effects
                         {:effect :http/request
                          ;; the query names what was asked: two searches of one
                          ;; endpoint are different sources
                          :resource (cond-> {:method method :url (:url opts)}
+                                     limit
+                                     (assoc :as :bytes :max-bytes limit)
                                      (seq (:query-params opts))
                                      (assoc :query (encoded-query (:query-params opts)))
                                      ;; so does a request's body: two POSTed
@@ -999,8 +1134,16 @@
                         #(acquisition/record-request!
                           opts (fn []
                                  (if fixture-transport
-                                   (do (when domain-check (domain-check (:url opts)))
-                                       (fixture-transport opts))
+                                   (let [limit (http-response-mode opts)]
+                                     (when domain-check (domain-check (:url opts)))
+                                     (let [response (fixture-transport opts)]
+                                       (when (and (nil? limit) (instance? InputStream (:body response)))
+                                         (with-open [input ^InputStream (:body response)]
+                                           (throw (ex-info "HTTP fixture must return materialized text" {}))))
+                                       (scrub-response secrets
+                                                       (if limit
+                                                         (update response :body binary-http-body limit)
+                                                         response))))
                                    (perform-request opts)))))))]
     (sci/add-namespace! sci-ctx 'babashka.http-client
                         {'request do-request
