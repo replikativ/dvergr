@@ -13,8 +13,10 @@ into forked worlds, which can hire further. Evaluation should be the same
 kind of thing: something an agent does, at any depth, in a further nested
 world. It is partly that: the generic machinery scores every benchmark, and
 an agent can start an experiment (`dvergr.agent/run-experiment!` in the
-sandbox), but only against verifiers the host offers, and inside a paid
-LLM Run only over `:echo`/`:scripted` candidates.
+sandbox), against exact verifiers and setups the host offers. Funded LLM
+candidates require explicit aggregate money/dispatch grants and narrowed
+provider, tool and sandbox authority; source definitions do not self-admit a
+verifier.
 
 The goal is one verb, `attempt!`, from which tests, benchmarks, retries,
 search and training data all follow, plus a small contract for what a
@@ -102,9 +104,9 @@ Room path (`dvergr.agent.conversation`).
 
 | Wanted | Blocked by |
 |---|---|
-| Function candidates | A candidate must be an AgentDef; programs are only `:echo :scripted :llm`; `make-attempt` cross-checks agent version and program kind |
+| Function candidates | A candidate is a versioned AgentDef; programs include `:echo :scripted :llm :sci`. SCI source/entrypoint programs require explicit host admission; arbitrary host closures are not portable candidates. |
 | Agent-authored verifiers | `Evaluator` is a host record matched by exact ref (`dvergr.agent.evaluation/make-evaluator`); the sandbox can only name a verifier its host offers (`dvergr.agent.evaluators`) |
-| Nested evaluation | SCI `hire!` forbids `:deferred`; children and the candidates of a sandbox experiment are limited to `:echo`/`:scripted` with provider effects off (`child-program-authority` in `dvergr.agent.program`); `experiment/run` requires `:discard` |
+| Nested evaluation | SCI `hire!` forbids `:deferred`; `run-experiment!` uses exact offered verifier/setup refs and discard settlement. Funded native LLM cells require aggregate grants and transitive delegation bounds; `invoke-experiment!` resolves an exact host-admitted plan. |
 | Branch any Run | A world can only be branched when nothing runs in it; `RunHandle` rejects cross-fork use; the Run registry is process-local; RunWorlds fork with `:forkable-components #{}` |
 
 Two unrelated things share a name: `dvergr.agent.episode` (a read-only join
@@ -442,8 +444,10 @@ Refactor first. Each step keeps the suite green.
    `attempt!`, `evaluate!` and reading the subtree's Attempts in the sandbox,
    with the attenuation `hire!` already applies. Built so far: the sandbox's
    `run-experiment!` (`dvergr.sandbox.ns.agent`) runs an experiment as a job
-   under the calling Run, against host-offered verifiers; inside a paid LLM
-   Run its candidates are limited to `:echo` and `:scripted`.
+   under the calling Run, against host-offered verifiers/setups, with explicit
+   funding for native LLM candidates and inherited delegation bounds. Pinned
+   SCI programs are admitted explicitly; arbitrary host-function candidates
+   remain distinct from portable source programs.
 3. **Run-level snapshot and branch** in `dvergr.agent.world`, replacing
    tau2's. The seam exists: `hire-prepared-in!` already separates the control
    Room from the world parent, so a branch is an evaluation whose world

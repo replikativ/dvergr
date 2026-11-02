@@ -23,8 +23,8 @@
    left under the captured directories and returns a verdict. It cannot read
    the room, the network or its own workspace. An unpromoted bundle's
    verifier is `:ad-hoc` on every receipt."
-  (:require [dvergr.runtime.allocation :as allocation] [dvergr.runtime.threads :as threads]
-            [clojure.edn :as edn]
+  (:require [clojure.edn :as edn]
+            [dvergr.catalog.checker :as checker]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [dvergr.agent.environment :as environment]
@@ -38,11 +38,9 @@
             [dvergr.resource :as resource]
             [dvergr.sandbox.ns.io :as sandbox-io]
             [org.replikativ.spindel.engine.core :as ec]
-            [dvergr.sandbox :as sandbox]
             [hasch.core :as hasch]
             [malli.core :as m]
-            [malli.error :as me]
-            [sci.core :as sci]))
+            [malli.error :as me]))
 
 (def Definition
   "workflow.edn"
@@ -78,8 +76,6 @@
 (def Verdict
   "What a checker returns."
   [:map [:checks [:map-of :keyword :boolean]] [:reward [:double {:min 0.0 :max 1.0}]]])
-
-(def ^:private checker-timeout-ms 20000)
 
 ;; ---------------------------------------------------------------------------
 ;; A bundle from files
@@ -202,57 +198,38 @@
 ;; The checker, in SCI with no effects
 ;; ---------------------------------------------------------------------------
 
-(defn- checker-ctx
-  "A fresh interpreter with the base sandbox's safe core and nothing else:
-   no namespaces that reach the world, and no `require` path (a checker is
-   one namespace)."
-  []
-  (sandbox/create-base-ctx :load-fn (constantly nil)))
-
-(defn- call-checker
-  "Call `fname` of checker `source` on `input` in a fresh interpreter, bounded
-   in time; `::absent` when the checker does not define it."
-  [source fname input]
-  (let [ctx (checker-ctx)
-        run (threads/future
-              (allocation/call-with-scope
-               (fn []
-                 (let [{:keys [ns]} (sci/eval-string+ ctx source)
-                       f (sci/eval-string* ctx (str "(ns-resolve '" ns " '" fname ")"))]
-                   (if f (@f input) ::absent)))))
-        result (deref run checker-timeout-ms ::timeout)]
-    (when (= ::timeout result)
-      (future-cancel run)
-      (throw (ex-info (str "The checker did not finish within " checker-timeout-ms "ms")
-                      {:type ::checker-timeout})))
-    result))
-
 (def JudgeRequests
   "What a checker's `judge-requests` returns: questions for the judge model."
   [:vector [:map [:id :string] [:prompt :string]]])
 
+(defn- with-checker-errors [f]
+  (try (f)
+       (catch clojure.lang.ExceptionInfo e
+         (if (= :dvergr.catalog.checker/invalid (:type (ex-data e)))
+           (throw (ex-info (ex-message e)
+                           {:type (case (:reason (ex-data e))
+                                    :missing-check ::no-check
+                                    :judge-requests ::invalid-judge-requests
+                                    :interrupted ::checker-timeout
+                                    :engine-drain ::checker-on-drain
+                                    :source ::invalid-checker-source
+                                    :options ::invalid-checker-policy
+                                    ::invalid-verdict)
+                            :reason (:reason (ex-data e))}
+                           e))
+           (throw e)))))
+
 (defn judge-requests
-  "The questions `source`'s `judge-requests` asks about `input` (nil when it
-   defines none), validated and bounded by `max-requests`."
+  "Read bounded eager requests on the calling owned worker. Validate the
+   whole vector before truncation. No future is detached on timeout."
   [source input max-requests]
-  (let [rs (call-checker source "judge-requests" input)]
-    (when-not (= ::absent rs)
-      (when-not (m/validate JudgeRequests (vec rs))
-        (throw (ex-info (str "judge-requests returned no requests: " (pr-str (me/humanize (m/explain JudgeRequests (vec rs)))))
-                        {:type ::invalid-judge-requests})))
-      (vec (take max-requests rs)))))
+  (with-checker-errors #(checker/judge-requests source input max-requests)))
 
 (defn run-checker
-  "Run `source`'s `check` on `input`, bounded in time; the verdict, validated."
+  "Run a bounded, effect-free checker on the calling owned worker. Returns
+   only after physical execution exits; cooperative limits are not OS isolation."
   [source input]
-  (let [verdict (call-checker source "check" input)]
-    (when (= ::absent verdict)
-      (throw (ex-info "checker.clj defines no `check`" {:type ::no-check})))
-    (let [verdict (update verdict :reward #(some-> % double))]
-      (when-not (m/validate Verdict verdict)
-        (throw (ex-info (str "The checker returned no verdict: " (pr-str (me/humanize (m/explain Verdict verdict))))
-                        {:type ::invalid-verdict})))
-      verdict)))
+  (with-checker-errors #(checker/run-checker source input)))
 
 ;; ---------------------------------------------------------------------------
 ;; Calibration and promotion: how a checker earns trust
@@ -301,9 +278,10 @@
     (if (.exists f) (edn/read-string (slurp f)) {})))
 
 (defn promoted?
-  "Was bundle `id` promoted on this host?"
+  "Was bundle `id` calibrated and promoted under the current checker policy?
+   Older policy promotions require recalibration; they do not attest new limits."
   [id]
-  (contains? (promotions) (str id)))
+  (= checker/policy-id (:checker-policy (get (promotions) (str id)))))
 
 (def ^:private promotion-lock (Object.))
 
@@ -319,7 +297,8 @@
         (let [f (promotions-file)]
           (.mkdirs (.getParentFile f))
           (spit f (pr-str (assoc (promotions) (str (:id b))
-                                 {:room (str room-slug) :name (:name b) :at (java.util.Date.)}))))))
+                                 {:room (str room-slug) :name (:name b) :at (java.util.Date.)
+                                  :checker-policy checker/policy-id}))))))
     (assoc result :promoted? (boolean ok?))))
 
 (defn tier
@@ -450,7 +429,7 @@
         judge (or judge-fn (when judge-model (model-judge judge-model)))]
     (evaluation/make-evaluator
      {:id (verifier-id b) :version 1 :tier (or tier (dvergr.catalog.room/tier b))
-      :basis (cond-> {:bundle (str id)} judge-model (assoc :judge judge-model))
+      :basis (cond-> {:bundle (str id) :checker-policy checker/policy-id} judge-model (assoc :judge judge-model))
       :capture (fn [{world :world/room}]
                  (cond-> {:files (into {} (map #(ws/read-tree world %)) dirs)
                           ;; what the world refused the attempt, by who refused it
