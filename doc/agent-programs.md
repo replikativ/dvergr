@@ -894,6 +894,38 @@ Handlers never enter SCI, Run inputs or `agent/offered`; only exact references
 do. Offers follow the existing child authority and have no global fallback.
 Changing a handler's admitted semantics requires a new reference/basis.
 
+An offer may explicitly include `:invocation/public-feedback`:
+
+```clojure
+{:version 1
+ :verifier {:verifier/id :host/check :verifier/version 1 :verifier/basis ...}
+ :checks {:label-correct? "Agreement with the reference label."}}
+```
+
+This HOST declaration authorizes a fixed post-evaluation projection, not access
+to the verifier. It is part of the invocation identity; a changed disclosure
+cannot observe an earlier offer's results. No declaration means no criteria.
+Declare public meanings explicitly rather than deriving them from private
+checker output, calibration or gold. Descriptions state the admitted rubric,
+not independently verified correctness. At most 16 criteria and 4096 encoded
+declaration bytes are allowed; individual descriptions are at most 512 characters.
+
+`await_child` returns only declared boolean checks of the exact certified
+Attempts, after binding their identities, candidate, environment, repetition,
+experiment and verifier to the returned Scorecard. An absent criterion is listed
+under `:feedback :unavailable-checks`, never turned into `false`. Certified
+`:attempt/status` and current `:run/status` / `:run/settlement-status` are separate
+facts. Unknown status values project to `:unavailable`. No evidence, answers,
+trace, metrics or error text is disclosed through this feedback projection.
+
+Descriptions and a content identity of the verifier appear once under
+`:public-feedback`; its raw verifier basis is not copied into that envelope.
+Invocation references themselves remain public portable data. Feedback pages contain up to
+eight entries and fit within 24000 encoded bytes. Follow `:next-offset` to read
+remaining entries of the same saved result; paging does not start another
+experiment. Offers without feedback retain the aggregate projection and up to
+32 entries per page.
+
 `(agent/invoke-experiment! ref roster opts)` dispatches that exact offer with
 the current host-issued control room, caller world and ambient Run authority.
 The trusted handler must validate a closed options schema, enforce its fixed

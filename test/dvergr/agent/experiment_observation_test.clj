@@ -5,6 +5,8 @@
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.experiment-observation :as observation]
+            [dvergr.agent.episode :as episode]
+            [dvergr.agent.public-feedback :as feedback]
             [dvergr.agent.invocations :as invocations]
             [dvergr.agent.roster :as roster]
             [dvergr.agent.run :as run]
@@ -50,6 +52,9 @@
         (is (:settled? first-result))
         (is (= :available (:result-state first-result)))
         (is (= 1.0 (get-in first-result [:entries 0 :reward])))
+        (is (= :completed (get-in first-result [:entries 0 :run/status])))
+        (is (not (contains? (first (:entries first-result)) :feedback))
+            "existing offers disclose no grading criteria")
         (is (not (.contains (pr-str first-result) "must-not-leak")))
         (let [reader experiment/scorecard-bounded]
           (with-redefs [experiment/scorecard-bounded
@@ -81,6 +86,103 @@
         (run/finish! parent :completed)
         (run/finish! other :completed)
         (#'fixtures/close-resource-test-room! room conn)))))
+
+(deftest explicit-public-checks-are-bound-to-the-exact-offer-and-certified-cell
+  (let [[room conn] (#'fixtures/resource-test-room :public-feedback)
+        parent (:run/id (run/start! room :parent (random-uuid) nil))
+        evaluator (evaluation/make-evaluator
+                   {:id :feedback/check :version 1 :basis "PRIVATE-VERIFIER-BASIS"
+                    :observe (fn [{:keys [default]}] (assoc default :private "PRIVATE-EVIDENCE"))
+                    :verify (fn [_ _] {:checks {:allowed false :secret true} :reward 0.0})})
+        disclosure {:version 1 :verifier (evaluation/evaluator-ref evaluator)
+                    :checks {:allowed "The public predicate held." :absent "May be unavailable."}}
+        offer {:invocation/id :feedback/exact :invocation/version 1 :invocation/basis :fixed
+               :invocation/public-feedback disclosure}
+        authority {:parent-run parent :control-room room :program-kinds #{:echo}
+                   :experiment-capabilities {:evaluators {(evaluation/evaluator-ref evaluator) evaluator}
+                                             :invocations {offer (constantly nil)}}}
+        ctx {:control-room room :run-id parent :agent-program-ceiling authority
+             :deadline-nanos (+ (System/nanoTime) 30000000000)}
+        team (roster/make-agent (roster/make-roster) {:id :echo :program {:kind :echo}})
+        env (environment/make-environment
+             {:id :feedback/case :task {:secret "PRIVATE-TASK"}
+              :verifier {:id :feedback/check :version 1 :basis "PRIVATE-VERIFIER-BASIS"}
+              :world {:isolation :ctx :settlement :discard}})
+        definition (experiment/make-experiment
+                    {:id :feedback/experiment
+                     :dataset (experiment/make-dataset {:id :feedback/data :environments [env]})
+                     :candidates [(roster/agent team :echo)]})]
+    (try
+      (let [receipt (binding [ec/*execution-context* (:ctx room)]
+                      (subexperiment/start! room room team definition {} authority
+                                            {:observation-ref offer :return-receipt? true}))
+            result (observation/await! ctx (:job receipt) 0)
+            row (first (:entries result))
+            card (experiment/scorecard-bounded room (:scorecard-id result))
+            entry (first (:scorecard/entries card))
+            certified (episode/attempt-bounded room (:attempt/id entry))]
+        (is (= (feedback/public-declaration disclosure) (:public-feedback result)))
+        (is (not= (:verifier-content-id (:public-feedback result))
+                  (:verifier-content-id (feedback/public-declaration
+                                         (assoc-in disclosure [:verifier :verifier/basis] :changed)))))
+        (is (= {:checks {:allowed false} :unavailable-checks [:absent]} (:feedback row)))
+        (is (= :completed (:attempt/status row) (:run/status row)))
+        (is (= :discarded (:run/settlement-status row)))
+        (doseq [private ["PRIVATE-EVIDENCE" "PRIVATE-TASK" "PRIVATE-VERIFIER-BASIS" ":secret"]]
+          (is (not (.contains (pr-str result) private))))
+        (is (= result (observation/await! ctx (:job receipt) 0)))
+        (is (not= (invocations/content-id offer)
+                  (invocations/content-id (assoc-in offer [:invocation/public-feedback :checks :allowed] "Changed meaning."))))
+        (is (= :not-admitted-child
+               (reason #(observation/await!
+                         (assoc-in ctx [:agent-program-ceiling :experiment-capabilities :invocations]
+                                   {(assoc-in offer [:invocation/public-feedback :checks :allowed] "Changed meaning.") (constantly nil)})
+                         (:job receipt) 0))))
+        (is (= :feedback-binding-mismatch
+               (reason #(feedback/project (assoc-in disclosure [:verifier :verifier/basis] :foreign)
+                                          (:experiment/content-id definition) entry certified))))
+        (doseq [mismatch [(assoc entry :attempt/id (random-uuid))
+                          (assoc entry :attempt/content-id (random-uuid))
+                          (assoc entry :candidate/agent-content-id (random-uuid))
+                          (assoc-in entry [:environment :environment/content-id] (random-uuid))
+                          (assoc entry :repetition 12)]]
+          (is (= :feedback-binding-mismatch
+                 (reason #(feedback/project disclosure (:experiment/content-id definition) mismatch certified))))))
+      (finally
+        (run/await-family! room parent)
+        (run/finish! parent :completed)
+        (#'fixtures/close-resource-test-room! room conn)))))
+
+(deftest public-feedback-declarations-and-pages-are-bounded
+  (let [declaration {:version 1 :verifier {:verifier/id :feedback/check :verifier/version 1}
+                     :checks {:ok "A public criterion."}}
+        too-many (into {} (for [i (range 17)] [(keyword (str "c" i)) "Criterion"]))
+        too-long (into {} (for [i (range 16)] [(keyword (str "c" i)) (apply str (repeat 512 "x"))]))]
+    (is (feedback/valid? declaration))
+    (is (= {:run/status :unavailable :run/settlement-status :unavailable}
+           (feedback/run-state {:run/status :PRIVATE-STATUS :run/settlement-status :PRIVATE-SETTLEMENT})))
+    (is (= :unavailable (feedback/execution-status :PRIVATE-ATTEMPT-STATUS)))
+    (is (= :adopted (:run/settlement-status (feedback/run-state {:run/settlement-status :adopted}))))
+    (doseq [invalid [(assoc declaration :private "not admitted")
+                     (assoc declaration :checks {})
+                     (assoc declaration :checks {:ok "  "})
+                     (assoc declaration :checks too-many)
+                     (assoc declaration :checks too-long)]]
+      (is (not (feedback/valid? invalid))))
+    (is (not (invocations/valid-ref? {:invocation/id :feedback/check :invocation/version 1
+                                      :invocation/basis :fixed :invocation/public-feedback nil})))
+    (let [checks (into {} (for [i (range 16)] [(keyword (str i (apply str (repeat 70 "界")))) true]))
+          declaration (assoc declaration :checks (into {} (map (fn [[k _]] [k "x"])) checks))
+          entry {:feedback {:checks checks}}
+          page {:job (random-uuid) :status :completed :settled? true :result-state :available
+                :scorecard-id (random-uuid) :entry-count 20 :offset 4
+                :public-feedback declaration :entries (vec (repeat 8 entry))}
+          packed (#'observation/bounded-page page)]
+      (is (feedback/valid? declaration))
+      (is (<= (alength (.getBytes (pr-str packed) "UTF-8")) 24000))
+      (is (seq (:entries packed)))
+      (is (< (count (:entries packed)) 8))
+      (is (= (+ 4 (count (:entries packed))) (:next-offset packed))))))
 
 (deftest incomplete-and-failed-outcomes-settle-without-inventing-a-scorecard
   (let [[room conn] (#'fixtures/resource-test-room :observed-incomplete)
