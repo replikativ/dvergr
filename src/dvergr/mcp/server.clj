@@ -87,13 +87,19 @@
   (reduce-kv (fn [a k v] (assoc a (keyword k) v)) {} (or m {})))
 
 (defn strict-schema
-  "An input schema in the form strict model APIs accept: an object at the root
-   with `properties`, closed (`additionalProperties false`)."
+  "Normalize an MCP object input, closing ordinary property schemas.
+   Composition-only roots retain their authored branch/ref constraints:
+   a synthetic closed empty root would forbid every branch's properties.
+   Vendor-specific strict-function subsets belong in their client adapter."
   [schema]
-  (-> (or schema {})
-      (assoc :type "object")
-      (update :properties #(or % {}))
-      (assoc :additionalProperties false)))
+  (let [schema (or schema {})]
+    (if (and (not (contains? schema :properties))
+             (some #(contains? schema %) [:oneOf :anyOf :allOf :$ref]))
+      (assoc schema :type "object")
+      (-> schema
+          (assoc :type "object")
+          (update :properties #(or % {}))
+          (assoc :additionalProperties false)))))
 
 (def ^:private no-daemon "No dvergr daemon is running in this process.")
 

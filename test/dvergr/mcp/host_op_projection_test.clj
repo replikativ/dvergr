@@ -108,6 +108,38 @@
            (is (= 1 (notifications)))
            (is (= 1 (transforms))))))))
 
+(deftest composed-host-inputs-keep-their-branch-property-scope
+  (let [schema [:multi {:dispatch :kind}
+                ["once" [:map {:closed true} [:kind [:= "once"]] [:at :int]]]
+                ["daily" [:map {:closed true} [:kind [:= "daily"]] [:hour :int]]]]
+        authored (mjs/transform schema)]
+    (ops/register-op! ::schedule (spec schema))
+    (let [projected (:inputSchema (first (definitions)))]
+      (is (= "object" (:type projected)))
+      (is (= authored (dissoc projected :type)))
+      (is (not (contains? projected :properties)))
+      (is (not (contains? projected :additionalProperties)))
+      (is (every? #(false? (:additionalProperties %)) (:oneOf projected)))
+      (is (= projected (get-in @(:cache *projection*) [::schedule :json]))))))
+
+(deftest object-normalization-preserves-composition-and-explicit-constraints
+  (doseq [key [:oneOf :anyOf :allOf :$ref]
+          :let [value (if (= key :$ref) "#/$defs/args"
+                          [{:type "object" :properties {:value {:type "string"}}
+                            :additionalProperties false}])
+                schema {key value :description "Authored input"}]]
+    (is (= (assoc schema :type "object") (server/strict-schema schema)))
+    (is (= (assoc schema :type "object" :additionalProperties false)
+           (server/strict-schema (assoc schema :additionalProperties false)))))
+  (is (= {:type "object" :properties {} :additionalProperties false}
+         (server/strict-schema nil)))
+  (is (= {:type "object" :properties {:value {:type "integer"}} :additionalProperties false}
+         (server/strict-schema {:properties {:value {:type "integer"}}})))
+  ;; Root-local property declarations still own closure at their own level.
+  (let [schema {:properties {:kind {:type "string"}} :oneOf [{:required [:kind]}]}]
+    (is (= (assoc schema :type "object" :additionalProperties false)
+           (server/strict-schema schema)))))
+
 (deftest projection-failure-does-not-publish-half-a-manifest
   (ops/register-op! ::alpha (spec))
   (let [before (definitions) cache @(:cache *projection*) notices (notifications)]
