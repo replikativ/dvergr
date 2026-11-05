@@ -136,7 +136,8 @@
   (-load-run [_ room-id run-id]
     (get-in @state [:runs room-id run-id]))
 
-  (-list-runs [_ room-id {:keys [limit status actor root-run-id]}]
+  (-list-runs [_ room-id {:keys [limit status actor root-run-id parent-run-id offset] :as opts}]
+    (store/validate-run-query! opts)
     (when (and root-run-id (or status actor))
       (throw (ex-info "Structural Run queries do not combine with status/actor"
                       {:type :room-store/incompatible-run-filters
@@ -173,11 +174,13 @@
                       (recur (into selected children)
                              (mapv :run/id children))))))))]
       (->> (if root-run-id visible-runs runs)
+           (filter #(if parent-run-id (= parent-run-id (:run/parent %)) true))
            (filter #(if status (= status (:run/status %)) true))
            (filter #(if actor (= actor (:run/actor %)) true))
            (sort-by (juxt #(some-> ^java.util.Date (:run/started-at %) .getTime)
                           #(str (:run/id %)))
                     #(compare %2 %1))
+           (drop (or offset 0))
            (take n)
            vec)))
 

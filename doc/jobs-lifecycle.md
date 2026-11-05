@@ -87,3 +87,50 @@ Tests cover real Room-close refusal while core or adapter cleanup is held,
 explicit recovery, context retirement, lost terminal/release acknowledgements,
 concurrent/stale recovery and synchronous construction failure. Work and all
 native fixtures are deterministic and perform no inference.
+
+## Owned experiment observation
+
+A HOST invocation adapter can pass `:observation-ref` and `:return-receipt? true`
+to `agent.subexperiment/start!`. Admission still happens exactly once, under
+ordinary child ownership, funding and capability checks. The receipt contains
+only the Job UUID, parent Run and exact invocation reference. Construction is
+synchronous; the receipt does not promise instantaneous admission.
+
+The Job stores two immutable scalar identities at admission: `:run/job-offer`
+(the domain-separated hash of the entire invocation reference) and
+`:run/job-experiment` (the normalized ExperimentDef content UUID). At terminal
+persistence it records `:run/job-result-state` and, for an available certified
+result, the exact `:run/job-scorecard` content UUID. An incomplete experiment is
+not an available Scorecard. A failed or cancelled experiment has an unavailable
+result. Terminal result fields cannot be replaced or retrofitted. These UUIDs
+are references to existing native records, not new blob stores or capabilities.
+
+A coordinator explicitly granted `await_child` uses its supervised HOST worker
+to wait on that original Job. This does not run SCI, change the SCI timeout,
+consume model steps while waiting, or disable repeated-tool detection. It
+occupies one native worker until completion, interruption, the finite owner
+deadline, or held cleanup. It may not run on the engine drain or while holding
+Run/Room/lifecycle locks. A deadline or cancelled waiter does not establish
+physical cleanup: the native parent still joins uncooperative children.
+
+The tool checks original control Room, direct structural parent, current exact
+offer, and the trusted owner deadline. It returns a result only after all native
+settlement witnesses and lease release. The bounded Scorecard read uses the
+recorded content ID, verifies the ExperimentDef and each Attempt's parent Job,
+and records causal consumption on the parent Run. It never substitutes the
+latest Scorecard of the same experiment. The projection exposes content IDs,
+rewards, pass flags and scalar spend observations, not private task/checker
+payloads. Spend remains the existing Scorecard scope, not full workflow cost.
+
+Calling `await_child` without `job` recovers already-admitted receipts after a
+lost start response. Direct-child queries page in deterministic descending
+start-time/string-UUID order; `offset`/`next-offset` are positional pages over
+that set (new child admissions can shift them). Deduplicate by Job ID if
+admissions overlap enumeration. Never restart an experiment merely because a
+reply was lost. Repeated waits/reads create no new inference or scoring. Held
+cleanup requires the existing explicit HOST recovery protocol.
+
+This surface covers exact invocation Jobs. Completion-only `run-experiment!`
+children and opaque RunHandles retain their existing interfaces. Process loss
+does not restore pending tool continuations or reconstruct missing settlement;
+durable result recovery requires a newly established authorized owner scope.

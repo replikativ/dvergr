@@ -84,10 +84,19 @@
     (when-not (and active (= status (:run/status active))
                    (= (:now opts) (:run/ended-at active))
                    (= (:reason opts) (:run/reason active))
-                   (= (some-> (:error opts) ex-message) (:run/error active)))
+                   (= (some-> (:error opts) ex-message) (:run/error active))
+                   (= (or (:job-result opts) {})
+                      (select-keys active [:run/job-scorecard :run/job-result-state])))
       (throw (ex-info "Job terminal persistence is not confirmed"
                       {:type ::terminal-unconfirmed :job id})))
     active))
+
+(defn- validate-result-binding! [{:keys [observation]} value]
+  (when (and observation (get-in value [:scorecard :scorecard/content-id])
+             (not= (:experiment observation)
+                   (get-in value [:scorecard :scorecard/experiment :experiment/content-id])))
+    (throw (ex-info "Job result does not match its admitted experiment"
+                    {:type ::result-binding-mismatch}))))
 
 (defn- perform-stage! [{:keys [id room before-finish settled state] :as owner} stage]
   (let [{:keys [status value error opts]} (:outcome @state)]
@@ -99,7 +108,8 @@
                            (when before-finish (before-finish id status (or error value))))
         :core-ack (run/acknowledge-job-cleanup! room id :core)
         :adapter-ack (run/acknowledge-job-cleanup! room id :adapter)
-        :persist (do (run/retain-finished! id status opts) (retained-run! owner))
+        :persist (do (validate-result-binding! owner value)
+                     (run/retain-finished! id status opts) (retained-run! owner))
         :settled (when settled (settled status (or error value)))
         :release (when (some #(= id (:run/id %)) (run/active-runs (:id room)))
                    (retained-run! owner)
@@ -127,8 +137,16 @@
               {:id id :settled? false :cleanup-required? true :cleanup-stage stage})
             (do (swap! state assoc :stage (get next-stage stage)) (recur))))))))
 
-(defn- finish-owned! [{:keys [state] :as owner} status value error reason]
-  (let [opts (cond-> {:now (java.util.Date.)}
+(defn- finish-owned! [{:keys [state observation] :as owner} status value error reason]
+  (let [result (when observation
+                 (cond
+                   (and (= status :completed) (get-in value [:scorecard :scorecard/content-id]))
+                   {:run/job-result-state :available
+                    :run/job-scorecard (get-in value [:scorecard :scorecard/content-id])}
+                   (= status :completed) {:run/job-result-state :incomplete}
+                   :else {:run/job-result-state :unavailable}))
+        opts (cond-> {:now (java.util.Date.)}
+               result (assoc :job-result result)
                error (assoc :error (ex-info (error-message error) {}))
                reason (assoc :reason reason))]
     (reset! state {:phase :finishing :stage :before-finish
@@ -197,17 +215,25 @@
    its active lease until explicit HOST recovery; :settled? remains false.
    :parent names a parent Run and :actor the owner (default :dvergr). `finish`
    observes the work value; `reason-of` supplies an optional reason keyword."
-  [room {:keys [id kind parent ctx actor]} work & {:keys [finish settled reason-of before-finish]}]
+  [room {:keys [id kind parent ctx actor observation]} work & {:keys [finish settled reason-of before-finish]}]
   (when-not (satisfies? store/PRoomStore (:store room))
     (throw (ex-info "Jobs require a durable Room store" {:type ::durable-store-required})))
   (when-not (contains? kinds kind)
     (throw (ex-info "Unknown job kind" {:type ::unknown-kind :kind kind :kinds kinds})))
+  (when (and observation
+             (not (and (= kind :experiment) (uuid? parent) (map? observation)
+                       (= #{:offer :experiment} (set (keys observation)))
+                       (every? uuid? (vals observation)))))
+    (throw (ex-info "Invalid native Job observation descriptor" {:type ::invalid-observation})))
   (let [ctx (or ctx (:ctx room))
         r (binding [ec/*execution-context* (:ctx room)]
             (run/start! room (or actor :dvergr) (random-uuid) nil
-                        (cond-> {:id id :kind kind} parent (assoc :parent parent))))
+                        (cond-> {:id id :kind kind}
+                          parent (assoc :parent parent)
+                          observation (assoc :provenance {:run/job-offer (:offer observation)
+                                                          :run/job-experiment (:experiment observation)}))))
         id (:run/id r)
-        owner {:id id :room room :done (promise) :state (atom {:phase :working})
+        owner {:id id :room room :observation observation :done (promise) :state (atom {:phase :working})
                :before-finish before-finish :settled settled}]
     (swap! live assoc id owner)
     (run/register-cancel-hook! id ::family #(run/cancel-family! room id))
@@ -272,6 +298,67 @@
    Missing owner without witnesses is unknown, never settled."
   [room id]
   (settlement-observation room (binding [ec/*execution-context* (:ctx room)] (run/run room id))))
+
+(defn status-in
+  "HOST observation in an explicit original control Room. Does not search the
+   global room registry or expose a Room value. Authorization belongs to the
+   calling adapter; a Job UUID alone conveys no authority."
+  [room id]
+  (let [owner (get @live id)]
+    (when (and owner (not (identical? room (:room owner))))
+      (throw (ex-info "Job belongs to another control Room" {:type ::foreign-owner})))
+    (let [r (binding [ec/*execution-context* (:ctx room)] (run/run room id))]
+      (when (and r (kinds (:run/kind r)))
+        (let [current (some-> owner :state deref)]
+          (cond-> (assoc (job room r)
+                         :settled? (true? (:settled? (settlement-observation room r))))
+            (= :held (:phase current))
+            (assoc :cleanup-required? true :cleanup-stage (:stage current))))))))
+
+(defn- check-await-deadline! [id deadline-nanos]
+  (when (.isInterrupted (Thread/currentThread))
+    (throw (InterruptedException. "Job observation interrupted")))
+  (when-not (pos? (- deadline-nanos (System/nanoTime)))
+    (throw (ex-info "Job observation deadline expired" {:type ::await-deadline :job id}))))
+
+(defn await-in!
+  "HOST wait on the existing native Job owner, outside engine execution.
+   DEADLINE-NANOS is an absolute finite host deadline. No model polling, admission,
+   cancellation or recovery is performed here. Interruption propagates to the
+   owning worker. Returns only positively settled status; held/missing ownership
+   is refused rather than inferred as successful completion."
+  [room id deadline-nanos]
+  (run/assert-unlocked-host-thread! room ::worker-required)
+  (when ec/*spin-id*
+    (throw (ex-info "Job await requires a native worker" {:type ::worker-required})))
+  (when-not (and (uuid? id) (integer? deadline-nanos))
+    (throw (ex-info "Job await requires an id and finite host deadline" {:type ::invalid-await})))
+  (loop []
+    (check-await-deadline! id deadline-nanos)
+    (let [status (or (status-in room id)
+                     (throw (ex-info "Job is unavailable in this Room" {:type ::unknown-job})))
+          owner (get @live id)]
+      (when (and owner (not (identical? room (:room owner))))
+        (throw (ex-info "Job belongs to another control Room" {:type ::foreign-owner})))
+      (cond
+        (:settled? status) (do (check-await-deadline! id deadline-nanos) status)
+        (:cleanup-required? status)
+        (throw (ex-info "Job requires native cleanup recovery"
+                        {:type ::cleanup-held :job id :stage (:cleanup-stage status)}))
+        ;; The owner may have completed between the two reads. Reobserve its
+        ;; durable witnesses once before declaring an unknown outcome.
+        (nil? owner)
+        (let [latest (status-in room id)]
+          (if (:settled? latest) (do (check-await-deadline! id deadline-nanos) latest)
+              (throw (ex-info "Job settlement is unconfirmed" {:type ::settlement-unconfirmed :job id}))))
+        :else
+        (let [remaining (- deadline-nanos (System/nanoTime))]
+          (when-not (pos? remaining)
+            (throw (ex-info "Job observation deadline expired" {:type ::await-deadline :job id})))
+          ;; A short native wait allows held-stage detection. It creates no new
+          ;; model turn and leaves the original Job's custody unchanged.
+          (deref (:done owner) (min 100 (max 1 (long (Math/ceil (/ remaining 1000000.0))))) nil)
+          (recur))))))
 
 (defn status
   "The job `id` (its Run's id), waiting up to `wait-ms` (capped at

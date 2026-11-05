@@ -23,6 +23,16 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]))
 
+(defn validate-run-query!
+  "Direct-child pagination is a separate mode from recursive/status queries."
+  [{:keys [parent-run-id root-run-id status actor offset limit]}]
+  (when (or (and parent-run-id
+                 (or (not (uuid? parent-run-id)) root-run-id status actor
+                     (and limit (not (and (integer? limit) (pos? limit) (<= limit 1000))))))
+            (and (some? offset)
+                 (not (and parent-run-id (integer? offset) (<= 0 offset 1000000)))))
+    (throw (ex-info "Invalid direct-child Run query" {:type :room-store/invalid-run-query}))))
+
 (defprotocol PRoomStore
   "Pluggable durability surface for Rooms. Implementations decide
    where data lives (Datahike, in-memory atom, KV store, etc.); the
@@ -91,7 +101,9 @@
      applied before :limit. :root-run-id restricts to that structural Run and
      all descendants before limiting. Structural traversal cannot be combined
      with :status or :actor; callers should project the bounded subtree and
-     filter it explicitly."))
+     filter it explicitly. :parent-run-id is a separate direct-child mode,
+     with optional nonnegative :offset and bounded :limit. It sorts descending
+     by started-at and string UUID and cannot combine with other filters."))
 
 (defprotocol PRunSavepointStore
   "Optional fixed Run checkpoint publication; no caller callbacks or authority."
@@ -467,6 +479,7 @@
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason
     :run/job-core-cleanup-ack :run/job-adapter-cleanup-ack :run/family-return-ack
+    :run/job-offer :run/job-experiment :run/job-scorecard :run/job-result-state
     :run/roster :run/agent-version :run/program-kind
     :run/interpreter-version :run/agent-def-hash :run/chat-id
     ;; the part the Run plays for its parent (dvergr.agent.budget)
@@ -482,7 +495,8 @@
    :run/created-at :run/started-at
    :run/world :run/isolation :run/settlement-policy
    :run/roster :run/agent-version :run/program-kind
-   :run/interpreter-version :run/agent-def-hash :run/chat-id :run/role])
+   :run/interpreter-version :run/agent-def-hash :run/chat-id :run/role
+   :run/job-offer :run/job-experiment])
 
 (defn validate-run!
   "Validate the minimal durable Run contract and return `run`."
@@ -492,6 +506,20 @@
                     {:type :room-store/unknown-run-keys
                      :unknown (set unknown)
                      :allowed durable-run-keys})))
+  (let [descriptor? (or (contains? run :run/job-offer) (contains? run :run/job-experiment))
+        result? (or (contains? run :run/job-scorecard) (contains? run :run/job-result-state))]
+    (when (and descriptor?
+               (not (and (= :experiment (:run/kind run)) (uuid? (:run/parent run))
+                         (uuid? (:run/job-offer run)) (uuid? (:run/job-experiment run)))))
+      (throw (ex-info "Invalid owned experiment observation descriptor" {:type :room-store/invalid-job-observation})))
+    (when (and result?
+               (not (and descriptor? (terminal-run-statuses (:run/status run))
+                         (contains? #{:available :incomplete :unavailable} (:run/job-result-state run))
+                         (case (:run/job-result-state run)
+                           :available (and (= :completed (:run/status run)) (uuid? (:run/job-scorecard run)))
+                           :incomplete (and (= :completed (:run/status run)) (not (contains? run :run/job-scorecard)))
+                           :unavailable (and (not= :completed (:run/status run)) (not (contains? run :run/job-scorecard)))))))
+      (throw (ex-info "Invalid owned experiment result receipt" {:type :room-store/invalid-job-result}))))
   (doseq [k [:run/id :run/trigger]]
     (when-not (uuid? (get run k))
       (throw (ex-info (str k " must be a UUID")
@@ -610,6 +638,13 @@
                      :update-status (:run/status run)
                      :existing-ended-at (:run/ended-at existing)
                      :update-ended-at (:run/ended-at run)})))
+  (when (and existing
+             (or (contains? terminal-run-statuses (:run/status existing))
+                 (contains? existing :run/job-result-state))
+             (not= (select-keys existing [:run/job-scorecard :run/job-result-state])
+                   (select-keys run [:run/job-scorecard :run/job-result-state])))
+    (throw (ex-info "Job result receipts are immutable at terminal acknowledgement"
+                    {:type :room-store/immutable-job-result :run-id (:run/id run)})))
   ;; a search record (dvergr.agent.search) is replaced, never dropped: an
   ;; update written from a live Run that never saw it keeps it, in both stores
   (cond-> run

@@ -642,6 +642,26 @@
     :db/cardinality :db.cardinality/one
     :db/doc "Versioned acknowledgement of this Job's configured adapter cleanup boundary"}
 
+   {:db/ident :run/job-offer
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/doc "Exact host invocation reference content identity for this child Job"}
+
+   {:db/ident :run/job-experiment
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/doc "Exact admitted experiment content identity"}
+
+   {:db/ident :run/job-scorecard
+    :db/valueType :db.type/uuid
+    :db/cardinality :db.cardinality/one
+    :db/doc "Exact immutable Scorecard selected by this Job terminal acknowledgement"}
+
+   {:db/ident :run/job-result-state
+    :db/valueType :db.type/keyword
+    :db/cardinality :db.cardinality/one
+    :db/doc "Closed native Job result receipt state: available, incomplete or unavailable"}
+
    {:db/ident :run/roster
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one
