@@ -2,6 +2,7 @@
   "Exact HOST invocation offers. Only portable references enter Run inputs;
    trusted handlers and their physical owners never enter agent-visible data."
   (:require [dvergr.agent.roster :as roster]
+            [dvergr.agent.public-feedback :as feedback]
             [hasch.core :as hasch]))
 
 (defn- refuse! [reason]
@@ -9,11 +10,13 @@
 
 (defn valid-ref? [ref]
   (and (map? ref)
-       (= #{:invocation/id :invocation/version :invocation/basis} (set (keys ref)))
+       (every? #{:invocation/id :invocation/version :invocation/basis :invocation/public-feedback} (keys ref))
        (qualified-keyword? (:invocation/id ref))
        (pos-int? (:invocation/version ref))
        (some? (:invocation/basis ref))
-       (roster/data-value? (:invocation/basis ref))))
+       (roster/data-value? (:invocation/basis ref))
+       (or (not (contains? ref :invocation/public-feedback))
+           (feedback/valid? (:invocation/public-feedback ref)))))
 
 (defn refs
   "Validate a host-owned offer map and return references, never handlers."

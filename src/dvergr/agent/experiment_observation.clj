@@ -3,6 +3,8 @@
    execution, cleanup, or result-selection authority is introduced here."
   (:require [dvergr.agent.experiment :as experiment]
             [dvergr.agent.invocations :as invocations]
+            [dvergr.agent.episode :as episode]
+            [dvergr.agent.public-feedback :as feedback]
             [dvergr.agent.run :as run]
             [dvergr.jobs :as jobs]
             [org.replikativ.spindel.engine.core :as ec]))
@@ -22,12 +24,24 @@
     (refuse! :owner-expired))
   (let [parent (binding [ec/*execution-context* (:ctx control-room)] (run/run control-room run-id))]
     (when-not (= :running (:run/status parent)) (refuse! :owner-not-running)))
-  (into #{} (map invocations/content-id)
+  (into {} (map (juxt invocations/content-id identity))
         (invocations/refs (:experiment-capabilities agent-program-ceiling))))
 
 (defn- admitted? [parent offers child]
   (and (= :experiment (:run/kind child)) (= parent (:run/parent child))
        (contains? offers (:run/job-offer child)) (uuid? (:run/job-experiment child))))
+
+(defn- bounded-page [result]
+  ;; Keep a continuation when public feedback makes a page larger. Unicode
+  ;; names count by encoded size, not just by the number of characters.
+  (loop [page result]
+    (if (<= (alength (.getBytes (pr-str page) java.nio.charset.StandardCharsets/UTF_8)) 24000)
+      page
+      (if (> (count (:entries page)) 1)
+        (let [entries (pop (:entries page))]
+          (recur (assoc page :entries entries :next-offset (+ (:offset page) (count entries)))))
+        (assoc (select-keys page [:job :status :settled? :result-state :scorecard-id :entry-count])
+               :projection-omitted :size-limit)))))
 
 (defn children
   "Recover receipts after a lost start response. Bounded, direct children only;
@@ -52,7 +66,9 @@
   (let [offers (scope! ctx)
         child (binding [ec/*execution-context* (:ctx control-room)] (run/run control-room id))]
     (when-not (admitted? run-id offers child) (refuse! :not-admitted-child))
-    (let [status (jobs/await-in! control-room id deadline-nanos)
+    (let [disclosure (get-in offers [(:run/job-offer child) :invocation/public-feedback])
+          page-size (if disclosure feedback/page-size 32)
+          status (jobs/await-in! control-room id deadline-nanos)
           child (binding [ec/*execution-context* (:ctx control-room)] (run/run control-room id))
           base {:job id :status (:status status) :settled? true :result-state (:run/job-result-state child)}
           result
@@ -71,18 +87,27 @@
                   (when-not (= id (:run/parent attempt-run)) (refuse! :foreign-result-attempt))))
               (cond-> (assoc base :scorecard-id (:scorecard/content-id card)
                              :entry-count (count entries) :offset offset
-                             :entries (mapv #(cond-> (assoc (select-keys % [:candidate/agent-content-id :attempt/id
-                                                                            :attempt/content-id :repetition :reward :passed?])
-                                                            :environment/content-id (get-in % [:environment :environment/content-id]))
-                                               (:spend %) (assoc :spend (select-keys (:spend %) [:microdollars :priced?])))
-                                            (take 32 (drop offset entries))))
-                (< (+ offset 32) (count entries)) (assoc :next-offset (+ offset 32))))
+                             :entries
+                             (mapv (fn [entry]
+                                     (let [row (binding [ec/*execution-context* (:ctx control-room)]
+                                                 (run/run control-room (:attempt/id entry)))
+                                           _ (when-not (= id (:run/parent row)) (refuse! :foreign-result-attempt))
+                                           projected (cond-> (assoc (select-keys entry [:candidate/agent-content-id :attempt/id
+                                                                                        :attempt/content-id :repetition :reward :passed?])
+                                                                    :environment/content-id (get-in entry [:environment :environment/content-id]))
+                                                       (:spend entry) (assoc :spend (select-keys (:spend entry) [:microdollars :priced?])))]
+                                       (if disclosure
+                                         (merge projected (feedback/run-state row)
+                                                (feedback/project disclosure (:run/job-experiment child) entry
+                                                                  (episode/attempt-bounded control-room (:attempt/id entry))))
+                                         (merge projected (feedback/run-state row)))))
+                                   (take page-size (drop offset entries))))
+                disclosure (assoc :public-feedback (feedback/public-declaration disclosure))
+                (< (+ offset page-size) (count entries)) (assoc :next-offset (+ offset page-size))))
             (if (contains? #{:incomplete :unavailable} (:run/job-result-state child)) base
                 (refuse! :missing-result-receipt)))]
-      ;; Deadline/cancel is sticky even if bounded decoding took time.
-      (scope! ctx)
-      (run/record-cause! run-id id)
-      (if (> (count (pr-str result)) 24000)
-        (assoc (select-keys result [:job :status :settled? :result-state :scorecard-id :entry-count])
-               :projection-omitted :size-limit)
+      (let [result (bounded-page result)]
+        ;; Deadline/cancel is sticky even if decoding and packing took time.
+        (scope! ctx)
+        (run/record-cause! run-id id)
         result))))
