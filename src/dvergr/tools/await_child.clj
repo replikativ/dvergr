@@ -1,6 +1,7 @@
 (ns dvergr.tools.await-child
-  (:require [dvergr.agent.experiment-observation :as observation]
-            [dvergr.tools :as tools]))
+  ;; Tool discovery can run while the sandbox is loading. Resolve the native
+  ;; observer only at execution, avoiding a discovery -> program -> sandbox cycle.
+  (:require [dvergr.tools :as tools]))
 
 (tools/register!
  {:name "await_child"
@@ -11,5 +12,5 @@
   :execute (fn [{:keys [job offset]} ctx]
              {:type :success
               :content (pr-str (if job
-                                 (observation/await! ctx (parse-uuid job) (or offset 0))
-                                 (observation/children ctx (or offset 0))))})})
+                                 ((requiring-resolve 'dvergr.agent.experiment-observation/await!) ctx (parse-uuid job) (or offset 0))
+                                 ((requiring-resolve 'dvergr.agent.experiment-observation/children) ctx (or offset 0))))})})
