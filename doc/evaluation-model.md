@@ -70,6 +70,15 @@ Cancellation before that transfer joins the Run and discards that exact world;
 after transfer, the certification worker alone owns compensation or settlement.
 Both paths remain registered until physical cleanup is acknowledged. A timeout
 or cleanup error throws; it is not evidence that resources are safe to release.
+An ordinary structured refusal during world construction is different from a
+failed cleanup. The original HOST constructor first invokes its retained,
+idempotent disposer and acknowledges the family obligation. Only after both
+acknowledgments may the admission monitor complete its cleanup gate normally
+while returning the original refusal to the evaluation. A busy source therefore
+fails without leaving a phantom child or requiring manual resource recovery.
+Failed disposal, failed family acknowledgment, engine-thread cleanup attempts,
+and errors after a Run handle exists keep their original recovery obligations.
+The room quiescence guard is unchanged; this never retries admission or inference.
 Experiments also register their admission controller before submitting cells.
 The barrier joins its actual completion, not merely its posted cancellation
 request, then includes any evaluation cleanup tasks the controller started late.
