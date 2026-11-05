@@ -1,7 +1,8 @@
 (ns dvergr.agent.invocations
   "Exact HOST invocation offers. Only portable references enter Run inputs;
    trusted handlers and their physical owners never enter agent-visible data."
-  (:require [dvergr.agent.roster :as roster]))
+  (:require [dvergr.agent.roster :as roster]
+            [hasch.core :as hasch]))
 
 (defn- refuse! [reason]
   (throw (ex-info "Experiment invocation is not admitted" {:type ::refused :reason reason})))
@@ -22,6 +23,12 @@
                    (every? (fn [[ref handler]] (and (valid-ref? ref) (fn? handler))) offers))
       (refuse! :invalid-offers))
     (set (keys offers))))
+
+(defn content-id
+  "Canonical identity of the entire exact offered invocation, not authority."
+  [ref]
+  (when-not (valid-ref? ref) (refuse! :invalid-reference))
+  (hasch/uuid [:dvergr/invocation-observation-v1 ref]))
 
 (defn invoke!
   "HOST bridge used by the injected closure. Handler receives ambient authority,

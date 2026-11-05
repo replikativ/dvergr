@@ -48,7 +48,10 @@
       (let [id (:run/id (run/start! room :test (random-uuid) nil {:kind :workflow}))]
         (run/finish! id :completed)
         (is (= :completed (:status (jobs/status id))))
-        (is (false? (:settled? (jobs/status id))))))))
+        (is (false? (:settled? (jobs/status id))))
+        (is (= ::jobs/settlement-unconfirmed
+               (try (jobs/await-in! room id (+ (System/nanoTime) 1000000000)) nil
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))))))
 
 (deftest missing-durable-store-is-refused-before-any-job-work
   (with-room
@@ -95,6 +98,9 @@
                 (is (= (if (= stage :core) 0 1) @adapter))
                 (is (active? room id))
                 (is (false? (:settled? (jobs/observe-settlement room id))))
+                (is (= ::jobs/cleanup-held
+                       (try (jobs/await-in! room id (+ (System/nanoTime) 1000000000)) nil
+                            (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
                 (is (= committed? (store/job-cleanup-acknowledged? (run/run room id) stage)))
                 (when-not committed?
                   (is (thrown? clojure.lang.ExceptionInfo (jobs/recover! id expected :acknowledge)))
@@ -362,3 +368,31 @@
               (is (thrown? clojure.lang.ExceptionInfo (jobs/recover! (:id job) first-token :acknowledge)))
               (is (:settled? (jobs/recover! (:id job) second-token :retry)))))
           (finally (recover-held! (:id job))))))))
+
+(deftest result-receipt-survives-lost-terminal-write-ack
+  (let [fail? (atom true)]
+    (with-room
+      #(fault-ack-store % :run/job-result-state fail? true)
+      (fn [room]
+        (let [parent (:run/id (run/start! room :parent (random-uuid) nil))
+              experiment (random-uuid) card (random-uuid)
+              job (jobs/start! room {:kind :experiment :parent parent
+                                     :observation {:offer (random-uuid) :experiment experiment}}
+                               (fn [_] (sp/spin {:scorecard {:scorecard/content-id card
+                                                             :scorecard/experiment {:experiment/content-id experiment}}})))
+              id (:id job)]
+          (try
+            (let [expected (held! id)]
+              (is (= :persist (:stage expected)))
+              (is (= card (:run/job-scorecard (run/run room id))))
+              (is (false? (:settled? (jobs/status-in room id))))
+              (is (thrown? clojure.lang.ExceptionInfo (jobs/recover! id expected :acknowledge)))
+              (reset! fail? false)
+              (jobs/recover! id (jobs/recovery-state id) :retry)
+              (is (:settled? (jobs/await-in! room id (+ (System/nanoTime) 1000000000))))
+              (is (= card (:run/job-scorecard (run/run room id)))))
+            (finally
+              (reset! fail? false)
+              (recover-held! id)
+              (run/await-family! room parent)
+              (run/finish! parent :completed))))))))

@@ -30,11 +30,18 @@
    Spin is ignored. The Job stays live until physical cleanup and wallet return.
    HOST-only :candidate-options may replace the child delegation scope with
    both explicit :experiment-capabilities and :delegation-policy. It does not
-   change the original admission, ownership or funding authority."
+   change the original admission, ownership or funding authority.
+   HOST :observation-ref binds a receipt to the exact offered invocation;
+   :return-receipt? returns that receipt instead of a passive result Spin."
   ([control-room work-room team definition opts authority]
    (start! control-room work-room team definition opts authority {}))
   ([control-room work-room team definition opts authority host-options]
-   (when-not (and (map? host-options) (every? #{:world-parent :admit! :settled! :candidate-options} (keys host-options))
+   (when-not (and (map? host-options) (every? #{:world-parent :admit! :settled! :candidate-options :observation-ref :return-receipt?} (keys host-options))
+                  (or (not (contains? host-options :observation-ref))
+                      (invocations/valid-ref? (:observation-ref host-options)))
+                  (or (not (contains? host-options :return-receipt?))
+                      (and (boolean? (:return-receipt? host-options))
+                           (:observation-ref host-options) (uuid? (:parent-run authority))))
                   (or (not (contains? host-options :world-parent))
                       (some? (:world-parent host-options)))
                   (every? #(or (not (contains? host-options %)) (fn? (get host-options %))) [:admit! :settled!]))
@@ -64,7 +71,11 @@
          (fn []
            (let [job
                  (jobs/start!
-                  control-room (cond-> {:kind :experiment :ctx execution-ctx} parent (assoc :parent parent))
+                  control-room (cond-> {:kind :experiment :ctx execution-ctx}
+                                 parent (assoc :parent parent)
+                                 (:observation-ref host-options)
+                                 (assoc :observation {:offer (invocations/content-id (:observation-ref host-options))
+                                                      :experiment (:experiment/content-id definition)}))
                   (fn [id]
                     (when-let [admit! (:admit! host-options)] (admit! id))
                     (when (seq resources)
@@ -105,5 +116,7 @@
      (when (and parent (nil? (:own-child! authority)))
        (run/register-cancel-hook! parent [::child id]
                                   #(run/cancel-room-run! (:id control-room) id)))
-     (binding [ec/*execution-context* ctx]
-       (sp/spin (assoc (sp/await done) :job id))))))
+     (if (:return-receipt? host-options)
+       {:job id :owner-run parent :invocation (:observation-ref host-options)}
+       (binding [ec/*execution-context* ctx]
+         (sp/spin (assoc (sp/await done) :job id)))))))

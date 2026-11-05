@@ -45,6 +45,90 @@
           "the status is the durable Run's")
       (is (some #(= (:id job) (:id %)) (jobs/jobs room))))))
 
+(deftest explicit-room-await-preserves-work-and-requires-settlement
+  (with-room [room :jobs-explicit-await]
+    (let [gate (sp/deferred)
+          job (jobs/start! room {:kind :experiment} (fn [_] (sp/spin (sp/await gate) :done)))
+          id (:id job)
+          deadline #(+ (System/nanoTime) (* 1000000 %))]
+      (is (= :running (:status (jobs/status-in room id))))
+      (is (= ::jobs/worker-required
+             ((ns-resolve 'dvergr.agent.run 'call-with-run-lock)
+              (:id room) id
+              #(try (jobs/await-in! room id (deadline 100)) nil
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+      (is (not (contains? (jobs/status-in room id) :room-value)))
+      (is (= ::jobs/foreign-owner
+             (try (jobs/await-in! (assoc room :replacement true) id (deadline 100)) nil
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+          "matching Room id does not replace the original live owner")
+      (is (= ::jobs/await-deadline
+             (try (jobs/await-in! room id (deadline 5)) nil
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+      (is (false? (boolean (run/cancel-requested? id))) "observation expiry never cancels work")
+      (is (= :running (:status (jobs/status-in room id))))
+      (is (= ::jobs/worker-required
+             (binding [ec/*spin-id* :test-engine-call]
+               (try (jobs/await-in! room id (deadline 100)) nil
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+      (with-room [other :jobs-explicit-other]
+        (is (= ::jobs/foreign-owner
+               (try (jobs/await-in! other id (deadline 100)) nil
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))))
+      (sp/deliver! gate true)
+      (is (= {:status :completed :settled? true}
+             (select-keys (jobs/await-in! room id (deadline 5000)) [:status :settled?])))
+      (is (:settled? (jobs/await-in! room id (deadline 5000))) "repeat observation uses durable witnesses")
+      (is (= ::jobs/await-deadline
+             (try (jobs/await-in! room id (dec (System/nanoTime))) nil
+                  (catch clojure.lang.ExceptionInfo e (:type (ex-data e)))))
+          "even a completed result cannot revive an expired owning execution")
+      (is (nil? (jobs/status-in room (random-uuid)))))))
+
+(deftest explicit-room-await-does-not-hide-held-adapter-cleanup
+  (with-room [room :jobs-await-held]
+    (let [fail? (atom true)
+          job (jobs/start! room {:kind :experiment} (fn [_] (sp/spin :done))
+                           :settled (fn [& _] (when @fail? (throw (ex-info "hold adapter" {})))))
+          id (:id job)
+          deadline #(+ (System/nanoTime) 5000000000)]
+      (try
+        (is (= ::jobs/cleanup-held
+               (try (jobs/await-in! room id (deadline)) nil
+                    (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))
+        (is (false? (:settled? (jobs/status-in room id))))
+        (is (some #(= id (:run/id %)) (run/active-runs (:id room))))
+        (finally
+          (reset! fail? false)
+          (when-let [state (jobs/recovery-state id)] (jobs/recover! id state :retry))))
+      (is (:settled? (jobs/await-in! room id (deadline)))))))
+
+(deftest explicit-room-await-interruption-does-not-release-the-job
+  (with-room [room :jobs-await-interruption]
+    (let [gate (sp/deferred)
+          job (jobs/start! room {:kind :experiment} (fn [_] (sp/spin (sp/await gate) :done)))
+          entered (promise) observed (promise)
+          worker (Thread. ^Runnable
+                  (fn []
+                    (deliver entered true)
+                    (try
+                      (jobs/await-in! room (:id job) (+ (System/nanoTime) 5000000000))
+                      (deliver observed :unexpected-completion)
+                      (catch InterruptedException _ (deliver observed :interrupted))
+                      (catch Throwable t (deliver observed t)))))]
+      (try
+        (.start worker)
+        (is (= true (deref entered 1000 ::timeout)))
+        (.interrupt worker)
+        (.join worker 1000)
+        (is (= :interrupted (deref observed 1000 ::timeout)))
+        (is (not (.isAlive worker)))
+        (is (= :running (:status (jobs/status-in room (:id job)))))
+        (is (false? (boolean (run/cancel-requested? (:id job)))))
+        (finally
+          (sp/deliver! gate true)
+          (jobs/await-in! room (:id job) (+ (System/nanoTime) 5000000000)))))))
+
 (deftest a-failing-job-fails-its-run
   (with-room [room :jobs-fail]
     (let [job (jobs/start! room {:kind :workflow}

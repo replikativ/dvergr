@@ -117,7 +117,7 @@
    what a name resolves to never depends on whether a sandbox happened to be
    built before: an LLM Run resolves its tools after building its sandbox,
    the prediction of its inputs before."
-  '[dvergr.tools.llm-call dvergr.intake.mail])
+  '[dvergr.tools.llm-call dvergr.intake.mail dvergr.tools.await-child])
 
 (defn- ensure-self-registered! []
   (doseq [n self-registering-namespaces]

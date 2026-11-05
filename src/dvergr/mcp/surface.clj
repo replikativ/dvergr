@@ -269,7 +269,7 @@
         w  (fn [destructive? open?] {:readOnlyHint false :destructiveHint destructive?
                                      :idempotentHint false :openWorldHint open?})]
     {"read_file" ro, "glob" ro, "grep" ro, "code_query" ro, "knowledge_search" ro,
-     "task_list" ro, "budget" ro, "clj_kondo" ro, "repl_describe" ro
+     "task_list" ro, "budget" ro, "clj_kondo" ro, "repl_describe" ro, "await_child" ro
      "clojure_eval" (w true true), "shell" (w true true),
      "write_file" (w true false), "edit_file" (w true false), "clojure_edit" (w true false),
      "run_tests" (w false false), "knowledge_add" (w false false),

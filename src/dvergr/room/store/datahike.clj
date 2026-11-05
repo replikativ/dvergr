@@ -420,6 +420,7 @@
     :run/world :run/isolation :run/settlement-policy
     :run/settlement-status :run/settlement-reason
     :run/job-core-cleanup-ack :run/job-adapter-cleanup-ack :run/family-return-ack
+    :run/job-offer :run/job-experiment :run/job-scorecard :run/job-result-state
     :run/status :run/created-at :run/started-at :run/updated-at :run/ended-at
     :run/reason :run/error :run/savepoint :run/conversation-ref :run/resumed-by :run/search :run/role])
 
@@ -505,6 +506,10 @@
     (:run/family-return-ack run) (assoc :run/family-return-ack (:run/family-return-ack run))
     (:run/job-core-cleanup-ack run) (assoc :run/job-core-cleanup-ack (:run/job-core-cleanup-ack run))
     (:run/job-adapter-cleanup-ack run) (assoc :run/job-adapter-cleanup-ack (:run/job-adapter-cleanup-ack run))
+    (:run/job-offer run) (assoc :run/job-offer (:run/job-offer run))
+    (:run/job-experiment run) (assoc :run/job-experiment (:run/job-experiment run))
+    (:run/job-scorecard run) (assoc :run/job-scorecard (:run/job-scorecard run))
+    (:run/job-result-state run) (assoc :run/job-result-state (:run/job-result-state run))
     (:run/ended-at run) (assoc :run/ended-at (:run/ended-at run))
     (:run/savepoint run) (assoc :run/savepoint (:run/savepoint run))
     (:run/conversation-ref run) (assoc :run/conversation-ref (:run/conversation-ref run))
@@ -1341,14 +1346,26 @@
                       @conn (:chat/id ent) run-id run-pull-pattern)
                 entity->run))))
 
-  (-list-runs [_ room-id {:keys [limit status actor root-run-id]}]
+  (-list-runs [_ room-id {:keys [limit status actor root-run-id parent-run-id offset] :as opts}]
+    (store/validate-run-query! opts)
     (when (and root-run-id (or status actor))
       (throw (ex-info "Structural Run queries do not combine with status/actor"
                       {:type :room-store/incompatible-run-filters
                        :root-run-id root-run-id :status status :actor actor})))
     (let [slug (store/room-id->slug room-id)]
       (if-let [ent (room-by-slug conn slug)]
-        (->> (if root-run-id
+        (->> (cond
+               parent-run-id
+               (mapv first
+                     (dh/q {:query '[:find (pull ?r pattern) ?started ?id-key
+                                     :in $ ?chat-id ?parent pattern
+                                     :where [?c :chat/id ?chat-id] [?r :run/chat ?c]
+                                     [?r :run/parent ?parent] [?r :run/started-at ?started]
+                                     [?r :run/id ?id] [(str ?id) ?id-key]]
+                            :args [@conn (:chat/id ent) parent-run-id run-pull-pattern]
+                            :order-by '[?started :desc ?id-key :desc]
+                            :offset (or offset 0) :limit (or limit 100)}))
+               root-run-id
                (let [db @conn
                      chat-id (:chat/id ent)
                      n (or limit 100)
@@ -1383,6 +1400,7 @@
                                children (mapv first rows)]
                            (recur (into selected children)
                                   (mapv :run/id children))))))))
+               :else
                (dh/q '[:find [(pull ?r pattern) ...]
                        :in $ ?chat-id pattern
                        :where

@@ -59,7 +59,7 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 11)
+(def interpreter-version 12)
 
 (def ^:private default-max-model-steps 32)
 
@@ -1144,6 +1144,7 @@
            ;; the SCI API. Carry structural parentage and the identical
            ;; attenuation policy across this boundary explicitly.
            :run-id run-id
+           :deadline-nanos (:deadline-nanos supervisor)
            :agent-program-ceiling (child-program-authority run-id supervisor)
            :actor (:agent/id agent)
            :model-policy (:agent/model-policy agent)})

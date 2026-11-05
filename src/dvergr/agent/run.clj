@@ -107,7 +107,8 @@
   #{:run/roster :run/agent-version :run/program-kind
     :run/interpreter-version :run/agent-def-hash :run/chat-id
     :run/world :run/isolation :run/settlement-policy
-    :run/settlement-status :run/settlement-reason :run/role})
+    :run/settlement-status :run/settlement-reason :run/role
+    :run/job-offer :run/job-experiment})
 
 (defn- public-entry [entry]
   (:run entry))
@@ -418,15 +419,21 @@
           ;; A callback exception after admission still owns that child.
           (change-family! parent owner #(family/callback-exited % token)))))))
 
+(defn assert-unlocked-host-thread!
+  "Refuse a blocking native observation while holding execution or lifecycle
+   locks needed by the operation being observed. ERROR-TYPE belongs to the caller."
+  [room error-type]
+  (when (or (simple/on-drain-thread?) (.get held-run) (Thread/holdsLock lifecycle-lock)
+            (pos? (.getReadHoldCount (room-lock (:id room))))
+            (.isWriteLockedByCurrentThread (room-lock (:id room))))
+    (throw (ex-info "Native wait requires an external unlocked HOST thread" {:type error-type}))))
+
 (defn await-family!
   "HOST join of the original native Run family. Seals admission, then waits
    for callback/preparation and child release, driving only native bookkeeping
    hooks. Never call while holding an engine drain or any Run/Room/owner lock."
   [room parent]
-  (when (or (simple/on-drain-thread?) (.get held-run) (Thread/holdsLock lifecycle-lock)
-            (pos? (.getReadHoldCount (room-lock (:id room))))
-            (.isWriteLockedByCurrentThread (room-lock (:id room))))
-    (throw (ex-info "Run family join requires an external unlocked HOST thread" {:type ::family-join-under-lock})))
+  (assert-unlocked-host-thread! room ::family-join-under-lock)
   (let [owner (locking lifecycle-lock (:native-owner (family-entry! room parent)))]
     (change-family! parent owner family/seal)
     (loop []
@@ -696,7 +703,10 @@
    This two-phase boundary prevents Room teardown from closing the execution
    context between durable terminal persistence and Deferred publication."
   ([run-id status] (retain-finished! run-id status {}))
-  ([run-id status {:keys [reason error now settlement-status settlement-reason]}]
+  ([run-id status {:keys [reason error now settlement-status settlement-reason job-result]}]
+   (when (and job-result (not (and (map? job-result)
+                                   (every? #{:run/job-scorecard :run/job-result-state} (keys job-result)))))
+     (throw (ex-info "Invalid native Job result fields" {:type ::invalid-job-result})))
    (when-not (contains? finish-statuses status)
      (throw (ex-info "Invalid run finish status"
                      {:type ::invalid-finish-status :status status :run-id run-id})))
@@ -705,6 +715,9 @@
        (let [owner (:native-owner entry)]
          (change-family! run-id owner family/seal)
          (family-guard! (get @active run-id)))
+       (when (and job-result (contains? finish-statuses (get-in entry [:run :run/status]))
+                  (not= job-result (select-keys (:run entry) [:run/job-scorecard :run/job-result-state])))
+         (throw (ex-info "Terminal Job result receipt cannot change" {:type ::invalid-job-result})))
        ;; Exactly one settlement path owns result publication. A graph callback
        ;; racing the normal Spin sees this retained terminal state and yields.
        (when-not (contains? finish-statuses (get-in entry [:run :run/status]))
@@ -719,7 +732,8 @@
                      reason (assoc :run/reason reason)
                      settlement-status (assoc :run/settlement-status settlement-status)
                      settlement-reason (assoc :run/settlement-reason settlement-reason)
-                     error (assoc :run/error (or (ex-message error) (str error))))]
+                     error (assoc :run/error (or (ex-message error) (str error)))
+                     job-result (merge job-result))]
            (when-let [room-store (:store entry)]
              (when-not (store/-store-run! room-store (:store-room-id entry) run)
                (throw (ex-info "Run finish was not durable"
@@ -1400,7 +1414,8 @@
   "List durable Runs from a Room store.
 
    Options: :limit, :status, :actor, and :root-run-id. The structural root
-   restricts the query to that Run and descendants before applying the limit."
+   restricts the query to that Run and descendants before applying the limit.
+   :parent-run-id instead pages direct children using :offset and :limit."
   ([room] (runs room {}))
   ([room opts]
    (if-let [room-store (:store room)]
