@@ -90,6 +90,20 @@ One separation in the existing code makes the rest compositional.
 
 Discarding a world discards its side effects and keeps the evidence.
 
+The durable experiment runner (`experiment.runner/run-in`) preserves explicit
+`:delegation-policy` and `:experiment-capabilities` for candidate child work.
+These are independent of the outer host's `:capabilities` used for scoring and
+setup. An explicit empty child scope stays empty; omitting it retains the trusted
+host default. A composite candidate must receive its own deliberately admitted
+child scope, never the outer evaluator merely because that evaluator scores it.
+For nested experiments, `subexperiment/start!` has a HOST-only
+`:candidate-options` override with both an explicit capability map and a valid
+delegation policy. It replaces only the candidate's child options. The original
+authority still governs experiment admission, parent ownership, resources and
+cleanup; an empty or partial override is refused rather than restoring defaults.
+The HOST chooses and admits this distinct scope; the option does not itself
+prove that arbitrary supplied capabilities attenuate another scope.
+
 ## What was wrong, and what still blocks
 
 Until step 1 (2026-09-20), tau2 went around this path: its episodes ran in

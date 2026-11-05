@@ -4,6 +4,7 @@
   (:require [dvergr.runtime.threads :as threads]
             [dvergr.agent.experiment-admission :as admission]
             [dvergr.agent.authority :as authority]
+            [dvergr.agent.invocations :as invocations]
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.program :as program]
@@ -26,16 +27,31 @@
 (defn start!
   "Start a preflighted child Job and return a Spin of its certified result.
    Parent ownership is reserved BEFORE Job admission, even if the returned
-   Spin is ignored. The Job stays live until physical cleanup and wallet return."
+   Spin is ignored. The Job stays live until physical cleanup and wallet return.
+   HOST-only :candidate-options may replace the child delegation scope with
+   both explicit :experiment-capabilities and :delegation-policy. It does not
+   change the original admission, ownership or funding authority."
   ([control-room work-room team definition opts authority]
    (start! control-room work-room team definition opts authority {}))
   ([control-room work-room team definition opts authority host-options]
-   (when-not (and (map? host-options) (every? #{:world-parent :admit! :settled!} (keys host-options))
+   (when-not (and (map? host-options) (every? #{:world-parent :admit! :settled! :candidate-options} (keys host-options))
                   (or (not (contains? host-options :world-parent))
                       (some? (:world-parent host-options)))
                   (every? #(or (not (contains? host-options %)) (fn? (get host-options %))) [:admit! :settled!]))
      (throw (ex-info "Invalid HOST child experiment options" {:type ::invalid-host-options})))
-   (let [{:keys [resources parallelism capabilities]} (admission/plan team definition opts authority)
+   (let [candidate-options
+         (if (contains? host-options :candidate-options)
+           (let [options (:candidate-options host-options)]
+             (when-not (and (map? options)
+                            (= (set authority/host-option-keys) (set (keys options)))
+                            (map? (:experiment-capabilities options)))
+               (throw (ex-info "Candidate options require an explicit scope and delegation policy"
+                               {:type ::invalid-host-options})))
+             (authority/validate-policy! (:delegation-policy options))
+             (invocations/refs (:experiment-capabilities options))
+             options)
+           (select-keys authority authority/host-option-keys))
+         {:keys [resources parallelism capabilities]} (admission/plan team definition opts authority)
          parent (:parent-run authority)
          ctx (:ctx work-room)
          world-parent (get host-options :world-parent work-room)
@@ -57,7 +73,7 @@
                       (reset! allocation :allocated))
                     (experiment/run
                      control-room team definition (:evaluators capabilities)
-                     (merge (select-keys authority authority/host-option-keys)
+                     (merge candidate-options
                             {:world-setups (:world-setups capabilities)
                              :parallelism parallelism :parent-run id :world-parent world-parent
                              :cleanup-group group :complete-only? true})))

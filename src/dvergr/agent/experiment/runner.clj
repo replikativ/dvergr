@@ -37,6 +37,7 @@
   (:require [clojure.java.basis :as basis]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [dvergr.agent.authority :as authority]
             [dvergr.agent.evaluation :as evaluation]
             [dvergr.agent.environment :as environment]
             [dvergr.agent.experiment :as experiment]
@@ -298,10 +299,13 @@
    evaluation in the latter loses its Run's wakeups. `capabilities` is
    `{:world-setup :protocol :evaluator}` (setup and protocol when named).
    For distinct environment setups, replace :world-setup with :world-setups,
-   a map from exact setup references to HOST WorldSetup capabilities."
+   a map from exact setup references to HOST WorldSetup capabilities.
+   Optional :experiment-capabilities and :delegation-policy govern the
+   candidates' child work, independently of the outer scoring capabilities.
+   Explicit empty scopes remain empty; absence retains trusted-host defaults."
   [room {:keys [capabilities team experiment parallelism cleanup-group benchmark parent-run
                 world-parent admit resume?]
-         :or {parallelism 1 resume? true}}]
+         :or {parallelism 1 resume? true} :as options}]
   (let [{:keys [protocol evaluator]} capabilities
         world-setups (world-setups! capabilities)
         cells (* (count (:experiment/candidates experiment))
@@ -311,18 +315,19 @@
       (experiment/run
        room team experiment
        {(evaluation/evaluator-ref evaluator) evaluator}
-       {:world-setups world-setups
-        :protocols (if protocol {(evaluation/protocol-ref protocol) protocol} {})
-        :parallelism parallelism
-        :max-parallelism (max 16 parallelism)
-        :max-attempts (max 256 cells)
-        :cleanup-group cleanup-group
-        :resume? resume?
-        :complete-only? true
-        :on-result #(log-cell benchmark %)
-        :parent-run parent-run
-        :world-parent world-parent
-        :admit admit}))))
+       (merge {:world-setups world-setups
+               :protocols (if protocol {(evaluation/protocol-ref protocol) protocol} {})
+               :parallelism parallelism
+               :max-parallelism (max 16 parallelism)
+               :max-attempts (max 256 cells)
+               :cleanup-group cleanup-group
+               :resume? resume?
+               :complete-only? true
+               :on-result #(log-cell benchmark %)
+               :parent-run parent-run
+               :world-parent world-parent
+               :admit admit}
+              (select-keys options authority/host-option-keys))))))
 
 ;; ---------------------------------------------------------------------------
 ;; A home of its own: an experiment's directory is a dvergr home
