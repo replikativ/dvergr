@@ -325,11 +325,20 @@
 
 (defn data-result
   "An op's data as an MCP tool result: JSON text, and the same value as
-   `structuredContent` (an object; a non-map is wrapped as `{result: …}`)."
+   `structuredContent` (an object; a non-map is wrapped as `{result: …}`).
+   Oversized data is an explicit result-encoding error, never invalid success
+   JSON. The operation already ran; callers must not blindly retry a write."
   [data]
   (let [text (->json data)]
     (if (< max-text-chars (count text))
-      {:content [{:type "text" :text (cut text)}] :isError false}
+      (let [error {:error {:type :result-too-large
+                           :limit-chars max-text-chars :actual-chars (count text)
+                           :operation-may-have-completed? true
+                           :message (str "Operation may have completed. Request a bounded summary or "
+                                         "chunked artifact read; do not resubmit a write with a new request id.")}}
+            encoded (->json error)]
+        {:content [{:type "text" :text encoded}]
+         :structuredContent (json/read-value encoded) :isError true})
       {:content [{:type "text" :text text}]
        :structuredContent (json/read-value (->json (if (map? data) data {:result data})))
        :isError false})))

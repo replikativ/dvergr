@@ -218,8 +218,8 @@
     (is (re-find #"\"run/status\":\"completed\"" (-> r :content first :text))))
   (is (= {"result" [1 2]} (:structuredContent (surface/data-result [1 2]))) "non-maps are wrapped")
   (let [big (surface/data-result {:s (apply str (repeat (+ 10 surface/max-text-chars) "x"))})]
-    (is (nil? (:structuredContent big)))
-    (is (re-find #"result cut at" (-> big :content first :text))))
+    (is (true? (:isError big)))
+    (is (= "result-too-large" (get-in big [:structuredContent "error" "type"]))))
   (is (true? (:isError (surface/tool-result {:type :error :error "nope" :suggestion "try x"}))))
   (is (= "hello" (-> (surface/tool-result {:type :success :content "hello"}) :content first :text))))
 
@@ -421,3 +421,30 @@
             row (re-find (re-pattern (str "(?m)^\\| `" profile "`[^\\n]*\\| (\\d+) \\|$")) doc)]
         (is row (str "doc/mcp.md has a row for " profile))
         (is (= (str n) (second row)) (str "doc/mcp.md's tool count of " profile))))))
+
+(deftest oversized-structured-data-is-a-bounded-encoding-error-not-partial-success
+  (doseq [payload [{:secret "DO-NOT-EXPOSE" :body (apply str (repeat surface/max-text-chars "x"))}
+                   [(apply str (repeat surface/max-text-chars "y")) "DO-NOT-EXPOSE"]]]
+    (let [result (surface/data-result payload)
+          text (get-in result [:content 0 :text])
+          decoded (jsonista.core/read-value text)]
+      (is (true? (:isError result)))
+      (is (= decoded (:structuredContent result)))
+      (is (= "result-too-large" (get-in decoded ["error" "type"])))
+      (is (= surface/max-text-chars (get-in decoded ["error" "limit-chars"])))
+      (is (< surface/max-text-chars (get-in decoded ["error" "actual-chars"])))
+      (is (true? (get-in decoded ["error" "operation-may-have-completed?"])))
+      (is (not (clojure.string/includes? text "DO-NOT-EXPOSE")))
+      (is (< (count text) surface/max-text-chars))))
+  ;; JSON quotes count toward the text ceiling; exactly the cap is permitted.
+  (let [at-limit (apply str (repeat (- surface/max-text-chars 2) "a"))
+        accepted (surface/data-result at-limit)
+        refused (surface/data-result (str at-limit "a"))]
+    (is (false? (:isError accepted)))
+    (is (= surface/max-text-chars (count (get-in accepted [:content 0 :text]))))
+    (is (= at-limit (jsonista.core/read-value (get-in accepted [:content 0 :text]))))
+    (is (true? (:isError refused))))
+  ;; Plain tool text remains a deliberate human/model preview, not JSON data.
+  (let [preview (surface/tool-result {:type :success :content (apply str (repeat (inc surface/max-text-chars) "z"))})]
+    (is (false? (:isError preview)))
+    (is (clojure.string/includes? (get-in preview [:content 0 :text]) "result cut at"))))
