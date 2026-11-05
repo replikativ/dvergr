@@ -22,6 +22,10 @@
   (Object.))
 
 (defonce ^:private room-locks (java.util.concurrent.ConcurrentHashMap.))
+(defonce ^:private room-lock-cleaner (java.lang.ref.Cleaner/create))
+
+(defn- clean-room-lock! [room-id entry]
+  (.remove ^java.util.concurrent.ConcurrentHashMap room-locks room-id entry))
 
 (defn- room-lock
   "The read-write lock of one Room's Run lifecycle. Admission fences (open,
@@ -32,9 +36,20 @@
    queued every cell's Run start behind the others' commits).
    Order: Room lock, then Run lock, then `lifecycle-lock`, then Room metadata."
   ^java.util.concurrent.locks.ReentrantReadWriteLock [room-id]
-  (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap room-locks (or room-id ::none)
-                    (reify java.util.function.Function
-                      (apply [_ _] (java.util.concurrent.locks.ReentrantReadWriteLock.)))))
+  (let [room-id (or room-id ::none)
+        chosen (volatile! nil)]
+    (.compute ^java.util.concurrent.ConcurrentHashMap room-locks room-id
+              (reify java.util.function.BiFunction
+                (apply [_ _ entry]
+                  (if-let [lock (when entry (.get ^java.lang.ref.WeakReference entry))]
+                    (do (vreset! chosen lock) entry)
+                    (let [lock (java.util.concurrent.locks.ReentrantReadWriteLock.)
+                          entry (java.lang.ref.WeakReference. lock)]
+                      (vreset! chosen lock)
+                      (.register room-lock-cleaner lock
+                                 ^Runnable #(clean-room-lock! room-id entry))
+                      entry)))))
+    @chosen))
 
 (def ^:private run-stripes
   "Run locks, striped by Run id: a fixed set, nothing to reclaim."
@@ -52,7 +67,9 @@
       (throw (ex-info "Room admission fence taken inside one of the Room's Run operations"
                       {:type ::lock-upgrade :room-id room-id})))
     (.lock (.writeLock lock))
-    (try (f) (finally (.unlock (.writeLock lock))))))
+    (try (f) (finally
+               (.unlock (.writeLock lock))
+               (java.lang.ref.Reference/reachabilityFence lock)))))
 
 (defn- call-with-run-lock [room-id run-id f]
   (let [lock (room-lock room-id)
@@ -70,7 +87,9 @@
       (locking stripe
         (.set held-run run-id)
         (try (f) (finally (.set held-run held))))
-      (finally (.unlock (.readLock lock))))))
+      (finally
+        (.unlock (.readLock lock))
+        (java.lang.ref.Reference/reachabilityFence lock)))))
 
 (defmacro ^:private with-room-exclusive [room-id & body]
   `(call-exclusive ~room-id (fn [] ~@body)))
