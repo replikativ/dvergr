@@ -85,9 +85,13 @@
 (defn install-sandbox-binding!
   "Install serializable world data for `binding-id` in `ctx`.
 
-   Host functions injected into SCI must capture only `owner` + `binding-id`,
-   never a Room, connection, filesystem or workspace.  That makes functions
-   defined before a SCI fork select the child binding when invoked there."
+   World/IO host functions injected into SCI capture only `owner` + `binding-id`,
+   never a Room, connection, filesystem or workspace. That makes functions
+   defined before a SCI fork select the child binding when invoked there.
+   Native Run-family control is deliberately separate: its supervisor retains
+   the original control Room for records, wallets and child ownership. That
+   ephemeral capability must never enter this serializable binding or select
+   the work world's filesystem/database."
   [ctx binding-id data]
   (binding [ec/*execution-context* ctx]
     (ec/swap-state! (conj sandbox-bindings-path binding-id)

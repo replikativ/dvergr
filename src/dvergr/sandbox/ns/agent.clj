@@ -538,16 +538,24 @@
                                      {:type ::no-current-room
                                       :room-id room-id}))))
         control-room!  (fn [work-room]
-                         (loop [candidate work-room]
-                           (if (some-> candidate :meta deref :run-world?)
-                             (if-let [parent (room-lookup* (:parent-id candidate))]
-                               (recur parent)
-                               (throw (ex-info
-                                       "Run world has no registered control ancestor"
-                                       {:type ::missing-control-room
-                                        :room-id (:id candidate)
-                                        :parent-id (:parent-id candidate)})))
-                             candidate)))
+                         ;; A native Run owns records/wallets in its exact
+                         ;; original control Room, even when its work world
+                         ;; descends from an independent clean fixture. This
+                         ;; capability is not a world-store selector or lease.
+                         (if (contains? agent-program-ceiling :control-room)
+                           (or (:control-room agent-program-ceiling)
+                               (throw (ex-info "Run has no original control owner"
+                                               {:type ::missing-control-room})))
+                           (loop [candidate work-room]
+                             (if (some-> candidate :meta deref :run-world?)
+                               (if-let [parent (room-lookup* (:parent-id candidate))]
+                                 (recur parent)
+                                 (throw (ex-info
+                                         "Run world has no registered control ancestor"
+                                         {:type ::missing-control-room
+                                          :room-id (:id candidate)
+                                          :parent-id (:parent-id candidate)})))
+                               candidate))))
         hire-fn        (fn [roster agent-ref opts]
                          (let [work-room (room!)
                                control-room (control-room! work-room)

@@ -82,13 +82,36 @@ One separation in the existing code makes the rest compositional.
 
 - **Work plane**: the forked world where a candidate acts. It holds
   application state and is settled by merge, review or discard.
-- **Control plane**: the nearest ancestor Room that is not itself a Run's
-  world (`control-room!` in `dvergr.sandbox.ns.agent` walks up past every
-  Run world). Runs, the resource ledger and Attempts are recorded there, even
-  from deeply nested hires, linked by `:run/parent`. The ledger is never
-  forked or settled with a world.
+- **Control plane**: a native Run's original control Room, captured by its
+  supervisor. Runs, the resource ledger and Attempts are recorded there, even
+  when work descends from an independent clean fixture, linked by `:run/parent`.
+  `control-room!` in `dvergr.sandbox.ns.agent` uses this exact ephemeral owner;
+  ancestry walking remains only for legacy unscoped participants. World files
+  and databases still follow the selected work context. The ledger is never
+  forked or settled with a world, and a closed owner is never replaced by lookup.
 
 Discarding a world discards its side effects and keeps the evidence.
+
+The durable experiment runner (`experiment.runner/run-in`) preserves explicit
+`:delegation-policy` and `:experiment-capabilities` for candidate child work.
+These are independent of the outer host's `:capabilities` used for scoring and
+setup. An explicit empty child scope stays empty; omitting it retains the trusted
+host default. A composite candidate must receive its own deliberately admitted
+child scope, never the outer evaluator merely because that evaluator scores it.
+For nested experiments, `subexperiment/start!` has a HOST-only
+`:candidate-options` override with both an explicit capability map and a valid
+delegation policy. It replaces only the candidate's child options. The original
+authority still governs experiment admission, parent ownership, resources and
+cleanup; an empty or partial override is refused rather than restoring defaults.
+The HOST chooses and admits this distinct scope; the option does not itself
+prove that arbitrary supplied capabilities attenuate another scope.
+
+The native owner is a control capability, not a lifetime lease or world-data
+capability. Existing supervisor/family guards still own child admission and
+physical completion. It is not stored in sandbox bindings, portable Run inputs,
+artifacts or AgentDefs. LLM input identities include the interpreter semantics
+version, so changes to these routing rules invalidate old resume comparisons
+without hashing process-local Room objects.
 
 ## What was wrong, and what still blocks
 

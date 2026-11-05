@@ -59,7 +59,7 @@
    to a Participant is a separate, explicit speech act."
   :_runs)
 
-(def interpreter-version 10)
+(def interpreter-version 11)
 
 (def ^:private default-max-model-steps 32)
 
@@ -82,6 +82,10 @@
            :funded-program-kinds #{:llm}
            :provider-effects? false
            :parent-run run-id
+           ;; Native, non-forking control owner, retained by this supervisor.
+           ;; World ancestry may lead to a clean fixture rather than this Room.
+           ;; This is never part of portable inputs or world/IO bindings.
+           :control-room (:control-room supervisor)
    ;; Process-local structured ownership. The sandbox may construct immutable
    ;; rosters freely, but every admitted child execution is leased to this
    ;; supervisor before `hire!` returns to agent code.
@@ -1014,6 +1018,7 @@
    candidate can call while its name, in the AgentDef, stays the same."
   [instructions tool-map model-spec compaction sandbox]
   (cond-> {:inputs/kind :llm
+           :interpreter-version interpreter-version
            :prompt-id (prompt-id instructions)
            :tools (tool-inputs tool-map)
            :model (model-inputs model-spec)}
@@ -1037,7 +1042,7 @@
    as portable data: the inputs resolved at Run start that are not in the
    AgentDef or the EnvironmentDef, so not in an ExperimentDef's identity.
 
-   - An LLM program: the assembled system prompt (by its `prompt-id`), the
+   - An LLM program: the interpreter version, assembled system prompt (by its `prompt-id`), the
      tools offered (`tool-inputs`), the resolved model (`model-inputs`) and,
      when its AgentDef names sandbox extensions, what they resolve to in the
      process's extension registry (`extensions/refs`), which the Run installs.
