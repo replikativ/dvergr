@@ -202,7 +202,7 @@
         lock (#'run/room-lock room) entered (promise)]
     (.lock (.writeLock lock))
     (try
-      (let [reader (test-future (#'run/call-with-run-lock room :reader #(deliver entered :entered)))]
+      (let [reader (test-future (#'run/call-with-run-lock room :reader #(do (deliver entered :entered) :entered)))]
         (is (eventually #(.hasQueuedThreads lock)))
         (System/gc)
         (is (identical? lock (#'run/room-lock (String. room))))
@@ -266,8 +266,10 @@
   (let [{:keys [room entry release worker]} (held-room-fixture)]
     (try
       (dotimes [_ 5] (System/gc))
-      (is (some? (.get ^WeakReference entry)) "only the acquisition helper owns the lock")
-      (is (identical? (.get ^WeakReference entry) (#'run/room-lock room)))
+      ;; Kaocha retains assertion arguments. Report only booleans, so the
+      ;; observation itself cannot keep the lock alive for the GC assertion.
+      (is (true? (some? (.get ^WeakReference entry))) "only the acquisition helper owns the lock")
+      (is (true? (identical? (.get ^WeakReference entry) (#'run/room-lock room))))
       (finally (.countDown ^CountDownLatch release) (deref worker 10000 ::timeout)))
     (is (eventually #(do (System/gc)
                          (and (nil? (.get ^WeakReference entry))
