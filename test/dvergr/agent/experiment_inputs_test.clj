@@ -448,7 +448,7 @@
       (finally (paths/set-home! prev)))))
 
 (deftest a-tool-a-sandbox-registers-resolves-before-any-sandbox
-  ;; `llm_call` and the mail tools register themselves when their namespaces
+  ;; The model-call, mail and native await tools register when their namespaces
   ;; load, which building a sandbox does: resolving a name loads them first.
   ;; A cold process is simulated: the tool is not registered until its
   ;; namespace is (re)required.
@@ -466,7 +466,7 @@
                         (swap! dvergr.tools/registry assoc "llm_call" saved))
                       (apply require! args))]
         (is (= {"llm_call" saved} (dvergr.tools/normalize-tools #{:llm_call})))
-        (is (= #{'dvergr.tools.llm-call 'dvergr.intake.mail} (set @required))))
+        (is (= #{'dvergr.tools.llm-call 'dvergr.intake.mail 'dvergr.tools.await-child} (set @required))))
       (finally (swap! dvergr.tools/registry assoc "llm_call" saved)))))
 
 (deftest a-cold-model-registry-is-read-only-once-loaded
