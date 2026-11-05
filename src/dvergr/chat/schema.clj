@@ -1638,26 +1638,75 @@
       (tool-schema/install-all-tool-schemas! conn registry))
     conn))
 
-;; Identity set of connections whose full schema has already been installed in
-;; THIS process. Schema installation is a per-connection, one-time concern, but
-;; `ensure-full-schema!` re-transacted the ENTIRE schema (core + every tool
-;; input schema + knowledge) on every call — ~5s on a file-backed store with
-;; `keep-history?`. Since `create-chat-context` calls it per turn, that ~5s ran
-;; on the engine thread every turn, freezing all reactive computation (renders,
-;; the room-bus watcher, other agents) for the whole turn.
-;;
-;; Guarding by conn identity makes it a true idempotent ensure: install once
-;; (daemon startup / DB provisioning), then a cheap no-op. Identity semantics
-;; (IdentityHashMap) avoid datahike's value-based equality shifting as the DB
-;; mutates.
-(defonce ^:private ensured-conns
-  (java.util.Collections/synchronizedSet
-   (java.util.Collections/newSetFromMap (java.util.IdentityHashMap.))))
+(deftype ^:private ConnectionKey [^java.lang.ref.WeakReference reference ^int identity-hash]
+  Object
+  (hashCode [_] identity-hash)
+  (equals [this other]
+    (or (identical? this other)
+        (and (instance? ConnectionKey other)
+             (let [a (.get reference)
+                   b (.get ^java.lang.ref.WeakReference (.-reference ^ConnectionKey other))]
+               (and (some? a) (identical? a b)))))))
 
-(defonce ^:private ensured-dynamic-tool-schemas
-  ;; Run-world connections are deliberately short lived. Weak keys prevent
-  ;; late-registered semantic tools from retaining discarded branches.
-  (java.util.Collections/synchronizedMap (java.util.WeakHashMap.)))
+(defonce ^:private schema-cleaner (java.lang.ref.Cleaner/create))
+(defonce ^:private ensured-conns (java.util.HashMap.))
+(defonce ^:private ensured-dynamic-tool-schemas (java.util.HashMap.))
+
+(defn- connection-key [conn]
+  (ConnectionKey. (java.lang.ref.WeakReference. conn) (System/identityHashCode conn)))
+
+(defn- clean-connection-key! [^java.util.Map cache key]
+  (locking cache
+    ;; A delayed callback cannot erase a replacement, even for the same conn.
+    (when (identical? key (:key (.get cache key))) (.remove cache key))))
+
+(defn- ensure-cached-schema! [^java.util.Map cache conn request ready? install]
+  (try
+    (loop []
+      (let [probe (connection-key conn)
+            [mode key entry same-request?]
+            (locking cache
+              (let [before (.get cache probe)]
+                (cond
+                  (ready? (:installed before)) [:ready]
+                  (:pending before)
+                  (let [pending (:pending before)]
+                    (when (identical? (Thread/currentThread) (:owner pending))
+                      (throw (ex-info "Schema ensure reentered its own installation"
+                                      {:type ::reentrant-ensure :request request})))
+                    [:wait nil pending (= request (:request pending))])
+                  :else
+                  (let [key (or (:key before) probe)
+                        cleanable (or (:cleanable before)
+                                      (.register schema-cleaner conn
+                                                 ^Runnable #(clean-connection-key! cache key)))
+                        entry {:key key :cleanable cleanable :installed (:installed before)
+                               :pending {:owner (Thread/currentThread) :request request :done (promise)}}]
+                    (.put cache key entry)
+                    [:install key entry]))))]
+        (case mode
+          :ready nil
+          :wait (let [[status error] @(:done entry)]
+                  (if (and (= :error status) same-request?) (throw error) (recur)))
+          :install
+          (let [done (get-in entry [:pending :done])]
+            (try
+              (let [installed (install (:installed entry))]
+                (locking cache
+                  (.put cache key (-> entry (dissoc :pending) (assoc :installed installed))))
+                (deliver done [:ok nil]))
+              (catch Throwable error
+                (let [removed? (locking cache
+                                 (when (identical? entry (.get cache key))
+                                   (if (nil? (:installed entry))
+                                     (do (.remove cache key) true)
+                                     (do (.put cache key (dissoc entry :pending)) false))))]
+                  ;; Unregister an abandoned fresh key's action: repeated failed
+                  ;; installs on a live conn must not accumulate Cleaner history.
+                  (when removed? (.clean ^java.lang.ref.Cleaner$Cleanable (:cleanable entry)))
+                  (deliver done [:error error])
+                  (throw error))))))))
+    (finally (java.lang.ref.Reference/reachabilityFence conn))))
 
 (defn ensure-tool-use-schemas!
   "Ensure schemas for registered tools appearing in `tool-uses` exist on
@@ -1671,17 +1720,12 @@
            :let [tool (get registry tool-name)]
            :when tool]
      (let [fingerprint (select-keys tool [:name :parameters])]
-        ;; Keep schema installation and publication under the same lock. If the
-        ;; cache were marked first, a concurrent message could transact typed
-        ;; tool input while the schema transaction was still in flight. Cache
-        ;; the definition fingerprint rather than only its name so a trusted
-        ;; host can add fields to a late-bound tool before its next use.
-       (locking ensured-dynamic-tool-schemas
-         (let [installed (or (.get ensured-dynamic-tool-schemas conn) {})]
-           (when-not (= fingerprint (get installed tool-name))
-             (tool-schema/install-tool-schema! conn tool)
-             (.put ensured-dynamic-tool-schemas conn
-                   (assoc installed tool-name fingerprint)))))))
+       (ensure-cached-schema!
+        ensured-dynamic-tool-schemas conn [tool-name fingerprint]
+        #(= fingerprint (get % tool-name))
+        (fn [installed]
+          (tool-schema/install-tool-schema! conn tool)
+          (assoc installed tool-name fingerprint)))))
    conn))
 
 (defn ensure-full-schema!
@@ -1697,11 +1741,13 @@
    created/registered (daemon startup, per-room DB). It is safe to call
    anywhere — the guard ensures the expensive transact runs at most once."
   [conn]
-  ;; `.add` returns true only if `conn` was newly inserted → install once.
-  (when (.add ^java.util.Set ensured-conns conn)
-    (install-schema! conn)
-    (when-let [registry (get-tool-registry)]
-      (tool-schema/install-all-tool-schemas! conn registry)))
+  (ensure-cached-schema!
+   ensured-conns conn ::full-schema boolean
+   (fn [_]
+     (install-schema! conn)
+     (when-let [registry (get-tool-registry)]
+       (tool-schema/install-all-tool-schemas! conn registry))
+     true))
   conn)
 
 ;; ============================================================================
