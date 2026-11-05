@@ -2280,6 +2280,31 @@
                    "The world of a Run that was not admitted could not be settled")
          nil)))
 
+(defn- failed-world-construction
+  "Drive the original failed constructor's disposal on its HOST caller.
+   Only structured native refusals carry the internal admission ACK protocol;
+   interruption and fatal errors retain their original Throwable identity."
+  [error cleanup!]
+  (let [acknowledged?
+        (when cleanup!
+          (try
+            (when (simple/on-drain-thread?)
+              (throw (ex-info "Constructor disposal requires a HOST worker"
+                              {:type ::construction-cleanup-on-engine})))
+            (cleanup!)
+            (run/child-preparation-cleaned!)
+            true
+            (catch Throwable cleanup-error
+              (when-not (identical? error cleanup-error)
+                (.addSuppressed ^Throwable error cleanup-error))
+              false)))]
+    (if (instance? clojure.lang.ExceptionInfo error)
+      (ex-info (ex-message error)
+               (cond-> (dissoc (ex-data error) ::admission-cleanup)
+                 acknowledged? (assoc ::admission-cleanup :acknowledged))
+               error)
+      error)))
+
 (defn- hire-prepared-unowned-in!
   "Host-only Run admission with a trusted fork-local world preparer.
 
@@ -2323,15 +2348,18 @@
         _ (when-not (contains? world/settlement-policies settlement)
             (throw (ex-info "Unknown Run settlement policy" {:type ::invalid-settlement-policy :policy settlement})))
         construction-cleanup (atom nil)
-        _ (run/child-preparation-entered!)
-        run-world (world/open! world-parent id settlement control-room
-                               (not-empty (into {} (remove (comp nil? val))
-                                                (cond-> (select-keys host-options [:snapshots :checkpoints])
-                                                  parent-run
-                                                  (assoc :retain-construction!
-                                                         (fn [cleanup!]
-                                                           (reset! construction-cleanup cleanup!)
-                                                           (run/retain-child-preparation! cleanup!)))))))
+        run-world (try
+                    (world/open! world-parent id settlement control-room
+                                 (not-empty (into {} (remove (comp nil? val))
+                                                  (cond-> (select-keys host-options [:snapshots :checkpoints])
+                                                    parent-run
+                                                    (assoc :retain-construction!
+                                                           (fn [cleanup!]
+                                                             (reset! construction-cleanup cleanup!)
+                                                             (run/child-preparation-entered!)
+                                                             (run/retain-child-preparation! cleanup!)))))))
+                    (catch Throwable error
+                      (throw (failed-world-construction error @construction-cleanup))))
         work-room (:work run-world)
         supervisor (cond-> (assoc (make-supervisor (:ctx world-parent) (:ctx work-room)) :run-id id :control-room control-room)
                      deadline-nanos (assoc :deadline-nanos deadline-nanos)

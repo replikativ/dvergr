@@ -294,7 +294,9 @@
 
 (defn retain-child-preparation!
   "Retain the original idempotent constructor cleanup before native effects.
-   Only failed pre-admission HOST recovery may invoke this private callback."
+   The original HOST constructor may dispose after failure before durable Run admission;
+   otherwise only failed pre-admission HOST recovery may invoke this callback.
+   Disposal runs off the engine, outside lifecycle/Run/Room locks."
   [cleanup!]
   (when-let [{:keys [parent owner token]} *child-admission*]
     (change-family! parent owner

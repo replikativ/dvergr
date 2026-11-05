@@ -122,8 +122,15 @@
                  (swap! state assoc :phase :done)
                  true))
              (catch Throwable error
-               (deliver outcome {:error error})
-               (throw error)))))))
+               (let [rejected? (= :admitting (:phase @state))]
+                 (deliver outcome {:error error})
+                 ;; A structured constructor refusal with positive disposal
+                 ;; ACK is a failed evaluation, not failed physical cleanup.
+                 ;; Once a handle exists its join/disposal errors stay held.
+                 (if (and rejected?
+                          (= :acknowledged (::program/admission-cleanup (ex-data error))))
+                   (do (swap! state assoc :phase :rejected) true)
+                   (throw error)))))))))
     {:cancel! cancel!
      :handoff! handoff!
      :await-handoff (fn [] @handoff)
