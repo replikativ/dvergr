@@ -5,6 +5,7 @@
             [dvergr.agent.experiment :as experiment]
             [dvergr.agent.experiment.runner :as runner]
             [dvergr.agent.roster :as roster]
+            [dvergr.agent.program :as program]
             [dvergr.agent.run :as run]
             [dvergr.agent.subexperiment :as subexperiment]
             [dvergr.jobs :as jobs]
@@ -13,6 +14,9 @@
             [dvergr.model.chat :as chat]
             [dvergr.model.providers :as providers]
             [dvergr.room.store.memory :as memory]
+            [dvergr.room.registry :as registry]
+            [dvergr.sandbox.ns.agent :as agent-ns]
+            [sci.core :as sci]
             [org.replikativ.spindel.blocking]
             [org.replikativ.spindel.engine.core :as ec]))
 
@@ -141,3 +145,65 @@
       (is (empty? (jobs/jobs room)))
       (is (empty? (run/runs room {:limit 10})))
       (finally (discourse/close-room! room)))))
+
+(deftest llm-resume-inputs-track-execution-semantics-without-native-owners
+  (let [inputs #(@#'program/llm-inputs "Fixed instructions" {} {:provider :test :model "fixed"} nil #{})
+        before (inputs)
+        after (with-redefs [program/interpreter-version (inc program/interpreter-version)] (inputs))]
+    (is (= program/interpreter-version (:interpreter-version before)))
+    (is (not= (program/inputs-id before) (program/inputs-id after)))
+    (is (roster/data-value? before))
+    (is (not (contains? before :control-room)))))
+
+(deftest a-missing-explicit-control-owner-never-falls-back-to-world-ancestry
+  (let [room (discourse/make-room {:id :runner-authority/nil-control :store (memory/make)})]
+    (try
+      (binding [ec/*execution-context* (:ctx room)]
+        (registry/register! room)
+        (let [ctx (sci/init {})]
+          (agent-ns/add-programming-ns! ctx (:id room) (:ctx room)
+                                        {:parent-run (random-uuid) :control-room nil})
+          (is (thrown-with-msg? Exception #"Run has no original control owner"
+                                (sci/eval-string* ctx "(dvergr.agent/balance)")))
+          (is (empty? (run/runs room {:limit 10})))
+          (is (empty? (jobs/jobs room)))))
+      (finally (discourse/close-room! room)))))
+
+(deftest sci-child-runs-stay-with-the-original-control-owner-of-a-clean-fixture
+  (let [control (discourse/make-room {:id :runner-authority/original-control :store (memory/make)})
+        fixture (discourse/make-room {:id :runner-authority/independent-fixture :store (memory/make)})
+        calls (atom 0)
+        opts (-> (options {:id :candidate :tools #{:clojure_eval}
+                           :model-policy {:provider :test :model "composite"}
+                           :program {:kind :llm :max-model-steps 2 :auto-compact? false}})
+                 (assoc :world-parent fixture)
+                 (assoc-in [:delegation-policy :tools] #{:clojure_eval}))
+        code "(let [team (dvergr.agent/make-agent (dvergr.agent/roster) {:id :child :program {:kind :echo}})
+                    result @(dvergr.agent/hire! team :child {:task :child-task :settlement :discard})]
+                (assert (= :child-task (:run/value result)))
+                (assert (= (:run/id result) (:run/id (dvergr.agent/observe (:run/id result))))))"]
+    (try
+      (with-redefs [providers/ensure-initialized! (constantly nil)
+                    chat-agent/messages->api-format (fn [messages _ _] messages)
+                    chat/chat (fn [& _]
+                                (if (= 1 (swap! calls inc))
+                                  {:content "" :stop-reason :tool-use :usage {:input-tokens 0 :output-tokens 0}
+                                   :tool-calls [{:id "child" :name "clojure_eval" :input {:code code}}]}
+                                  {:content "done" :stop-reason :end-turn :usage {:input-tokens 0 :output-tokens 0}}))]
+        ;; Spins execute in the caller's selected context. The original
+        ;; control Room owns records; the independent fixture owns execution.
+        (binding [ec/*execution-context* (:ctx fixture)]
+          (let [result @(runner/run-in control opts)
+                runs (run/runs control {:limit 10})
+                child (first (filter #(= :child (:run/actor %)) runs))]
+            (is (= 1 (count (:attempts result))))
+            (is (= 2 @calls) (pr-str (:results result)))
+            (is (= 2 (count runs)))
+            (is (= (:attempt/run-id (first (:attempts result))) (:run/parent child)))
+            (is (= :completed (:run/status child)))
+            (is (= :discarded (:run/settlement-status child)))
+            (is (empty? (run/runs fixture {:limit 10}))))))
+      (finally
+        (evaluation/await-cleanups! control 10000)
+        (discourse/close-room! fixture)
+        (discourse/close-room! control)))))

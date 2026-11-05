@@ -293,10 +293,12 @@
    store, resumable; `:parent-run` makes every cell's Run its child. With
    `:world-parent`, the cells fork that room instead while `room` keeps the
    records (a benchmark set's fixture room, reported in the caller's room).
-   Evaluates in the context of the room the cells fork (`:world-parent`, else
-   `room`), whoever calls; each cell's own fork context is chosen inside
-   `experiment/run`. A daemon room's context is a fork of the daemon's, and an
-   evaluation in the latter loses its Run's wakeups. `capabilities` is
+   Constructs under the context of the room the cells fork (`:world-parent`,
+   else `room`). The returned Spin is stateless: callers must also execute or
+   await it with that context selected, e.g. bind *execution-context* around
+   the dereference, not just the call. Each cell's own fork context is chosen
+   inside `experiment/run`. Running in a different context loses its Run's
+   wakeups; the control Room still owns durable records and wallets. `capabilities` is
    `{:world-setup :protocol :evaluator}` (setup and protocol when named).
    For distinct environment setups, replace :world-setup with :world-setups,
    a map from exact setup references to HOST WorldSetup capabilities.
